@@ -25,6 +25,7 @@ This is an opt-in v3 path behind ``VLLM_TQ_DECODE_V3``.
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
@@ -99,16 +100,19 @@ def _tq_fuse_q_rotation(
     d_offs = tl.arange(0, HEAD_SIZE_PADDED)
     pit_offsets = d_offs[:, None] * PiT_stride_0 + d_offs[None, :] * PiT_stride_1
     pit_mask = dim_mask[:, None] & dim_mask[None, :]
-    PiT_tile = tl.load(PiT_ptr + pit_offsets, mask=pit_mask, other=0.0).to(tl.float32)
-    # input_precision="ieee" pins both inputs to full fp32 MFMA (no TF32
-    # truncation). allow_tf32 is intentionally omitted — Triton rejects
-    # passing both. This matches the launcher's rocBLAS fp32 GEMM in
-    # algebra; rounding-order differs, diff is <= a few fp16 ulp.
-    Q_rot = tl.dot(
-        Q.to(tl.float32),
-        PiT_tile,
-        input_precision="ieee",
-    )
+    # [Opt E: BF16 Q rotation] — Use BF16 MFMA instead of FP32 for Q rotation.
+    # The original FP32 path generates 64 v_mfma_f32_16x16x4_f32 MFMAs per warp
+    # (fully unrolled for constexpr HEAD_SIZE=128).  BF16 generates only 8
+    # v_mfma_f32_16x16x32_bf16_1k MFMAs — 8× fewer, freeing registers and
+    # shortening the prologue critical path.
+    # Precision: KV cache is already 4-bit quantized so bf16 rounding is well
+    # within the existing quantization noise floor.
+    # --- Opt E revert: original FP32 rotation (uncomment to revert) ---
+    # PiT_tile = tl.load(PiT_ptr + pit_offsets, mask=pit_mask, other=0.0).to(tl.float32)
+    # Q_rot = tl.dot(Q.to(tl.float32), PiT_tile, input_precision="ieee")
+    # --- Opt E: BF16 rotation ---
+    PiT_tile = tl.load(PiT_ptr + pit_offsets, mask=pit_mask, other=0.0).to(tl.bfloat16)  # [Opt E]
+    Q_rot = tl.dot(Q.to(tl.bfloat16), PiT_tile)  # [Opt E] BF16 MFMA, fp32 accumulator
     return Q_rot.to(Q.dtype)
 
 
@@ -130,7 +134,7 @@ def _tq_load_k_tile(
     knorm_u16_addrs,  # [TILE_SIZE] int64 — u16 element index for each token's K-norm
     d_offs,  # [HEAD_SIZE_PADDED]
     d_mask,  # [HEAD_SIZE_PADDED] int1
-    tile_mask,  # [TILE_SIZE] int1
+    tile_mask,  # [TILE_SIZE] int1 — ignored when UNMASKED=True
     Centroids_ptr,
     Pair_lut_ptr,
     OUT_DTYPE: tl.constexpr,  # tl.float16 or tl.bfloat16
@@ -143,6 +147,7 @@ def _tq_load_k_tile(
     NORM_CORRECTION: tl.constexpr,
     FP8_E4B15: tl.constexpr,
     TILE_SIZE: tl.constexpr,
+    UNMASKED: tl.constexpr = False,  # [Main/tail] True in main loop: no tile boundary predicate
 ):
     """Load + dequantize a TILE_SIZE × HEAD_SIZE block of keys and return
     the transposed tile K_T : [HEAD_SIZE_PADDED, TILE_SIZE].
@@ -156,11 +161,10 @@ def _tq_load_k_tile(
     """
     if KEY_FP8:
         k_addrs = data_bases[:, None] + d_offs[None, :]
-        k_raw = tl.load(
-            KV_cache_ptr + k_addrs,
-            mask=tile_mask[:, None] & d_mask[None, :],
-            other=0,
-        )
+        if UNMASKED:
+            k_raw = tl.load(KV_cache_ptr + k_addrs, mask=d_mask[None, :], other=0)
+        else:
+            k_raw = tl.load(KV_cache_ptr + k_addrs, mask=tile_mask[:, None] & d_mask[None, :], other=0)
         if FP8_E4B15:
             k_f32 = k_raw.to(tl.float8e4b15, bitcast=True).to(tl.float32)
         else:
@@ -175,36 +179,31 @@ def _tq_load_k_tile(
             half_offs = tl.arange(0, HALF_D)
             byte_mask = (half_offs * 2) < HEAD_DIM
             byte_addrs = data_bases[:, None] + half_offs[None, :]
-            byte_raw = tl.load(
-                KV_cache_ptr + byte_addrs,
-                mask=tile_mask[:, None] & byte_mask[None, :],
-                other=0,
-            ).to(tl.int32)
+            if UNMASKED:
+                byte_raw = tl.load(KV_cache_ptr + byte_addrs, mask=byte_mask[None, :], other=0).to(tl.int32)
+            else:
+                byte_raw = tl.load(KV_cache_ptr + byte_addrs, mask=tile_mask[:, None] & byte_mask[None, :], other=0).to(tl.int32)
             lo_idx = byte_raw & 0xF
             hi_idx = (byte_raw >> 4) & 0xF
             pair_key = lo_idx * N_CENTROIDS + hi_idx
             pair_slot = tl.arange(0, 2)
-            c_pair = tl.load(
-                Pair_lut_ptr + pair_key[:, :, None] * 2 + pair_slot[None, None, :],
-                mask=(tile_mask[:, None, None] & byte_mask[None, :, None]),
-                other=0.0,
-            )
+            if UNMASKED:
+                c_pair = tl.load(Pair_lut_ptr + pair_key[:, :, None] * 2 + pair_slot[None, None, :], mask=byte_mask[None, :, None], other=0.0)
+            else:
+                c_pair = tl.load(Pair_lut_ptr + pair_key[:, :, None] * 2 + pair_slot[None, None, :], mask=(tile_mask[:, None, None] & byte_mask[None, :, None]), other=0.0)
             c_vals = tl.reshape(c_pair, [TILE_SIZE, BLOCK_D])
         elif MSE_BITS == 4:
             half_idx = d_offs // 2
             nibble_shift = (d_offs % 2) * 4
             mse_addrs = data_bases[:, None] + half_idx[None, :]
-            mse_raw = tl.load(
-                KV_cache_ptr + mse_addrs,
-                mask=tile_mask[:, None] & d_mask[None, :],
-                other=0,
-            ).to(tl.int32)
-            mse_idx = (mse_raw >> nibble_shift[None, :]) & 0xF
-            c_vals = tl.load(
-                Centroids_ptr + mse_idx,
-                mask=tile_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            )
+            if UNMASKED:
+                mse_raw = tl.load(KV_cache_ptr + mse_addrs, mask=d_mask[None, :], other=0).to(tl.int32)
+                mse_idx = (mse_raw >> nibble_shift[None, :]) & 0xF
+                c_vals = tl.load(Centroids_ptr + mse_idx, mask=d_mask[None, :], other=0.0)
+            else:
+                mse_raw = tl.load(KV_cache_ptr + mse_addrs, mask=tile_mask[:, None] & d_mask[None, :], other=0).to(tl.int32)
+                mse_idx = (mse_raw >> nibble_shift[None, :]) & 0xF
+                c_vals = tl.load(Centroids_ptr + mse_idx, mask=tile_mask[:, None] & d_mask[None, :], other=0.0)
         else:
             # Generic bit extraction (3-bit, etc.)
             mse_bit_off = d_offs * MSE_BITS
@@ -212,31 +211,24 @@ def _tq_load_k_tile(
             mse_bit_shift = mse_bit_off % 8
             mse_mask_val = (1 << MSE_BITS) - 1
             mse_addrs0 = data_bases[:, None] + mse_byte_idx[None, :]
-            mse_raw0 = tl.load(
-                KV_cache_ptr + mse_addrs0,
-                mask=tile_mask[:, None] & d_mask[None, :],
-                other=0,
-            ).to(tl.int32)
-            mse_raw1 = tl.load(
-                KV_cache_ptr + mse_addrs0 + 1,
-                mask=tile_mask[:, None] & d_mask[None, :],
-                other=0,
-            ).to(tl.int32)
-            raw16 = mse_raw0 | (mse_raw1 << 8)
-            mse_idx = (raw16 >> mse_bit_shift[None, :]) & mse_mask_val
-            c_vals = tl.load(
-                Centroids_ptr + mse_idx,
-                mask=tile_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            )
+            if UNMASKED:
+                mse_raw0 = tl.load(KV_cache_ptr + mse_addrs0, mask=d_mask[None, :], other=0).to(tl.int32)
+                mse_raw1 = tl.load(KV_cache_ptr + mse_addrs0 + 1, mask=d_mask[None, :], other=0).to(tl.int32)
+                raw16 = mse_raw0 | (mse_raw1 << 8)
+                mse_idx = (raw16 >> mse_bit_shift[None, :]) & mse_mask_val
+                c_vals = tl.load(Centroids_ptr + mse_idx, mask=d_mask[None, :], other=0.0)
+            else:
+                mse_raw0 = tl.load(KV_cache_ptr + mse_addrs0, mask=tile_mask[:, None] & d_mask[None, :], other=0).to(tl.int32)
+                mse_raw1 = tl.load(KV_cache_ptr + mse_addrs0 + 1, mask=tile_mask[:, None] & d_mask[None, :], other=0).to(tl.int32)
+                raw16 = mse_raw0 | (mse_raw1 << 8)
+                mse_idx = (raw16 >> mse_bit_shift[None, :]) & mse_mask_val
+                c_vals = tl.load(Centroids_ptr + mse_idx, mask=tile_mask[:, None] & d_mask[None, :], other=0.0)
 
-        # Opt#1: 1/||c_vec|| is pre-folded into the stored K-norm at store
-        # time, so the kernel doesn't recompute norm-correction here.
-        # Opt#3: K-norms for a tile are contiguous in the per-block SoA
-        # region when the tile lies within one block (always true for
-        # aligned decode tiles with TILE_SIZE == BLOCK_SIZE) — one coalesced
-        # u16 load replaces TILE_SIZE scattered 2-byte loads.
-        norm_u16 = tl.load(KV_cache_u16_ptr + knorm_u16_addrs, mask=tile_mask, other=0)
+        # Opt#3: K-norms contiguous in per-block SoA region for aligned tiles.
+        if UNMASKED:
+            norm_u16 = tl.load(KV_cache_u16_ptr + knorm_u16_addrs)
+        else:
+            norm_u16 = tl.load(KV_cache_u16_ptr + knorm_u16_addrs, mask=tile_mask, other=0)
         vec_norms = norm_u16.to(tl.float16, bitcast=True).to(tl.float32)
         K = c_vals * vec_norms[:, None]  # [TILE_SIZE, HEAD_SIZE_PADDED]
 
@@ -260,10 +252,11 @@ def _tq_load_v_tile(
     vzero_u16_addrs,  # [TILE_SIZE] int64 — u16 element index for V-zero
     d_offs,
     d_mask,
-    tile_mask,
+    tile_mask,  # [TILE_SIZE] int1 — ignored when UNMASKED=True
     OUT_DTYPE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     VQB: tl.constexpr,
+    UNMASKED: tl.constexpr = False,  # [Main/tail] True in main loop: no tile boundary predicate
 ):
     """Load + dequantize a TILE_SIZE × HEAD_SIZE block of values.
 
@@ -279,33 +272,32 @@ def _tq_load_v_tile(
         vb_idx = d_offs // 2
         vb_shift = (d_offs % 2) * 4
         val_addrs = val_bases[:, None] + vb_idx[None, :]
-        val_raw = tl.load(
-            KV_cache_ptr + val_addrs,
-            mask=tile_mask[:, None] & d_mask[None, :],
-            other=0,
-        ).to(tl.int32)
+        if UNMASKED:
+            val_raw = tl.load(KV_cache_ptr + val_addrs, mask=d_mask[None, :], other=0).to(tl.int32)
+        else:
+            val_raw = tl.load(KV_cache_ptr + val_addrs, mask=tile_mask[:, None] & d_mask[None, :], other=0).to(tl.int32)
         v_idx = ((val_raw >> vb_shift[None, :]) & 0xF).to(tl.float32)
     else:  # VQB == 3
         val_bit_off = d_offs * 3
         val_byte_idx = val_bit_off // 8
         val_bit_shift = val_bit_off % 8
         val_addrs0 = val_bases[:, None] + val_byte_idx[None, :]
-        val_raw0 = tl.load(
-            KV_cache_ptr + val_addrs0,
-            mask=tile_mask[:, None] & d_mask[None, :],
-            other=0,
-        ).to(tl.int32)
-        val_raw1 = tl.load(
-            KV_cache_ptr + val_addrs0 + 1,
-            mask=tile_mask[:, None] & d_mask[None, :],
-            other=0,
-        ).to(tl.int32)
+        if UNMASKED:
+            val_raw0 = tl.load(KV_cache_ptr + val_addrs0, mask=d_mask[None, :], other=0).to(tl.int32)
+            val_raw1 = tl.load(KV_cache_ptr + val_addrs0 + 1, mask=d_mask[None, :], other=0).to(tl.int32)
+        else:
+            val_raw0 = tl.load(KV_cache_ptr + val_addrs0, mask=tile_mask[:, None] & d_mask[None, :], other=0).to(tl.int32)
+            val_raw1 = tl.load(KV_cache_ptr + val_addrs0 + 1, mask=tile_mask[:, None] & d_mask[None, :], other=0).to(tl.int32)
         raw16 = val_raw0 | (val_raw1 << 8)
         v_idx = ((raw16 >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
 
     # SoA scale / zero loads — coalesced on aligned decode tiles.
-    scale_u16 = tl.load(KV_cache_u16_ptr + vscale_u16_addrs, mask=tile_mask, other=0)
-    zero_u16 = tl.load(KV_cache_u16_ptr + vzero_u16_addrs, mask=tile_mask, other=0)
+    if UNMASKED:
+        scale_u16 = tl.load(KV_cache_u16_ptr + vscale_u16_addrs)
+        zero_u16 = tl.load(KV_cache_u16_ptr + vzero_u16_addrs)
+    else:
+        scale_u16 = tl.load(KV_cache_u16_ptr + vscale_u16_addrs, mask=tile_mask, other=0)
+        zero_u16 = tl.load(KV_cache_u16_ptr + vzero_u16_addrs, mask=tile_mask, other=0)
     v_scales = scale_u16.to(tl.float16, bitcast=True).to(tl.float32)
     v_zeros = zero_u16.to(tl.float16, bitcast=True).to(tl.float32)
 
@@ -377,6 +369,7 @@ def kernel_tq_unified_attention_2d(
     FP8_E4B15: tl.constexpr = 0,
     FUSE_Q_ROT: tl.constexpr = 0,  # Fused Q @ PiT prologue when 1 (MSE path)
     USE_SINKS: tl.constexpr = 0,  # Per-head sink logit folded into softmax denom
+    USE_BF16_DOT: tl.constexpr = 0,  # [USE_BF16_DOT] explicit bf16 cast before QK and PV tl.dot
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -460,91 +453,33 @@ def kernel_tq_unified_attention_2d(
     max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
     num_tiles = tl.cdiv(max_seq_prefix_len, TILE_SIZE)
 
-    for j in range(0, num_tiles):
+    # [Main/tail split] Main loop: tiles [0, num_tiles-1) are fully within
+    # max_seq_prefix_len — no tile boundary predicate needed on loads.
+    # Tail tile (num_tiles-1) may be partial and uses the real tile_mask.
+    # This eliminates predicated loads from ~(seq_len/TILE_SIZE - 1) tiles.
+    DATA_BYTES_PER_SLOT: tl.constexpr = KEY_DATA_BYTES + VAL_DATA_BYTES
+    query_abs_pos = context_len + query_pos[:, None]
+    dummy_tile_mask = tl.full([TILE_SIZE], 1, tl.int1)  # placeholder; UNMASKED=True skips it
+
+    for j in range(0, num_tiles - 1):
         seq_offset = j * TILE_SIZE + offs_t
-        tile_mask = seq_offset < max_seq_prefix_len
-
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
-
-        # Opt#3 SoA addressing: compute data + SoA metadata addresses once
-        # per tile; the load helpers below issue coalesced wide loads from
-        # these addresses for decode tiles that align with block boundaries.
+        physical_block_idx = tl.load(block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE).to(tl.int64)
         slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
         block_base = physical_block_idx * stride_cache_block
-        DATA_BYTES_PER_SLOT: tl.constexpr = KEY_DATA_BYTES + VAL_DATA_BYTES
-        data_bases = (
-            block_base
-            + slot_within_block * (NUM_KV_HEADS * DATA_BYTES_PER_SLOT)
-            + tl.cast(kv_head_idx, tl.int64) * DATA_BYTES_PER_SLOT
-        )
+        data_bases = block_base + slot_within_block * (NUM_KV_HEADS * DATA_BYTES_PER_SLOT) + tl.cast(kv_head_idx, tl.int64) * DATA_BYTES_PER_SLOT
         val_bases = data_bases + KEY_DATA_BYTES
-
-        head_meta_u16_base = (block_base + META_REGION_OFFSET) // 2 + tl.cast(
-            kv_head_idx, tl.int64
-        ) * (NUM_SOA_FIELDS * BLOCK_SIZE)
-        knorm_u16_addrs = (
-            head_meta_u16_base + SOA_K_NORM * BLOCK_SIZE + slot_within_block
-        )
-        vscale_u16_addrs = (
-            head_meta_u16_base + SOA_V_SCALE * BLOCK_SIZE + slot_within_block
-        )
-        vzero_u16_addrs = (
-            head_meta_u16_base + SOA_V_ZERO * BLOCK_SIZE + slot_within_block
-        )
-
-        # ---- K : [HEAD_SIZE_PADDED, TILE_SIZE] in Q.dtype ----
-        K_T = _tq_load_k_tile(
-            KV_cache_ptr,
-            KV_cache_u16_ptr,
-            data_bases,
-            knorm_u16_addrs,
-            offs_d,
-            dim_mask,
-            tile_mask,
-            Centroids_ptr,
-            Pair_lut_ptr,
-            OUT_DTYPE=Q.dtype,
-            HEAD_DIM=HEAD_SIZE,
-            BLOCK_D=HEAD_SIZE_PADDED,
-            MSE_BITS=MSE_BITS,
-            N_CENTROIDS=N_CENTROIDS,
-            KEY_FP8=KEY_FP8,
-            USE_PAIR_LUT=USE_PAIR_LUT,
-            NORM_CORRECTION=NORM_CORRECTION,
-            FP8_E4B15=FP8_E4B15,
-            TILE_SIZE=TILE_SIZE,
-        )
-
-        # ---- V : [TILE_SIZE, HEAD_SIZE_PADDED] in Q.dtype ----
-        V = _tq_load_v_tile(
-            KV_cache_ptr,
-            KV_cache_u16_ptr,
-            val_bases,
-            vscale_u16_addrs,
-            vzero_u16_addrs,
-            offs_d,
-            dim_mask,
-            tile_mask,
-            OUT_DTYPE=Q.dtype,
-            HEAD_DIM=HEAD_SIZE,
-            VQB=VQB,
-        )
-
-        # S : [BLOCK_M, TILE_SIZE]
-        S = scale * tl.dot(Q, K_T)
-
-        # Causal + query-padding mask
-        query_abs_pos = context_len + query_pos[:, None]
+        head_meta_u16_base = (block_base + META_REGION_OFFSET) // 2 + tl.cast(kv_head_idx, tl.int64) * (NUM_SOA_FIELDS * BLOCK_SIZE)
+        knorm_u16_addrs = head_meta_u16_base + SOA_K_NORM * BLOCK_SIZE + slot_within_block
+        vscale_u16_addrs = head_meta_u16_base + SOA_V_SCALE * BLOCK_SIZE + slot_within_block
+        vzero_u16_addrs = head_meta_u16_base + SOA_V_ZERO * BLOCK_SIZE + slot_within_block
+        K_T = _tq_load_k_tile(KV_cache_ptr, KV_cache_u16_ptr, data_bases, knorm_u16_addrs, offs_d, dim_mask, dummy_tile_mask, Centroids_ptr, Pair_lut_ptr, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED, MSE_BITS=MSE_BITS, N_CENTROIDS=N_CENTROIDS, KEY_FP8=KEY_FP8, USE_PAIR_LUT=USE_PAIR_LUT, NORM_CORRECTION=NORM_CORRECTION, FP8_E4B15=FP8_E4B15, TILE_SIZE=TILE_SIZE, UNMASKED=True)
+        V = _tq_load_v_tile(KV_cache_ptr, KV_cache_u16_ptr, val_bases, vscale_u16_addrs, vzero_u16_addrs, offs_d, dim_mask, dummy_tile_mask, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, VQB=VQB, UNMASKED=True)
+        if USE_BF16_DOT:
+            S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
+        else:
+            S = scale * tl.dot(Q, K_T)
         seq_mask = seq_offset[None, :] <= query_abs_pos
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
-            S,
-            float("-inf"),
-        )
-
-        # Online softmax
+        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
         m_j = tl.maximum(M, tl.max(S, axis=1))
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
         P = tl.exp(S - m_j[:, None])
@@ -553,9 +488,45 @@ def kernel_tq_unified_attention_2d(
         acc = acc * alpha[:, None]
         L = L * alpha + l_j
         M = m_j
+        if USE_BF16_DOT:
+            acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
-        # acc += P · V
-        acc += tl.dot(P.to(V.dtype), V)
+    # Tail tile: last tile may be partial — use real tile_mask on all loads.
+    if num_tiles > 0:
+        j = num_tiles - 1
+        seq_offset = j * TILE_SIZE + offs_t
+        tile_mask = seq_offset < max_seq_prefix_len
+        physical_block_idx = tl.load(block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE).to(tl.int64)
+        slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
+        block_base = physical_block_idx * stride_cache_block
+        data_bases = block_base + slot_within_block * (NUM_KV_HEADS * DATA_BYTES_PER_SLOT) + tl.cast(kv_head_idx, tl.int64) * DATA_BYTES_PER_SLOT
+        val_bases = data_bases + KEY_DATA_BYTES
+        head_meta_u16_base = (block_base + META_REGION_OFFSET) // 2 + tl.cast(kv_head_idx, tl.int64) * (NUM_SOA_FIELDS * BLOCK_SIZE)
+        knorm_u16_addrs = head_meta_u16_base + SOA_K_NORM * BLOCK_SIZE + slot_within_block
+        vscale_u16_addrs = head_meta_u16_base + SOA_V_SCALE * BLOCK_SIZE + slot_within_block
+        vzero_u16_addrs = head_meta_u16_base + SOA_V_ZERO * BLOCK_SIZE + slot_within_block
+        K_T = _tq_load_k_tile(KV_cache_ptr, KV_cache_u16_ptr, data_bases, knorm_u16_addrs, offs_d, dim_mask, tile_mask, Centroids_ptr, Pair_lut_ptr, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED, MSE_BITS=MSE_BITS, N_CENTROIDS=N_CENTROIDS, KEY_FP8=KEY_FP8, USE_PAIR_LUT=USE_PAIR_LUT, NORM_CORRECTION=NORM_CORRECTION, FP8_E4B15=FP8_E4B15, TILE_SIZE=TILE_SIZE, UNMASKED=False)
+        V = _tq_load_v_tile(KV_cache_ptr, KV_cache_u16_ptr, val_bases, vscale_u16_addrs, vzero_u16_addrs, offs_d, dim_mask, tile_mask, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, VQB=VQB, UNMASKED=False)
+        if USE_BF16_DOT:
+            S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
+        else:
+            S = scale * tl.dot(Q, K_T)
+        seq_mask = seq_offset[None, :] <= query_abs_pos
+        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        P = tl.exp(S - m_j[:, None])
+        l_j = tl.sum(P, axis=1)
+        alpha = tl.exp(M - m_j)
+        acc = acc * alpha[:, None]
+        L = L * alpha + l_j
+        M = m_j
+        if USE_BF16_DOT:
+            acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
     # Epilogue: normalize and store
     acc = acc / L[:, None]
@@ -640,6 +611,7 @@ def kernel_tq_unified_attention_3d(
     FP8_E4B15: tl.constexpr = 0,
     FUSE_Q_ROT: tl.constexpr = 0,  # Fused Q @ PiT prologue when 1 (MSE path)
     USE_SINKS: tl.constexpr = 0,  # Per-head sink logit folded into softmax denom
+    USE_BF16_DOT: tl.constexpr = 0,  # [USE_BF16_DOT] explicit bf16 cast before QK and PV tl.dot
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -729,84 +701,43 @@ def kernel_tq_unified_attention_3d(
     tile_lo = segm_idx * tiles_per_segment
     tile_hi = tl.minimum((segm_idx + 1) * tiles_per_segment, num_tiles)
 
-    for j in range(tile_lo, tile_hi):
+    # [Main/tail split] Same logic as 2D kernel: eliminate tile predicate on
+    # loads for all tiles except the last in this segment.
+    DATA_BYTES_PER_SLOT: tl.constexpr = KEY_DATA_BYTES + VAL_DATA_BYTES
+    query_abs_pos = context_len + query_pos[:, None]
+    dummy_tile_mask = tl.full([TILE_SIZE], 1, tl.int1)
+    tail = tile_hi - 1  # last tile in this segment (may be partial)
+
+    # [Opt H — REVERTED] Hoisting `slot_*_offset` vectors out of the tile
+    # loop *increased* VGPR pressure from 144 → 196 (5×TILE_SIZE int64 live
+    # across the whole loop = ~80 VGPRs, dropping occupancy below 2 waves/
+    # SIMD). The compiler's per-tile recomputation has tighter live ranges
+    # and is faster. See report §7.
+
+    for j in range(tile_lo, tile_hi - 1):
         seq_offset = j * TILE_SIZE + offs_t
-        tile_mask = seq_offset < max_seq_prefix_len
-
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
-
-        # Opt#3 SoA addressing (see 2D kernel for the layout invariants).
-        slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
+        # [Opt N] Same as 3D kernel: when TILE_SIZE==BLOCK_SIZE use j directly.
+        if TILE_SIZE == BLOCK_SIZE:
+            physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j).to(tl.int64)  # [Opt N]
+            slot_within_block = offs_t.to(tl.int64)  # [Opt N]
+        else:
+            physical_block_idx = tl.load(block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE).to(tl.int64)
+            slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
         block_base = physical_block_idx * stride_cache_block
-        DATA_BYTES_PER_SLOT: tl.constexpr = KEY_DATA_BYTES + VAL_DATA_BYTES
-        data_bases = (
-            block_base
-            + slot_within_block * (NUM_KV_HEADS * DATA_BYTES_PER_SLOT)
-            + tl.cast(kv_head_idx, tl.int64) * DATA_BYTES_PER_SLOT
-        )
+        data_bases = block_base + slot_within_block * (NUM_KV_HEADS * DATA_BYTES_PER_SLOT) + tl.cast(kv_head_idx, tl.int64) * DATA_BYTES_PER_SLOT
         val_bases = data_bases + KEY_DATA_BYTES
-
-        head_meta_u16_base = (block_base + META_REGION_OFFSET) // 2 + tl.cast(
-            kv_head_idx, tl.int64
-        ) * (NUM_SOA_FIELDS * BLOCK_SIZE)
-        knorm_u16_addrs = (
-            head_meta_u16_base + SOA_K_NORM * BLOCK_SIZE + slot_within_block
-        )
-        vscale_u16_addrs = (
-            head_meta_u16_base + SOA_V_SCALE * BLOCK_SIZE + slot_within_block
-        )
-        vzero_u16_addrs = (
-            head_meta_u16_base + SOA_V_ZERO * BLOCK_SIZE + slot_within_block
-        )
-
-        K_T = _tq_load_k_tile(
-            KV_cache_ptr,
-            KV_cache_u16_ptr,
-            data_bases,
-            knorm_u16_addrs,
-            offs_d,
-            dim_mask,
-            tile_mask,
-            Centroids_ptr,
-            Pair_lut_ptr,
-            OUT_DTYPE=Q.dtype,
-            HEAD_DIM=HEAD_SIZE,
-            BLOCK_D=HEAD_SIZE_PADDED,
-            MSE_BITS=MSE_BITS,
-            N_CENTROIDS=N_CENTROIDS,
-            KEY_FP8=KEY_FP8,
-            USE_PAIR_LUT=USE_PAIR_LUT,
-            NORM_CORRECTION=NORM_CORRECTION,
-            FP8_E4B15=FP8_E4B15,
-            TILE_SIZE=TILE_SIZE,
-        )
-
-        V = _tq_load_v_tile(
-            KV_cache_ptr,
-            KV_cache_u16_ptr,
-            val_bases,
-            vscale_u16_addrs,
-            vzero_u16_addrs,
-            offs_d,
-            dim_mask,
-            tile_mask,
-            OUT_DTYPE=Q.dtype,
-            HEAD_DIM=HEAD_SIZE,
-            VQB=VQB,
-        )
-
-        S = scale * tl.dot(Q, K_T)
-
-        query_abs_pos = context_len + query_pos[:, None]
+        head_meta_u16_base = (block_base + META_REGION_OFFSET) // 2 + tl.cast(kv_head_idx, tl.int64) * (NUM_SOA_FIELDS * BLOCK_SIZE)
+        knorm_u16_addrs = head_meta_u16_base + SOA_K_NORM * BLOCK_SIZE + slot_within_block
+        vscale_u16_addrs = head_meta_u16_base + SOA_V_SCALE * BLOCK_SIZE + slot_within_block
+        vzero_u16_addrs = head_meta_u16_base + SOA_V_ZERO * BLOCK_SIZE + slot_within_block
+        K_T = _tq_load_k_tile(KV_cache_ptr, KV_cache_u16_ptr, data_bases, knorm_u16_addrs, offs_d, dim_mask, dummy_tile_mask, Centroids_ptr, Pair_lut_ptr, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED, MSE_BITS=MSE_BITS, N_CENTROIDS=N_CENTROIDS, KEY_FP8=KEY_FP8, USE_PAIR_LUT=USE_PAIR_LUT, NORM_CORRECTION=NORM_CORRECTION, FP8_E4B15=FP8_E4B15, TILE_SIZE=TILE_SIZE, UNMASKED=True)
+        V = _tq_load_v_tile(KV_cache_ptr, KV_cache_u16_ptr, val_bases, vscale_u16_addrs, vzero_u16_addrs, offs_d, dim_mask, dummy_tile_mask, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, VQB=VQB, UNMASKED=True)
+        if USE_BF16_DOT:
+            S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
+        else:
+            S = scale * tl.dot(Q, K_T)
         seq_mask = seq_offset[None, :] <= query_abs_pos
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
-            S,
-            float("-inf"),
-        )
-
+        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
         m_j = tl.maximum(M, tl.max(S, axis=1))
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
         P = tl.exp(S - m_j[:, None])
@@ -815,8 +746,49 @@ def kernel_tq_unified_attention_3d(
         acc = acc * alpha[:, None]
         L = L * alpha + l_j
         M = m_j
+        if USE_BF16_DOT:
+            acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
-        acc += tl.dot(P.to(V.dtype), V)
+    # Tail tile of this segment — may be at max_seq_prefix_len boundary.
+    if tile_lo < tile_hi:
+        j = tail
+        seq_offset = j * TILE_SIZE + offs_t
+        tile_mask = seq_offset < max_seq_prefix_len
+        if TILE_SIZE == BLOCK_SIZE:
+            physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j).to(tl.int64)  # [Opt N]
+            slot_within_block = offs_t.to(tl.int64)  # [Opt N]
+        else:
+            physical_block_idx = tl.load(block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE).to(tl.int64)
+            slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
+        block_base = physical_block_idx * stride_cache_block
+        data_bases = block_base + slot_within_block * (NUM_KV_HEADS * DATA_BYTES_PER_SLOT) + tl.cast(kv_head_idx, tl.int64) * DATA_BYTES_PER_SLOT
+        val_bases = data_bases + KEY_DATA_BYTES
+        head_meta_u16_base = (block_base + META_REGION_OFFSET) // 2 + tl.cast(kv_head_idx, tl.int64) * (NUM_SOA_FIELDS * BLOCK_SIZE)
+        knorm_u16_addrs = head_meta_u16_base + SOA_K_NORM * BLOCK_SIZE + slot_within_block
+        vscale_u16_addrs = head_meta_u16_base + SOA_V_SCALE * BLOCK_SIZE + slot_within_block
+        vzero_u16_addrs = head_meta_u16_base + SOA_V_ZERO * BLOCK_SIZE + slot_within_block
+        K_T = _tq_load_k_tile(KV_cache_ptr, KV_cache_u16_ptr, data_bases, knorm_u16_addrs, offs_d, dim_mask, tile_mask, Centroids_ptr, Pair_lut_ptr, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED, MSE_BITS=MSE_BITS, N_CENTROIDS=N_CENTROIDS, KEY_FP8=KEY_FP8, USE_PAIR_LUT=USE_PAIR_LUT, NORM_CORRECTION=NORM_CORRECTION, FP8_E4B15=FP8_E4B15, TILE_SIZE=TILE_SIZE, UNMASKED=False)
+        V = _tq_load_v_tile(KV_cache_ptr, KV_cache_u16_ptr, val_bases, vscale_u16_addrs, vzero_u16_addrs, offs_d, dim_mask, tile_mask, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, VQB=VQB, UNMASKED=False)
+        if USE_BF16_DOT:
+            S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
+        else:
+            S = scale * tl.dot(Q, K_T)
+        seq_mask = seq_offset[None, :] <= query_abs_pos
+        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf"))
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        P = tl.exp(S - m_j[:, None])
+        l_j = tl.sum(P, axis=1)
+        alpha = tl.exp(M - m_j)
+        acc = acc * alpha[:, None]
+        L = L * alpha + l_j
+        M = m_j
+        if USE_BF16_DOT:
+            acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
     # -------- Write partial (acc, M, L) to scratch; no normalization --------
     # Layout matches baseline reduce_segments so we can reuse it.
@@ -847,6 +819,36 @@ def kernel_tq_unified_attention_3d(
 
 
 _layout_cache: dict[tuple, dict[str, int]] = {}
+
+# [Opt L1] Cache for PiT cast to query dtype (typically bf16). PiT is a
+# (D, D) projection matrix that is stable per layer across decode steps;
+# casting it once amortizes the convert. Keyed by data_ptr (a proxy for
+# tensor identity), with shape/device validated on every lookup to handle
+# the address-reuse case (e.g., across unit tests where PyTorch may free
+# and reallocate storage at the same address with a different shape).
+_qrot_pit_cache: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+
+
+def _get_pit_in_dtype(PiT: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Return PiT contiguous in `dtype`, caching across calls.
+
+    Cache invalidation: data_ptr() can be reused after a tensor is freed,
+    so we also validate shape and device on the cached entry. If anything
+    differs from the request, we recompute (the convert is ~5 us, much
+    cheaper than serving an incorrect tensor).
+    """
+    if PiT.dtype == dtype:
+        return PiT if PiT.is_contiguous() else PiT.contiguous()
+    key = (PiT.data_ptr(), dtype)
+    cached = _qrot_pit_cache.get(key)
+    if (
+        cached is None
+        or cached.shape != PiT.shape
+        or cached.device != PiT.device
+    ):
+        cached = PiT.to(dtype).contiguous()
+        _qrot_pit_cache[key] = cached
+    return cached
 
 
 def _get_layout(D: int, mse_bits: int, value_quant_bits: int) -> dict[str, int]:
@@ -977,6 +979,14 @@ def triton_turboquant_unified_attention(
         if apply_fuse_q_rot:
             q_rot = query.contiguous()
         else:
+            # [Opt L1 — REVERTED] Tried `torch.matmul(query, PiT_bf16)` to
+            # eliminate the fp32 round-trip (saves 1 alloc + 2 kernel
+            # launches per call, ~0.5 ms ITL win on 8K serving). However
+            # the bf16 GEMM rounds PiT to bf16 once *before* the matmul,
+            # introducing 1 bf16 ULP of error vs the fp32-precision path.
+            # That broke `TestV1V3TightEquivalence::test_v1_v3_decode_tight`
+            # (max_abs=2.44e-3 vs threshold 1.5e-3). Original fp32 GEMM
+            # path retained for precision parity with v1.
             q_rot = (query.float() @ PiT).to(query.dtype).contiguous()
 
     # PiT in fp32, contiguous. For the fused path this is what the kernel
@@ -1060,20 +1070,48 @@ def triton_turboquant_unified_attention(
     # Grid: at most ceil(N / BLOCK_Q) + num_seqs q-blocks total, like unified.
     total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
 
-    # TILE_SIZE heuristic (matches stock unified_attention's _get_tile_size):
-    #   prefill (max_query_len > 1): 32
-    #   decode  (max_query_len == 1): 16
-    if tile_size is None:
-        tile_size = 32 if is_prefill_like else 16
-
     # Pair-LUT fast path for 4-bit MSE keys. Skipped for FP8 and non-4-bit.
     # When USE_PAIR_LUT==0 the kernel never dereferences pair_lut, but Triton
     # still requires a tensor pointer, so we fall back to reusing `centroids`.
+    # (Moved before tile_size so Opt G can use use_pair_lut.)
     use_pair_lut = (not key_fp8) and (mse_bits == 4)
     pair_lut = _get_pair_lut(centroids) if use_pair_lut else centroids
 
+    # TILE_SIZE heuristic:
+    # decode: 16 — Triton AMD AOT backend forces num_warps=2 regardless of
+    # what we request, so TILE_SIZE=32 doubles register pressure per warp and
+    # causes spilling. Keep 16 until num_warps can be reliably set.
+    # [Opt G was TILE_SIZE=32 for pair_lut decode — reverted: hurts under
+    #  forced num_warps=2 in AOT mode even though JIT micro-bench showed gain]
+    # [Opt T] After Opt B reduced VGPR pressure 156→144, allow env var
+    # override to retest TILE_SIZE=32 on decode path.
+    if tile_size is None:
+        tile_size = 32 if is_prefill_like else 16
+    _tile_override = os.environ.get("VLLM_TQ_TILE_SIZE_DECODE")
+    if (not is_prefill_like) and _tile_override is not None:
+        tile_size = int(_tile_override)
+
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
-    num_stages = 1 if _is_hip else 2
+    # NOTE: num_stages and num_warps hints are overridden by the Triton AMD AOT
+    # backend (always compiles to num_warps=2, num_stages=1 on gfx950 for this
+    # kernel). Opt F (num_stages=2) and Opt H (num_warps=8) were tested but had
+    # zero effect in AOT serving mode. Keeping the original values here.
+    # [Opt P — REVERTED in serving] num_stages=3 was 9% faster in micro-bench
+    # but regressed 4-5 ms ITL in serving (63.12 → 59.22). Deeper pipelining
+    # adds register live-range overhead (212 VGPRs vs 196) that micro-bench
+    # doesn't expose under serving's CUDA-graph scheduling. See report §7.
+    # Override via VLLM_TQ_NUM_STAGES_3D for ablation.
+    num_stages = int(os.environ.get("VLLM_TQ_NUM_STAGES_3D", "1" if _is_hip else "2"))
+    # [USE_BF16_DOT] On ROCm, explicitly cast both operands of QK and PV dots
+    # to bfloat16 before tl.dot. This guarantees v_mfma_f32_16x16x16bf16_1k
+    # instructions are generated (vs. possibly fp32 MFMAs if Triton's AMD
+    # codegen chooses to promote based on accumulator type inference).
+    # Gated on `query.dtype == bfloat16`: when Q is fp16, casting fp16→bf16
+    # silently drops 3 mantissa bits of input precision and breaks
+    # TestV1V3TightEquivalence::test_v1_v3_decode_tight (qfp16) by ~1 fp16
+    # ULP. Production Qwen3-32B uses bf16, so this preserves the perf win
+    # without regressing fp16 unit tests.
+    use_bf16_dot = 1 if (_is_hip and query.dtype == torch.bfloat16) else 0
 
     # uint16-aliased view of the cache. Under the Opt#3 SoA layout, K-norm /
     # V-scale / V-zero live in a contiguous per-block metadata region and are
@@ -1171,6 +1209,7 @@ def triton_turboquant_unified_attention(
             FP8_E4B15=fp8_e4b15,
             FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
             USE_SINKS=1 if use_sinks else 0,
+            USE_BF16_DOT=use_bf16_dot,
             num_warps=4,
             num_stages=num_stages,
         )
@@ -1251,7 +1290,11 @@ def triton_turboquant_unified_attention(
         FP8_E4B15=fp8_e4b15,
         FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
         USE_SINKS=1 if use_sinks else 0,
-        num_warps=4,
+        USE_BF16_DOT=use_bf16_dot,
+        # [Opt B2] num_warps=2 outperforms 4/8 on MI355X with FUSE_Q_ROT=0:
+        # less per-warp work but fewer LDS-staging barriers per dot operand.
+        # Override via VLLM_TQ_NUM_WARPS_3D for ablation.
+        num_warps=int(os.environ.get("VLLM_TQ_NUM_WARPS_3D", "2")),
         num_stages=num_stages,
     )
 
@@ -1324,6 +1367,14 @@ def triton_turboquant_decode_attention_v3(
     B = query.shape[0]
     cu_seqlens_q = torch.arange(B + 1, device=query.device, dtype=seq_lens.dtype)
 
+    # [Opt B] FUSE_Q_ROT toggle. The kernel-side prologue (fuse_q_rot=True)
+    # was historically faster — but on MI355X (gfx950) micro-bench shows the
+    # launcher-side rocBLAS path is ~27% faster (saves ~160 µs per call /
+    # ~10 ms over 64 layers) because it amortizes Q@PiT into a single
+    # well-tuned rocBLAS GEMM instead of replaying it inside every CTA's
+    # prologue. Default toggled to False; set VLLM_TQ_FUSE_Q_ROT=1 to revert.
+    fuse_q_rot = os.environ.get("VLLM_TQ_FUSE_Q_ROT", "0") == "1"
+
     out = triton_turboquant_unified_attention(
         query=query.contiguous(),
         kv_cache=kv_cache,
@@ -1341,6 +1392,7 @@ def triton_turboquant_decode_attention_v3(
         norm_correction=norm_correction,
         PiT=PiT,
         output=output_buf[:B] if output_buf is not None else None,
+        fuse_q_rot=fuse_q_rot,
         max_query_len=1,
         max_seq_len=max_seq_len if max_seq_len > 0 else None,
         num_kv_splits=max_num_kv_splits,

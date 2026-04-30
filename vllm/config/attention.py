@@ -27,10 +27,12 @@ class AttentionConfig:
     flash_attn_max_num_splits_for_cuda_graph: int = 32
     """Flash Attention max number splits for cuda graph decode."""
 
-    tq_max_kv_splits_for_cuda_graph: int = 32
+    tq_max_kv_splits_for_cuda_graph: int = 64
     """TurboQuant max NUM_KV_SPLITS for cuda graph decode.
     Fixes the split count so grid dimensions are constant across captures,
-    and buffers can be pre-allocated to avoid inflating the memory estimate."""
+    and buffers can be pre-allocated to avoid inflating the memory estimate.
+    Increased from 32 to 64 (Opt B): with FUSE_Q_ROT=0 the kernel has
+    less per-CTA work, so more parallelism (smaller segments) is faster."""
 
     use_cudnn_prefill: bool = False
     """Whether to use cudnn prefill."""
