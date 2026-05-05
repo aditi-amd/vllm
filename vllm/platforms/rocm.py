@@ -374,13 +374,18 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
             ]
 
-    backends = [
-        AttentionBackendEnum.ROCM_ATTN,
-    ]
+    # Priority order (index 0 = highest priority).
+    # ROCM_AITER_UNIFIED_ATTN (Triton unified path) is preferred over the
+    # legacy ROCM_ATTN for non-TQ layers so that baseline and TQ runs use
+    # the same attention kernel on all non-quantized layers, giving a clean
+    # apples-to-apples comparison. TURBOQUANT is always auto-selected for
+    # layers with turboquant_4bit_nc KV dtype regardless of this ordering.
+    backends = []
     if rocm_aiter_ops.is_mha_enabled():
         backends.append(AttentionBackendEnum.ROCM_AITER_FA)
     if is_aiter_found_and_supported():
         backends.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
+    backends.append(AttentionBackendEnum.ROCM_ATTN)
     backends.append(AttentionBackendEnum.TRITON_ATTN)
     backends.append(AttentionBackendEnum.TURBOQUANT)
 
@@ -483,20 +488,27 @@ class RocmPlatform(Platform):
                 )
             except ImportError:
                 invalid_reasons = ["ImportError"]
-            if invalid_reasons:
-                raise ValueError(
-                    f"Selected backend {selected_backend} is not valid for "
-                    f"this configuration. Reason: {invalid_reasons}"
-                )
-            else:
+            if not invalid_reasons:
                 logger.info_once(
                     "Using %s backend (selected via --attention-backend).",
                     selected_backend.name,
                 )
                 return selected_backend.get_path()
+            # The explicitly selected backend is incompatible with this
+            # specific layer (e.g. user passed ROCM_AITER_UNIFIED_ATTN but
+            # this layer needs TURBOQUANT for a quantized KV cache dtype).
+            # Fall through to auto-selection so the correct per-layer backend
+            # is chosen rather than raising an error.
+            logger.debug(
+                "Selected backend %s is incompatible with this layer "
+                "(%s); falling back to auto-selection. Reason: %s",
+                selected_backend.name,
+                attn_selector_config.attn_type,
+                invalid_reasons,
+            )
 
-        # No selected backend or the selected backend is invalid,
-        # so we try finding a valid backend.
+        # No selected backend, or the selected backend was incompatible with
+        # this layer — find the best valid backend automatically.
         valid_backends_priorities, invalid_reasons = cls.get_valid_backends(
             device_capability=device_capability,
             attn_selector_config=attn_selector_config,

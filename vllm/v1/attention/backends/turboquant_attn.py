@@ -59,6 +59,10 @@ from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_stor
 from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
     triton_turboquant_decode_attention_v3,
 )
+from vllm.v1.attention.ops.flydsl_turboquant_decode_v4 import (
+    flydsl_turboquant_decode_attention_v4,
+    is_flydsl_available as _flydsl_v4_available,
+)
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -72,8 +76,19 @@ logger = init_logger(__name__)
 # Set VLLM_TQ_DECODE_V3=1 to enable v3 (unified prefill+decode kernel with
 # 2D/3D split-KV dispatch and BLOCK_M=128 prefill heuristic). v3 supersedes
 # v2 when enabled.
+# Set VLLM_TQ_DECODE_V4=1 to enable v4 (FlyDSL CDNA4 wide-K MFMA decode
+# kernel; MI355X / gfx950 only, MSE-key path, HEAD_SIZE=128, GQA=16).
+# v4 supersedes v3 when enabled. Continuation prefill still falls back
+# to v3 since v4 is decode-only.
 _USE_TQ_V2 = os.environ.get("VLLM_TQ_DECODE_V2", "0") == "1"
 _USE_TQ_V3 = os.environ.get("VLLM_TQ_DECODE_V3", "0") == "1"
+_USE_TQ_V4 = os.environ.get("VLLM_TQ_DECODE_V4", "0") == "1"
+if _USE_TQ_V4 and not _flydsl_v4_available():
+    logger.warning(
+        "VLLM_TQ_DECODE_V4 requested but FlyDSL is unavailable; "
+        "falling back to v3."
+    )
+    _USE_TQ_V4 = False
 
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
@@ -82,7 +97,7 @@ if _HAS_FLASH_ATTN:
 logger.info_once(
     "TurboQuant has flash attn: %s, decode kernel: %s",
     _HAS_FLASH_ATTN,
-    "v3" if _USE_TQ_V3 else "v2" if _USE_TQ_V2 else "v1",
+    "v4(flydsl)" if _USE_TQ_V4 else "v3" if _USE_TQ_V3 else "v2" if _USE_TQ_V2 else "v1",
 )
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
@@ -693,7 +708,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     # Slice from pre-built arange (no kernel launch)
                     synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]
                     synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
-                    if _USE_TQ_V3:
+                    if _USE_TQ_V3 or _USE_TQ_V4:
+                        # Continuation prefill stays on v3 even when v4 is the
+                        # main decode kernel (v4 is decode-batch only, q_len=1
+                        # implicit). Keeping v3 here makes the v3-leg vs v4-leg
+                        # differ ONLY in the decode-batch kernel — clean A/B.
                         out = triton_turboquant_decode_attention_v3(
                             query=q_seq,
                             kv_cache=kv_cache,
@@ -959,7 +978,86 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 )
             )
 
-        if _USE_TQ_V3:
+        if _USE_TQ_V4:
+            # FlyDSL v4 decode kernel: MI355X/gfx950 only, MSE-key path,
+            # HEAD_SIZE=128, GQA=8 or 16. Falls back to v3 for FP8 keys or
+            # when sinks are required.
+            #
+            # ``norm_correction`` does NOT block v4: the correction is
+            # pre-folded into the stored K-norm value at storage time
+            # (see ``triton_turboquant_store._store_packed_key`` step 3),
+            # so the decode kernel just multiplies ``c_vals * stored_knorm``
+            # regardless of whether the model uses norm_correction or not.
+            # v3 keeps NORM_CORRECTION as a constexpr only for API parity.
+            v4_eligible = (
+                not self.tq_config.key_fp8
+                and self.tq_config.key_mse_bits == 4
+                and self.tq_config.effective_value_quant_bits == 4
+                and self.head_size == 128
+                and self.num_kv_groups in (8, 16)
+                and self.sinks is None
+            )
+            if v4_eligible:
+                result = flydsl_turboquant_decode_attention_v4(
+                    query=query,
+                    kv_cache=kv_cache,
+                    block_table=attn_metadata.block_table,
+                    seq_lens=attn_metadata.seq_lens,
+                    Pi=Pi,
+                    centroids=centroids,
+                    scale=self.scale,
+                    mse_bits=self.tq_config.key_mse_bits,
+                    key_packed_size=self.tq_config.key_packed_size,
+                    value_quant_bits=self.tq_config.effective_value_quant_bits,
+                    value_packed_size=self.tq_config.value_packed_size,
+                    max_seq_len=attn_metadata.max_seq_len,
+                    key_fp8=self.tq_config.key_fp8,
+                    norm_correction=self.tq_config.norm_correction,
+                    PiT=PiT,
+                    mid_o_buf=mid_o_buf,
+                    output_buf=output_buf,
+                    lse_buf=lse_buf,
+                    buf_holder=layer,
+                    max_num_kv_splits=self.max_num_kv_splits,
+                    sinks=self.sinks,
+                )
+            else:
+                # Per-config gate failed — route to v3.
+                logger.warning_once(
+                    "v4 eligibility failed (key_fp8=%s mse_bits=%s vqb=%s "
+                    "head_size=%s num_kv_groups=%s sinks=%s) — "
+                    "falling back to v3",
+                    self.tq_config.key_fp8,
+                    self.tq_config.key_mse_bits,
+                    self.tq_config.effective_value_quant_bits,
+                    self.head_size,
+                    self.num_kv_groups,
+                    self.sinks is not None,
+                )
+                result = triton_turboquant_decode_attention_v3(
+                    query=query,
+                    kv_cache=kv_cache,
+                    block_table=attn_metadata.block_table,
+                    seq_lens=attn_metadata.seq_lens,
+                    Pi=Pi,
+                    centroids=centroids,
+                    scale=self.scale,
+                    mse_bits=self.tq_config.key_mse_bits,
+                    key_packed_size=self.tq_config.key_packed_size,
+                    value_quant_bits=self.tq_config.effective_value_quant_bits,
+                    value_packed_size=self.tq_config.value_packed_size,
+                    max_seq_len=attn_metadata.max_seq_len,
+                    key_fp8=self.tq_config.key_fp8,
+                    norm_correction=self.tq_config.norm_correction,
+                    PiT=PiT,
+                    mid_o_buf=mid_o_buf,
+                    output_buf=output_buf,
+                    lse_buf=lse_buf,
+                    buf_holder=layer,
+                    max_num_kv_splits=self.max_num_kv_splits,
+                    sinks=self.sinks,
+                )
+        elif _USE_TQ_V3:
             result = triton_turboquant_decode_attention_v3(
                 query=query,
                 kv_cache=kv_cache,
