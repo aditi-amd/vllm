@@ -309,11 +309,40 @@ def build_tq_decode_v4_module(
         # With kv_block_size > TILE_SIZE there are _TILES_PER_BLOCK tiles
         # per cache block. Tiles within the same block share a block-table
         # entry but address different slot ranges within the block.
+        #
+        # ── Per-tile block-table OOB redirect ────────────────────────────
+        # The K-tile loop is unrolled 16 times so every CTA issues 16
+        # block-table reads regardless of (partition, seq_len). When a
+        # partition extends past ``seq_len`` (e.g. num_partitions=2 for
+        # a 256-token sequence — partition 1 covers tokens 256..511, all
+        # masked out) the per-tile bt offset can land beyond the bt
+        # allocation. With ``max_size=True`` the descriptor advertises
+        # 4 GB so the HW returns whatever pre-existing HBM bytes live at
+        # that offset; the resulting garbage ``phys_block`` is multiplied
+        # by ``stride_cache_block`` and the subsequent kv_cache read
+        # jumps into pages that may be unmapped (→ "Memory access fault
+        # by GPU node") or may decode as NaN bytes (→ NaN segm_out).
+        # Allocator-pattern dependent, but reproduces deterministically
+        # at large B (e.g. B=64 seq=256 in the test sweep produces 8 192
+        # NaN entries even on canonical QG=8).
+        #
+        # Fix: when the tile starts at or past ``seq_len`` (so its
+        # qk_acc is going to be killed by the per-token
+        # ``kv_tok < seq_len`` mask anyway), redirect the bt read to
+        # ``bt[seq, 0]`` — always in bounds. The redundant phys_block
+        # decode + kv_cache read is wasted work, but correctness is
+        # preserved without changing the kernel's iteration count.
         for n_tile in range_constexpr(16):
             block_in_part = n_tile // _TILES_PER_BLOCK
             tile_in_block = n_tile % _TILES_PER_BLOCK
+            tile_start_tok = (
+                partition_start + fx.Int32(n_tile * TILE_SIZE)
+            )
+            tile_in_seq = tile_start_tok < seq_len
+            bt_off = bt_seq_base + fx.Int32(block_in_part)
+            bt_off_safe = tile_in_seq.select(bt_off, seq * c_bt)
             phys_block = buffer_ops.buffer_load(
-                bt_rsrc, bt_seq_base + fx.Int32(block_in_part),
+                bt_rsrc, bt_off_safe,
                 vec_width=1, dtype=T.i32,
             )
             block_base = phys_block * c_block
