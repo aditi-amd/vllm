@@ -145,6 +145,14 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["TurboQuantAttentionImpl"]:
+        # Opt-in HIP SoA-fusion impl when VLLM_TQ_SOA_FUSION=1.
+        # Experimental gfx950-only path; superseded by FlyDSL v4
+        # (see feat/tq-flydsl-v4). Default off.
+        if os.environ.get("VLLM_TQ_SOA_FUSION", "0") == "1":
+            from vllm.v1.attention.ops.turboquant_soa_fusion import (
+                FusionTurboQuantAttentionImpl,
+            )
+            return FusionTurboQuantAttentionImpl
         return TurboQuantAttentionImpl
 
     @staticmethod
