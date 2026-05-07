@@ -1651,15 +1651,14 @@ class EngineArgs:
                 TurboQuantConfig,
             )
 
-            num_layers = model_config.hf_text_config.num_hidden_layers
-            boundary = TurboQuantConfig.get_boundary_skip_layers(num_layers)
+            boundary = TurboQuantConfig.get_boundary_skip_layers(model_config)
             existing = set(cache_config.kv_cache_dtype_skip_layers)
             merged = sorted(existing | set(boundary), key=lambda x: int(x))
             cache_config.kv_cache_dtype_skip_layers = merged
             logger.info(
                 "TQ: skipping layers %s for boundary protection (num_layers=%d)",
                 merged,
-                num_layers,
+                model_config.hf_text_config.num_hidden_layers,
             )
 
         ray_runtime_env = None
