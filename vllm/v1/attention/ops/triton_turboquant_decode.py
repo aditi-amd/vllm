@@ -1148,7 +1148,7 @@ def triton_turboquant_decode_attention(
         and _should_use_fused(B, max_seq_len_hint)
     ) else None
 
-    if hip_fused_fn is not None:
+    if hip_fused_fn is not None and sinks is None:
         # V4: native-dtype Q path — no fp32 conversion.
         # PiT in query's dtype for native GEMM (bf16×bf16 or fp16×fp16).
         # This eliminates: query.float() cast, fp32 GEMM overhead,
@@ -1308,7 +1308,7 @@ def triton_turboquant_decode_attention(
             if buf_holder is not None:
                 buf_holder._tq_q_rot_buf = q_rot
 
-    if hip_split_fn is not None:
+    if hip_split_fn is not None and sinks is None:
         _nc = 1 if norm_correction else 0
         # v136 unified kernel ABI: accepts output ptr for direct-output mode
         # When NUM_KV_SPLITS > 1, output ptr is unused (mid_o path).
