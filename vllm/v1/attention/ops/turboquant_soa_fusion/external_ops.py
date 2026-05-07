@@ -310,6 +310,169 @@ def _load_soa_bf16q_pv_mfma():
     return _load_soa_bf16q_pv_mfma_from_path(str(so_path))
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Fused SoA store kernel  (tq_store_fused_soa.so)
+# Gate: VLLM_TQ_SOA_FUSION_STORE=1
+# Fuses cast+norm+GEMV+bucketize+value_quant into one HIP kernel.
+# Constraints: D=128, mse_bits=4, value_quant_bits=4, not FP8 key.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SOA_STORE_LIB = None
+_SOA_STORE_FN = None
+_SOA_STORE_LOADED = False
+
+
+def _load_soa_fused_store():
+    global _SOA_STORE_LIB, _SOA_STORE_FN, _SOA_STORE_LOADED
+    if _SOA_STORE_LOADED:
+        return _SOA_STORE_FN
+    _SOA_STORE_LOADED = True
+    if os.environ.get("VLLM_TQ_SOA_FUSION_STORE", "0") != "1":
+        return None
+    if not current_platform.is_rocm():
+        return None
+    so_path = Path(__file__).with_name("tq_store_fused_soa.so")
+    if not so_path.exists():
+        _warn_hip_v3_scalar_once(
+            "soa-fused-store-missing",
+            f"TurboQuant SoA fused store .so missing: {so_path}; "
+            "falling back to Triton store.",
+        )
+        return None
+    try:
+        lib = ctypes.CDLL(str(so_path))
+        fn = lib.launch_tq_store_fused_soa
+        fn.argtypes = [
+            ctypes.c_void_p,  # key (bf16/fp16) [NH, D]
+            ctypes.c_void_p,  # value (bf16/fp16) [NH, D]
+            ctypes.c_void_p,  # PiT float32 [D, D]
+            ctypes.c_void_p,  # centroids float32 [16]
+            ctypes.c_void_p,  # midpoints float32 [15]
+            ctypes.c_void_p,  # kv_cache uint8
+            ctypes.c_void_p,  # kv_cache_u16 uint16 alias
+            ctypes.c_void_p,  # slot_map int64 [N]
+            ctypes.c_int,     # stride_cache_block
+            ctypes.c_int,     # H (num_kv_heads)
+            ctypes.c_int,     # block_size
+            ctypes.c_int,     # NH
+            ctypes.c_int,     # kv_dtype: 0=bf16, 1=fp16
+            ctypes.c_void_p,  # stream
+        ]
+        fn.restype = None
+        _SOA_STORE_LIB = lib
+        _SOA_STORE_FN = fn
+        return fn
+    except Exception as exc:
+        _warn_hip_v3_scalar_once(
+            "soa-fused-store-load-failed",
+            f"Failed to load TurboQuant SoA fused store: {exc}; "
+            "falling back to Triton store.",
+        )
+        return None
+
+
+def _soa_fused_store_safe(
+    key: torch.Tensor,
+    kv_cache: torch.Tensor,
+    mse_bits: int,
+    value_quant_bits: int,
+    key_fp8: bool,
+) -> bool:
+    return (
+        current_platform.is_rocm()
+        and key.shape[-1] == 128
+        and mse_bits == 4
+        and value_quant_bits == 4
+        and not key_fp8
+        and key.dtype in (torch.bfloat16, torch.float16)
+        and kv_cache.dtype == torch.uint8
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WHT butterfly kernel  (wht_butterfly.so)
+# Gate: VLLM_TQ_SOA_FUSION_WHT_BUTTERFLY=1
+# Replaces q @ PiT GEMV with an in-register Hadamard butterfly (5x faster).
+# Constraints: D=128, bf16 input/output only.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_WHT_BF_LIB = None
+_WHT_BF_FN = None
+_WHT_BF_LOADED = False
+
+
+def _load_wht_butterfly():
+    global _WHT_BF_LIB, _WHT_BF_FN, _WHT_BF_LOADED
+    if _WHT_BF_LOADED:
+        return _WHT_BF_FN
+    _WHT_BF_LOADED = True
+    if os.environ.get("VLLM_TQ_SOA_FUSION_WHT_BUTTERFLY", "0") != "1":
+        return None
+    if not current_platform.is_rocm():
+        return None
+    so_path = Path(__file__).with_name("wht_butterfly.so")
+    if not so_path.exists():
+        _warn_hip_v3_scalar_once(
+            "wht-butterfly-missing",
+            f"TurboQuant WHT butterfly .so missing: {so_path}; "
+            "falling back to FP32 GEMV q_rot.",
+        )
+        return None
+    try:
+        lib = ctypes.CDLL(str(so_path))
+        fn = lib.launch_wht_butterfly
+        fn.argtypes = [
+            ctypes.c_void_p,  # q  bf16 [M, D]
+            ctypes.c_void_p,  # q_rot bf16 [M, D] (output)
+            ctypes.c_void_p,  # signs bf16 [D]
+            ctypes.c_int,     # M = B * Hq
+            ctypes.c_int,     # D = HEAD_DIM
+            ctypes.c_void_p,  # stream
+        ]
+        fn.restype = None
+        _WHT_BF_LIB = lib
+        _WHT_BF_FN = fn
+        return fn
+    except Exception as exc:
+        _warn_hip_v3_scalar_once(
+            "wht-butterfly-load-failed",
+            f"Failed to load TurboQuant WHT butterfly: {exc}; "
+            "falling back to FP32 GEMV q_rot.",
+        )
+        return None
+
+
+def _apply_wht_butterfly(
+    query: torch.Tensor,  # [B, Hq, D] bf16
+    signs: torch.Tensor,  # [D] bf16/fp32
+) -> torch.Tensor | None:
+    """Apply WHT butterfly as drop-in replacement for FP32 GEMV q_rot.
+
+    Returns rotated query [B, Hq, D] bf16, or None if butterfly is unavailable
+    or conditions are not met (falls back to caller's GEMV path).
+    """
+    fn = _load_wht_butterfly()
+    if fn is None:
+        return None
+    if query.dtype != torch.bfloat16 or query.shape[-1] != 128:
+        return None
+    B, Hq, D = query.shape
+    M = B * Hq
+    q_flat = query.reshape(M, D).contiguous()
+    signs_bf16 = signs.to(torch.bfloat16).contiguous()
+    q_rot = torch.empty_like(q_flat)
+    stream_ptr = torch.cuda.current_stream(query.device).cuda_stream
+    fn(
+        ctypes.c_void_p(q_flat.data_ptr()),
+        ctypes.c_void_p(q_rot.data_ptr()),
+        ctypes.c_void_p(signs_bf16.data_ptr()),
+        M,
+        D,
+        ctypes.c_void_p(stream_ptr),
+    )
+    return q_rot.reshape(B, Hq, D)
+
+
 def _dtype_code(dtype: torch.dtype) -> int | None:
     if dtype is torch.bfloat16:
         return 0
@@ -405,6 +568,7 @@ def _maybe_hip_v3_mfma_like_decode(
     output_buf = kwargs.get("output_buf", None)
     max_seq_len = int(kwargs.get("max_seq_len", 0) or 0)
     max_num_kv_splits = int(kwargs.get("max_num_kv_splits", 32))
+    signs = kwargs.get("signs", None)
 
     if require_query_dtype is not None and query.dtype != require_query_dtype:
         return None
@@ -421,9 +585,16 @@ def _maybe_hip_v3_mfma_like_decode(
     if kv_group_size not in (6, 8):
         return None
 
-    q_rot = _rotated_query_fp32(query, Pi, PiT)
-    if q_rot_dtype is not None:
-        q_rot = q_rot.to(q_rot_dtype)
+    # Try WHT butterfly (5x faster than FP32 GEMV) when signs are available.
+    # Falls back to FP32 GEMV if butterfly is disabled or conditions not met.
+    if signs is not None:
+        q_rot = _apply_wht_butterfly(query, signs)
+    else:
+        q_rot = None
+    if q_rot is None:
+        q_rot = _rotated_query_fp32(query, Pi, PiT)
+        if q_rot_dtype is not None:
+            q_rot = q_rot.to(q_rot_dtype)
     q_rot = q_rot.contiguous()
     output = output_buf[:B] if output_buf is not None else torch.empty_like(query)
     if not output.is_contiguous():

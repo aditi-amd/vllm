@@ -10,6 +10,7 @@ existing production backend.
 
 from __future__ import annotations
 
+import ctypes
 import functools
 import json
 import math
@@ -28,6 +29,10 @@ from vllm.v1.attention.backends.turboquant_attn import (
 )
 
 from .external_ops import (
+    _apply_wht_butterfly,
+    _load_soa_fused_store,
+    _load_wht_butterfly,
+    _soa_fused_store_safe,
     _tq_full_dequant_kv,
     _use_fp8_e4b15,
     triton_turboquant_decode_attention_v3,
@@ -155,6 +160,44 @@ class FusionTurboQuantAttentionImpl(LegacyTurboQuantAttentionImpl):
         layer: Any | None = None,
     ) -> None:
         assert layer is not None, "Fusion store path expects the attention layer."
+        N, H, D = key.shape
+        NH = N * H
+        mse_bits = self.tq_config.key_mse_bits
+        value_quant_bits = self.tq_config.effective_value_quant_bits
+        key_fp8 = self.tq_config.key_fp8
+
+        # Fast path: single-launch HIP fused store (7x over Triton).
+        # Gate: VLLM_TQ_SOA_FUSION_STORE=1. Requires D=128, 4-bit MSE+value.
+        soa_fn = _load_soa_fused_store()
+        if soa_fn is not None and _soa_fused_store_safe(
+            key, kv_cache, mse_bits, value_quant_bits, key_fp8
+        ):
+            kv_dtype = 1 if key.dtype == torch.float16 else 0  # 0=bf16, 1=fp16
+            k_flat = key.reshape(NH, D).contiguous()
+            v_flat = value.reshape(NH, D).contiguous()
+            kv_cache_u16 = kv_cache.view(torch.uint16)
+            sm = (slot_mapping.to(torch.int64)
+                  if slot_mapping.dtype != torch.int64 else slot_mapping)
+            stream_ptr = torch.cuda.current_stream(key.device).cuda_stream
+            soa_fn(
+                ctypes.c_void_p(k_flat.data_ptr()),
+                ctypes.c_void_p(v_flat.data_ptr()),
+                ctypes.c_void_p(layer._tq_PiT.data_ptr()),
+                ctypes.c_void_p(centroids.data_ptr()),
+                ctypes.c_void_p(layer._tq_midpoints.data_ptr()),
+                ctypes.c_void_p(kv_cache.data_ptr()),
+                ctypes.c_void_p(kv_cache_u16.data_ptr()),
+                ctypes.c_void_p(sm.data_ptr()),
+                kv_cache.stride(0),
+                H,
+                kv_cache.shape[1],  # block_size
+                NH,
+                kv_dtype,
+                ctypes.c_void_p(stream_ptr),
+            )
+            return
+
+        # Fallback: Triton fused store.
         triton_turboquant_store(
             key=key,
             value=value,
@@ -162,10 +205,10 @@ class FusionTurboQuantAttentionImpl(LegacyTurboQuantAttentionImpl):
             slot_mapping=slot_mapping,
             PiT=layer._tq_PiT,
             midpoints=layer._tq_midpoints,
-            mse_bits=self.tq_config.key_mse_bits,
+            mse_bits=mse_bits,
             key_packed_size=self.tq_config.key_packed_size,
-            value_quant_bits=self.tq_config.effective_value_quant_bits,
-            key_fp8=self.tq_config.key_fp8,
+            value_quant_bits=value_quant_bits,
+            key_fp8=key_fp8,
             centroids=centroids,
             norm_correction=self.tq_config.norm_correction,
         )
@@ -514,6 +557,13 @@ class FusionTurboQuantAttentionImpl(LegacyTurboQuantAttentionImpl):
             if maybe_output_buf is not None and maybe_output_buf.dtype == query.dtype:
                 output_buf = maybe_output_buf
 
+        # Pass signs for optional WHT butterfly q_rot
+        # (VLLM_TQ_SOA_FUSION_WHT_BUTTERFLY=1). _apply_wht_butterfly
+        # checks the flag lazily; passing None disables the fast path.
+        signs = getattr(layer, "_tq_signs", None) if layer is not None else None
+        if signs is not None and _load_wht_butterfly() is None:
+            signs = None  # butterfly not loaded — skip kwarg overhead
+
         return triton_turboquant_decode_attention_v3(
             query=query,
             kv_cache=kv_cache,
@@ -533,4 +583,5 @@ class FusionTurboQuantAttentionImpl(LegacyTurboQuantAttentionImpl):
             output_buf=output_buf,
             buf_holder=layer,
             max_num_kv_splits=_effective_max_num_kv_splits(self.max_num_kv_splits),
+            signs=signs,
         )
