@@ -62,6 +62,7 @@ from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
 from vllm.v1.attention.ops.flydsl_turboquant_decode_v4 import (
     flydsl_turboquant_decode_attention_v4,
     is_flydsl_available as _flydsl_v4_available,
+    is_flydsl_gqa6_available as _flydsl_v4_gqa6_available,
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.worker.workspace import (
@@ -77,12 +78,15 @@ logger = init_logger(__name__)
 # 2D/3D split-KV dispatch and BLOCK_M=128 prefill heuristic). v3 supersedes
 # v2 when enabled.
 # Set VLLM_TQ_DECODE_V4=1 to enable v4 (FlyDSL CDNA4 wide-K MFMA decode
-# kernel; MI355X / gfx950 only, MSE-key path, HEAD_SIZE=128, GQA=16).
-# v4 supersedes v3 when enabled. Continuation prefill still falls back
-# to v3 since v4 is decode-only.
+# kernel; MI355X / gfx950 only, MSE-key path, HEAD_SIZE=128, GQA in
+# {6, 8, 16}). GQA={8,16} routes to canonical kernel (Qwen-class);
+# GQA=6 routes to tq_decode_v4_gqa6 sibling (MiniMax-M2.5). v4 supersedes
+# v3 when enabled. Continuation prefill still falls back to v3 since v4
+# is decode-only.
 _USE_TQ_V2 = os.environ.get("VLLM_TQ_DECODE_V2", "0") == "1"
 _USE_TQ_V3 = os.environ.get("VLLM_TQ_DECODE_V3", "0") == "1"
 _USE_TQ_V4 = os.environ.get("VLLM_TQ_DECODE_V4", "0") == "1"
+_USE_TQ_SOA_FUSION = os.environ.get("VLLM_TQ_SOA_FUSION", "0") == "1"
 if _USE_TQ_V4 and not _flydsl_v4_available():
     logger.warning(
         "VLLM_TQ_DECODE_V4 requested but FlyDSL is unavailable; "
@@ -160,6 +164,11 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["TurboQuantAttentionImpl"]:
+        if _USE_TQ_SOA_FUSION:
+            from vllm.v1.attention.ops.turboquant_soa_fusion import (
+                FusionTurboQuantAttentionImpl,
+            )
+            return FusionTurboQuantAttentionImpl
         return TurboQuantAttentionImpl
 
     @staticmethod
@@ -240,6 +249,12 @@ class TurboQuantMetadata(AttentionMetadata):
 class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
     """Builds TurboQuantMetadata from scheduler output."""
 
+    # v1/v2/v3, HIP SoA fusion, and v4 all bake their gridDim from a stable source
+    # (compile-time MAX_NUM_KV_SPLITS, pre-computed metadata, or worst-case derivation
+    # from block_table.shape * block_size). The v4 launcher uses a deterministic
+    # worst-case sizing (mirrored on capture and runtime) so the captured gridDim is
+    # always valid at replay. Continuation prefill needs workspace warmup that only
+    # happens during cudagraph capture, so v4 must stay IN UNIFORM_BATCH cudagraph.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
@@ -829,10 +844,23 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Use WorkspaceManager for dequant buffers.
         # Shared across all layers — saves 60× memory at long context.
         # Required for CUDA Graph capture (per-layer growth incompatible with CG).
-        k_buf, v_buf = current_workspace_manager().get_simultaneous(
-            (buf_shape, torch.float16),
-            (buf_shape, torch.float16),
-        )
+        #
+        # Fallback: if the workspace was locked at a smaller size than needed
+        # (happens when the CUDA-graph profile_seq_lens undershot max_model_len),
+        # allocate directly. _continuation_prefill is always eager (never inside
+        # a captured graph), so a per-call torch.empty is safe here.
+        if is_workspace_manager_initialized():
+            try:
+                k_buf, v_buf = current_workspace_manager().get_simultaneous(
+                    (buf_shape, torch.float16),
+                    (buf_shape, torch.float16),
+                )
+            except AssertionError:
+                k_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
+                v_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
+        else:
+            k_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
+            v_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
         # Skip .zero_() — kernel writes all positions up to cached_len,
         # and we only read [:cached_len] afterwards.
         k_cached = k_buf[:, :, :alloc_len, :]
@@ -980,8 +1008,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         if _USE_TQ_V4:
             # FlyDSL v4 decode kernel: MI355X/gfx950 only, MSE-key path,
-            # HEAD_SIZE=128, GQA=8 or 16. Falls back to v3 for FP8 keys or
-            # when sinks are required.
+            # HEAD_SIZE=128, GQA in {6, 8, 16}. Falls back to v3 for FP8
+            # keys or when sinks are required.
+            #
+            # GQA dispatch (handled inside the launcher):
+            #   * 8/16 → canonical tq_decode_v4 kernel  (Qwen 72B / 32B)
+            #   * 6    → tq_decode_v4_gqa6 sibling      (MiniMax-M2.5)
+            #
+            # GQA-6 also requires the optional sibling module to be
+            # importable from the FlyDSL checkout — if it's missing,
+            # gate the layer out of v4 here so we route cleanly to v3
+            # instead of erroring at launch.
             #
             # ``norm_correction`` does NOT block v4: the correction is
             # pre-folded into the stored K-norm value at storage time
@@ -989,12 +1026,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # so the decode kernel just multiplies ``c_vals * stored_knorm``
             # regardless of whether the model uses norm_correction or not.
             # v3 keeps NORM_CORRECTION as a constexpr only for API parity.
+            _gqa = self.num_kv_groups
+            v4_gqa_ok = (_gqa in (8, 16)) or (
+                _gqa == 6 and _flydsl_v4_gqa6_available()
+            )
             v4_eligible = (
                 not self.tq_config.key_fp8
                 and self.tq_config.key_mse_bits == 4
                 and self.tq_config.effective_value_quant_bits == 4
                 and self.head_size == 128
-                and self.num_kv_groups in (8, 16)
+                and v4_gqa_ok
                 and self.sinks is None
             )
             if v4_eligible:
