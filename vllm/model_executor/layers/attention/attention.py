@@ -379,6 +379,12 @@ class Attention(nn.Module, AttentionLayerBase):
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)
 
+        # Initialize TurboQuant buffers (Pi, S, centroids) if tq cache dtype.
+        # FusionTurboQuantAttentionImpl (HIP/SoA path) reads these as
+        # pre-registered buffers rather than lazily creating them.
+        if kv_cache_dtype.startswith("turboquant_"):
+            self._init_turboquant_buffers(kv_cache_dtype, head_size, prefix)
+
         # for attn backends supporting query quantization
         self.query_quant = None
         if (
@@ -510,6 +516,46 @@ class Attention(nn.Module, AttentionLayerBase):
         s += f", scale={self.impl.scale}"  # type: ignore
         s += f", backend={self.impl.__class__.__name__}"
         return s
+
+    def _init_turboquant_buffers(
+        self,
+        cache_dtype: str,
+        head_size: int,
+        prefix: str,
+    ) -> None:
+        """Register per-layer TurboQuant buffers needed by HIP/SoA kernels.
+
+        The FusionTurboQuantAttentionImpl reads these as pre-registered buffers
+        rather than lazily initialising them. The Triton path can work either
+        way, but registering here keeps both paths consistent.
+        """
+        from vllm.model_executor.layers.quantization.turboquant.centroids import (
+            get_centroids,
+        )
+        from vllm.model_executor.layers.quantization.turboquant.config import (
+            TurboQuantConfig,
+        )
+        from vllm.model_executor.layers.quantization.turboquant.quantizer import (
+            generate_wht_signs,
+        )
+
+        tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype, head_size)
+
+        _TQ_LAYER_SEED_STRIDE = 1337
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        layer_idx = extract_layer_index(prefix)
+        seed = tq_config.seed + layer_idx * _TQ_LAYER_SEED_STRIDE
+
+        self.register_buffer(
+            "_tq_signs",
+            generate_wht_signs(head_size, seed=seed),
+        )
+        self.register_buffer(
+            "_tq_centroids",
+            get_centroids(head_size, tq_config.centroid_bits),
+        )
+        self._tq_config = tq_config
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         self.impl.process_weights_after_loading(act_dtype)
