@@ -40,6 +40,7 @@ class SchedulerConfig:
     """
 
     DEFAULT_MAX_NUM_BATCHED_TOKENS: ClassVar[int] = 2048
+    DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP: ClassVar[int] = 256
     DEFAULT_MAX_NUM_SEQS: ClassVar[int] = 128
 
     runner_type: RunnerType = "generate"
@@ -147,17 +148,17 @@ class SchedulerConfig:
     avoid gaps in GPU utilization, leading to better latency and throughput.
     """
 
-    tq_defer_waiting_prefills_for_running_decodes: bool = False
-    """When enabled, prefer decode-only steps once running requests have
-    entered decode. This is a TurboQuant-specific latency/throughput trade-off
-    for long-context decode workloads; new prefills stay queued until the
-    current decode wave yields."""
-
     stream_interval: int = Field(default=1, ge=1)
     """The interval (or buffer size) for streaming in terms of token length.
     A smaller value (1) makes streaming smoother by sending each token immediately,
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
+
+    tq_defer_waiting_prefills_for_running_decodes: bool = False
+    """When enabled, prefer decode-only steps once running requests have
+    entered decode. This is a TurboQuant-specific latency/throughput trade-off
+    for long-context decode workloads; new prefills stay queued until the
+    current decode wave yields."""
 
     @staticmethod
     def default_factory(**kwargs):
