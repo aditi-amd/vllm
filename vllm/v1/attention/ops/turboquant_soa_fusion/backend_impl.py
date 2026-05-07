@@ -122,6 +122,29 @@ class FusionTurboQuantAttentionImpl(LegacyTurboQuantAttentionImpl):
         layer._tq_fusion_cached = True
         layer._tq_cached = True
 
+    def do_kv_cache_update(
+        self,
+        layer,
+        key,
+        value,
+        kv_cache,
+        slot_mapping,
+    ):
+        """Override parent to pass centroids and layer separately to _store_kv.
+
+        The parent calls _store_kv(k, v, kv_cache, slot_mapping, layer) using
+        the 5-arg parent signature, but FusionImpl._store_kv has a 6-arg
+        signature (centroids, layer). Override here to call correctly.
+        """
+        N = slot_mapping.shape[0]
+        if N <= 0:
+            return
+        device = key.device
+        self._ensure_on_device(layer, device)
+        k = key[:N].view(N, self.num_kv_heads, self.head_size)
+        v = value[:N].view(N, self.num_kv_heads, self.head_size)
+        self._store_kv(k, v, kv_cache, slot_mapping, layer._tq_centroids, layer)
+
     def _store_kv(
         self,
         key: torch.Tensor,  # (N, Hk, D)
