@@ -558,13 +558,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             kv_cache,
             slot_mapping,
             layer._tq_PiT,
+            layer._tq_centroids,
             layer._tq_midpoints,
             mse_bits=self.tq_config.key_mse_bits,
             key_packed_size=self.tq_config.key_packed_size,
             value_quant_bits=self.tq_config.effective_value_quant_bits,
             key_fp8=self.tq_config.key_fp8,
-            centroids=layer._tq_centroids,
-            norm_correction=self.tq_config.norm_correction,
         )
 
     # ------------------------------------------------------------------ #
@@ -880,7 +879,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         grid = (alloc_len, 1 * Hk)
         _tq_full_dequant_kv[grid](
             kv_cache,
-            kv_cache_u16,
             block_table,
             centroids,
             k_cached,
@@ -892,24 +890,23 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             v_cached.stride(1),
             v_cached.stride(2),
             kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
             block_table.stride(0),
             HEAD_DIM=D,
             BLOCK_SIZE=block_size,
             NUM_KV_HEADS=Hk,
             MSE_BYTES=mse_bytes,
+            KPS=self.tq_config.key_packed_size,
             VQB=self.tq_config.effective_value_quant_bits,
             VAL_DATA_BYTES=val_data_bytes,
             MSE_BITS=self.tq_config.key_mse_bits,
+            N_CENTROIDS=2 ** self.tq_config.key_mse_bits,
             KEY_FP8=1 if key_fp8 else 0,
-            KEY_DATA_BYTES=key_data_bytes,
-            META_REGION_OFFSET=meta_region_offset,
-            NUM_SOA_FIELDS=num_soa_fields,
-            SOA_K_NORM=soa_k_norm,
-            SOA_V_SCALE=soa_v_scale,
-            SOA_V_ZERO=soa_v_zero,
             BLOCK_D=BLOCK_D,
             NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
             FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+            OUT_BF16=0,
             num_warps=4,
         )
 
