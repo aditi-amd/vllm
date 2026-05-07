@@ -539,6 +539,8 @@ def _tq_decode_stage1(
     Centroids_ptr,  # [n_centroids] float32
     # Output (intermediate for stage2)
     Mid_o_ptr,  # [B, Hq, NUM_KV_SPLITS, D+1] float32
+    # Optional sink logits (None → null ptr when USE_SINKS=0)
+    Sink_ptr,  # [Hq] float32 — per-head sink logit; only read when USE_SINKS=1
     # Strides
     stride_qb,
     stride_qh,  # Q strides: [B, Hq, D]
@@ -569,6 +571,7 @@ def _tq_decode_stage1(
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    USE_SINKS: tl.constexpr = 0,  # 1 = per-head sink logit in Sink_ptr
 ):
     bid = tl.program_id(0)  # batch index
     hid = tl.program_id(1)  # q_head index
@@ -628,9 +631,20 @@ def _tq_decode_stage1(
         val_byte_idx = val_bit_off // 8
         val_bit_shift = val_bit_off % 8
 
-    # Online softmax accumulators
-    m_prev = -float("inf")
-    l_prev = 0.0
+    # Online softmax accumulators.
+    # When sinks are active, split-0 seeds m_prev with the per-head sink
+    # logit so that sink tokens participate in the global softmax normalization
+    # across all splits (same semantics as the unified-attention v3 kernel).
+    if USE_SINKS:
+        if sid == 0:
+            m_prev = tl.load(Sink_ptr + hid).to(tl.float32)
+            l_prev = 1.0
+        else:
+            m_prev = -float("inf")
+            l_prev = 0.0
+    else:
+        m_prev = -float("inf")
+        l_prev = 0.0
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
     bt_base = bid * stride_bt_b
@@ -1029,6 +1043,7 @@ def triton_turboquant_decode_attention(
     max_seq_len_hint: int = 0,
     allow_adaptive_kv_splits: bool = False,
     v56_max_seq_len: int = 0,  # 0 = disabled; GEMV cost is seq-independent
+    sinks: torch.Tensor | None = None,  # [Hq] float32, pre-computed sink logits
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -1328,6 +1343,12 @@ def triton_turboquant_decode_attention(
         BLOCK_KV = 4
         grid = (B, Hq, NUM_KV_SPLITS)
         t0 = time.perf_counter()
+        use_sinks = sinks is not None
+        sinks_f32 = None
+        if use_sinks:
+            sinks_f32 = sinks if sinks.dtype == torch.float32 else sinks.to(torch.float32)
+            if not sinks_f32.is_contiguous():
+                sinks_f32 = sinks_f32.contiguous()
         _tq_decode_stage1[grid](
             q_rot,
             kv_cache,
@@ -1335,6 +1356,7 @@ def triton_turboquant_decode_attention(
             seq_lens,
             centroids,
             mid_o,
+            sinks_f32,
             q_rot.stride(0),
             q_rot.stride(1),
             kv_cache.stride(0),
@@ -1360,6 +1382,7 @@ def triton_turboquant_decode_attention(
             KEY_FP8=1 if key_fp8 else 0,
             NORM_CORRECTION=1 if norm_correction else 0,
             FP8_E4B15=fp8_e4b15,
+            USE_SINKS=1 if use_sinks else 0,
             num_warps=1,
             num_stages=1,
         )
