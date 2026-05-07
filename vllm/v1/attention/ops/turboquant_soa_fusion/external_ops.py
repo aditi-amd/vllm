@@ -257,6 +257,30 @@ def _load_soa_bf16q_pv_mfma_from_path(so_path: str):
         return None
 
 
+def _load_soa_bf16q_pv_mfma_gqa6():
+    """Load the gqa=6 variant of the bf16Q/PV MFMA decode kernel.
+
+    Compiled from soa_bf16q_pv_mfma_decode_gqa6.hip with:
+      KV_GROUP_SIZE=6, THREADS=192 (=32*6), WAVES=3 (=192/64)
+    All other constants (BLOCK_N, HEAD_DIM, DIMS_PER_THREAD, etc.) unchanged.
+    """
+    if os.environ.get("VLLM_TQ_SOA_FUSION_DECODE_BF16Q_PV_MFMA", "0") != "1":
+        return None
+    if os.environ.get("TQ_DISABLE_HIP_SO", "0") == "1":
+        return None
+    if not current_platform.is_rocm():
+        return None
+    so_path = Path(
+        os.environ.get(
+            "VLLM_TQ_SOA_FUSION_BF16Q_PV_MFMA_GQA6_SO_PATH",
+            str(Path(__file__).with_name("soa_bf16q_pv_mfma_decode_gqa6.so")),
+        )
+    )
+    if not so_path.exists():
+        return None
+    return _load_soa_bf16q_pv_mfma_from_path(str(so_path))
+
+
 def _load_soa_bf16q_pv_mfma():
     if os.environ.get("VLLM_TQ_SOA_FUSION_DECODE_BF16Q_PV_MFMA", "0") != "1":
         return None
@@ -394,7 +418,7 @@ def _maybe_hip_v3_mfma_like_decode(
     Hk = kv_cache.shape[2]
     block_size = kv_cache.shape[1]
     kv_group_size = Hq // Hk
-    if kv_group_size != 8:
+    if kv_group_size not in (6, 8):
         return None
 
     q_rot = _rotated_query_fp32(query, Pi, PiT)
@@ -449,8 +473,23 @@ def _maybe_hip_v3_mfma_like_decode(
 
 
 def _maybe_soa_bf16q_pv_mfma_decode(*args, **kwargs):
+    # Dispatch to the matching compiled kernel by kv_group_size.
+    # KV_GROUP_SIZE is baked into the kernel at compile time, so each gqa
+    # value needs its own .so. Unsupported values fall back to Triton v3.
+    query = kwargs.get("query")
+    kv_cache = kwargs.get("kv_cache")
+    if query is not None and kv_cache is not None:
+        kv_group_size = query.shape[1] // kv_cache.shape[2]
+        if kv_group_size == 6:
+            fn = _load_soa_bf16q_pv_mfma_gqa6()
+        elif kv_group_size == 8:
+            fn = _load_soa_bf16q_pv_mfma()
+        else:
+            return None  # unsupported gqa — fall back to Triton v3
+    else:
+        fn = _load_soa_bf16q_pv_mfma()
     return _maybe_hip_v3_mfma_like_decode(
-        _load_soa_bf16q_pv_mfma(),
+        fn,
         *args,
         q_rot_dtype=torch.bfloat16,
         require_query_dtype=torch.bfloat16,
