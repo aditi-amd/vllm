@@ -188,9 +188,10 @@ class FusionTurboQuantAttentionImpl(LegacyTurboQuantAttentionImpl):
                 ctypes.c_void_p(kv_cache.data_ptr()),
                 ctypes.c_void_p(kv_cache_u16.data_ptr()),
                 ctypes.c_void_p(sm.data_ptr()),
-                kv_cache.stride(0),
+                kv_cache.stride(0),   # stride_cache_block: bytes per block
+                kv_cache.stride(2),   # stride_cache_head: bytes per slot (e.g. 134)
                 H,
-                kv_cache.shape[1],  # block_size
+                kv_cache.shape[1],    # block_size
                 NH,
                 kv_dtype,
                 ctypes.c_void_p(stream_ptr),

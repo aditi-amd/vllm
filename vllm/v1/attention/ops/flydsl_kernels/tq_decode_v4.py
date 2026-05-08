@@ -90,6 +90,7 @@ def build_tq_decode_v4_module(
     query_group_size: int = QUERY_GROUP_SIZE,
     kv_block_size: int = KV_BLOCK_SIZE,
     use_hw_v_transpose: bool = False,
+    tile_groups_per_partition: int = 1,
 ):
     """Build a TQ decode v4 kernel module.
 
@@ -115,6 +116,15 @@ def build_tq_decode_v4_module(
     instructions per lane per K-tile (32 -> 4) and 8 strided ds_read_b64
     per PV chunk (replaces them with 1 hw-transpose read each). Pattern
     derived from ``flash_attn_func.py`` (USE_HW_TR=True path).
+
+    ``tile_groups_per_partition`` (default 1) controls the FA-2 split-K
+    granularity. With value G each partition processes ``G * 16`` K-tiles
+    = ``G * KV_COMPUTE_BLOCK`` tokens, with the existing 16-tile loop
+    body iterated G times. The launcher uses this to bound
+    ``num_partitions`` (e.g. cap at 32) for long context: at 32K /
+    block_size=32 / num_partitions=32, G=5 covers 32*5*256 = 40 960
+    tokens of worst-case context with grid.z=32 instead of 256.
+    Behavior at G=1 is bit-identical to the pre-Option-A kernel.
     """
     assert query_group_size in (8, 16), (
         f"query_group_size must be 8 or 16; got {query_group_size}"
@@ -123,7 +133,12 @@ def build_tq_decode_v4_module(
         f"kv_block_size must be 16 or 32; got {kv_block_size}"
     )
     assert kv_block_size % TILE_SIZE == 0
+    assert int(tile_groups_per_partition) >= 1, (
+        f"tile_groups_per_partition must be >= 1; got {tile_groups_per_partition}"
+    )
     USE_HW_TR = bool(use_hw_v_transpose)
+    TGPP = int(tile_groups_per_partition)
+    PARTITION_EXTENT_TOKENS = TGPP * KV_COMPUTE_BLOCK
 
     QG = int(query_group_size)
     QG_LOAD_ITERS = QG // 4         # 2 for QG=8, 4 for QG=16
@@ -286,7 +301,15 @@ def build_tq_decode_v4_module(
 
         # ===== STEP E: Sequence-len + partition base ====================
         seq_len = buffer_ops.buffer_load(sl_rsrc, seq, vec_width=1, dtype=T.i32)
-        partition_start = part * fx.Int32(KV_COMPUTE_BLOCK)
+        # ── Option A: bounded num_partitions + internal looping ─────────
+        # With TGPP > 1 this CTA owns a contiguous slice of length
+        # ``PARTITION_EXTENT_TOKENS`` that is iterated as ``TGPP`` groups
+        # of 16 K-tiles each. ``partition_start`` is recomputed per
+        # outer ``tg`` iteration below; the FA-2 online-softmax state
+        # (running_max, running_sum, acc_pv) accumulates across all
+        # ``TGPP * 16`` tiles for this CTA — semantically identical to
+        # processing one large 16*TGPP-tile partition.
+        partition_base = part * fx.Int32(PARTITION_EXTENT_TOKENS)
 
         # Per-K-tile dequant lane assignment:
         # 16 tokens × 64 packed bytes per token = 1024 bytes
@@ -302,8 +325,6 @@ def build_tq_decode_v4_module(
         c_knorm_off_u16 = fx.Int32(SOA_K_NORM * _BS)
         c_vscale_off_u16 = fx.Int32(SOA_V_SCALE * _BS)
         c_vzero_off_u16 = fx.Int32(SOA_V_ZERO * _BS)
-
-        bt_seq_base = seq * c_bt + (partition_start // fx.Int32(_BS))
 
         # ===== STEP F: K-tile loop =======================================
         # With kv_block_size > TILE_SIZE there are _TILES_PER_BLOCK tiles
@@ -332,310 +353,385 @@ def build_tq_decode_v4_module(
         # ``bt[seq, 0]`` — always in bounds. The redundant phys_block
         # decode + kv_cache read is wasted work, but correctness is
         # preserved without changing the kernel's iteration count.
-        for n_tile in range_constexpr(16):
-            block_in_part = n_tile // _TILES_PER_BLOCK
-            tile_in_block = n_tile % _TILES_PER_BLOCK
-            tile_start_tok = (
-                partition_start + fx.Int32(n_tile * TILE_SIZE)
+        # ===== Option A': scf.ForOp w/ iter_args (HIP-style) =========
+        # Runtime-adaptive outer loop: trip count derives from
+        # actual seq_len, NOT TGPP_max. At cudagraph-capture warmup
+        # (seq_len=1) only 1 iteration runs; at 32K production
+        # decode all TGPP iterations run. Kernel binary stays small
+        # (single body, looped at runtime) — capture time matches
+        # the legacy 16-tile-only kernel rather than scaling 4x.
+        #
+        # FA-2 state (running_max, running_sum, acc_pv[8]) threads
+        # through scf iter_args; the body reads them at top, runs
+        # the unchanged 16-tile inner body, and yields the new
+        # state at bottom. After the loop, results are pulled out
+        # of for_op.results back into the local Python names so the
+        # downstream STEP G (output) is unmodified.
+        c_kcb = fx.Int32(KV_COMPUTE_BLOCK)
+        c_tgpp = fx.Int32(TGPP)
+        c_zero_i32 = fx.Int32(0)
+        c_one_i32 = fx.Int32(1)
+        # remaining = seq_len - partition_base   (signed, may be <=0)
+        remaining = seq_len - partition_base
+        in_range = remaining > c_zero_i32
+        # trip_raw = ceil(remaining / KV_COMPUTE_BLOCK)
+        # (when in_range is false, the divisor branch produces
+        # garbage that the select below overrides with zero, so we
+        # don't pre-clamp)
+        trip_raw = (remaining + c_kcb - c_one_i32) // c_kcb
+        trip_clamped = (trip_raw > c_tgpp).select(c_tgpp, trip_raw)
+        trip_or_zero = in_range.select(trip_clamped, c_zero_i32)
+        c_zero_idx = arith.constant(0, index=True)
+        c_one_idx = arith.constant(1, index=True)
+        trip_idx = arith.index_cast(
+            T.index,
+            trip_or_zero.ir_value()
+            if hasattr(trip_or_zero, 'ir_value') else trip_or_zero,
+        )
+        # Initial iter_args list: FA-2 accumulator state.
+        # Order: running_max, running_sum, acc_pv[0..PV_N_CHUNKS-1].
+        # NOTE: scf.ForOp requires ir.Value (with .type). The DSL
+        # constants ZERO_F / ONE_F are fx.Float32 (Numeric) wrappers,
+        # not raw ir.Value, so we unwrap via .ir_value() before
+        # passing.
+        def _ival(v):
+            return v.ir_value() if hasattr(v, 'ir_value') else v
+        _init_iter = [
+            _ival(running_max),
+            _ival(running_sum),
+            *[_ival(p) for p in acc_pv],
+        ]
+        _for_op = _scf.ForOp(
+            c_zero_idx, trip_idx, c_one_idx, _init_iter,
+        )
+        _for_ip = ir.InsertionPoint(_for_op.body)
+        _for_ip.__enter__()
+        try:
+            tg_idx = _for_op.induction_variable
+            tg_i32 = fx.Int32(arith.index_cast(T.i32, tg_idx))
+            partition_start = partition_base + tg_i32 * c_kcb
+            bt_seq_base = (
+                seq * c_bt + (partition_start // fx.Int32(_BS))
             )
-            tile_in_seq = tile_start_tok < seq_len
-            bt_off = bt_seq_base + fx.Int32(block_in_part)
-            bt_off_safe = tile_in_seq.select(bt_off, seq * c_bt)
-            phys_block = buffer_ops.buffer_load(
-                bt_rsrc, bt_off_safe,
-                vec_width=1, dtype=T.i32,
-            )
-            block_base = phys_block * c_block
-            data_region = block_base
-            meta_region = block_base + c_meta_off
-
-            # ``slot`` is the absolute slot index within the cache block
-            # (range 0.._BS-1). For BS=16 it equals tok_in_tile; for BS=32
-            # it equals tile_in_block * 16 + tok_in_tile. Used both for
-            # the K/V data region and SoA metadata region addressing.
-            slot = fx.Int32(tile_in_block * TILE_SIZE) + tok_in_tile
-            data_bases_byte = (
-                data_region
-                + slot * (c_kv_heads * c_data_per_slot)
-                + kv_h * c_data_per_slot
-            )
-            k_byte = data_bases_byte + chunk_in_tok * fx.Int32(16)
-            k_packed = buffer_ops.buffer_load(
-                kv_rsrc, k_byte // fx.Int32(4),
-                vec_width=4, dtype=T.i32,
-            )
-
-            # ---- HOISTED: issue V data + meta HBM loads early ---------
-            # These are async; their s_waitcnt is pushed by the compiler
-            # past the K dequant + QK MFMA + softmax block, hiding most
-            # of the V HBM latency behind compute.
-            v_byte = data_bases_byte + c_keydata + chunk_in_tok * fx.Int32(16)
-            v_packed = buffer_ops.buffer_load(
-                kv_rsrc, v_byte // fx.Int32(4),
-                vec_width=4, dtype=T.i32,
-            )
-            vscale_u16 = (
-                meta_region // fx.Int32(2)
-                + kv_h * c_meta_u16_per_kvh
-                + c_vscale_off_u16 + slot
-            )
-            vzero_u16 = (
-                meta_region // fx.Int32(2)
-                + kv_h * c_meta_u16_per_kvh
-                + c_vzero_off_u16 + slot
-            )
-            vscale_raw = buffer_ops.buffer_load(
-                kv_rsrc, vscale_u16, vec_width=1, dtype=T.i16,
-            )
-            vzero_raw = buffer_ops.buffer_load(
-                kv_rsrc, vzero_u16, vec_width=1, dtype=T.i16,
-            )
-
-            knorm_u16 = (
-                meta_region // fx.Int32(2)
-                + kv_h * c_meta_u16_per_kvh
-                + c_knorm_off_u16 + slot
-            )
-            knorm_raw = buffer_ops.buffer_load(
-                kv_rsrc, knorm_u16, vec_width=1, dtype=T.i16,
-            )
-            knorm_f16 = arith.bitcast(T.f16, knorm_raw)
-            knorm_f32 = arith.extf(T.f32, knorm_f16)
-
-            # K dequant → LDS [token, head_dim] (natural)
-            # Lane writes 32 bf16 (= 4×8) for token=tok_in_tile,
-            # head_dims chunk_in_tok*32..+31 (4 sub-chunks of 8).
-            tok_kreg = tok_in_tile * fx.Int32(HEAD_SIZE * 2 // 8)
-            chunk_kreg = tok_kreg + chunk_in_tok * fx.Int32(8)
-            for w in range_constexpr(4):
-                word_i32 = vector.extract(k_packed, static_position=[w])
-                bf16_elems = []
-                for n in range_constexpr(8):
-                    nibble = (word_i32 >> fx.Int32(n * 4)) & fx.Int32(0xF)
-                    nibble_idx = arith.index_cast(T.index, nibble)
-                    cent_f32 = cent_lds.load([nibble_idx])
-                    elem_bf16 = arith.trunc_f(T.bf16, cent_f32 * knorm_f32)
-                    bf16_elems.append(elem_bf16)
-                v_bf16 = vector.from_elements(T.vec(8, T.bf16), bf16_elems)
-                v_i64 = vector.bitcast(T.vec(2, T.i64), v_bf16)
-                vector.store(
-                    v_i64, kv_lds_i64,
-                    [arith.index_cast(T.index, chunk_kreg + fx.Int32(w * 2))],
+            running_max = _for_op.inner_iter_args[0]
+            running_sum = _for_op.inner_iter_args[1]
+            acc_pv = list(_for_op.inner_iter_args[2:])
+            for n_tile in range_constexpr(16):
+                block_in_part = n_tile // _TILES_PER_BLOCK
+                tile_in_block = n_tile % _TILES_PER_BLOCK
+                tile_start_tok = (
+                    partition_start + fx.Int32(n_tile * TILE_SIZE)
                 )
-            gpu.barrier()
+                tile_in_seq = tile_start_tok < seq_len
+                bt_off = bt_seq_base + fx.Int32(block_in_part)
+                bt_off_safe = tile_in_seq.select(bt_off, seq * c_bt)
+                phys_block = buffer_ops.buffer_load(
+                    bt_rsrc, bt_off_safe,
+                    vec_width=1, dtype=T.i32,
+                )
+                block_base = phys_block * c_block
+                data_region = block_base
+                meta_region = block_base + c_meta_off
 
-            # QK MFMA (CDNA4 wide-K): A=K[token, head_dim], B=Q (= Q^T).
-            # K read: lane t = K[token=mfma_row, head_dim=chunk*32+col_grp*8..+7]
-            # Same i64×2 indexing as Q.
-            qk_acc = zero_v4
-            for chk in range_constexpr(QK_K_CHUNKS):
-                k_idx_i64 = (
-                    mfma_row * fx.Int32(HEAD_SIZE * 2 // 8)
-                    + fx.Int32(chk * 8)
-                    + mfma_col_grp * fx.Int32(2)
+                # ``slot`` is the absolute slot index within the cache block
+                # (range 0.._BS-1). For BS=16 it equals tok_in_tile; for BS=32
+                # it equals tile_in_block * 16 + tok_in_tile. Used both for
+                # the K/V data region and SoA metadata region addressing.
+                slot = fx.Int32(tile_in_block * TILE_SIZE) + tok_in_tile
+                data_bases_byte = (
+                    data_region
+                    + slot * (c_kv_heads * c_data_per_slot)
+                    + kv_h * c_data_per_slot
                 )
-                kv_load = vector.load_op(
-                    T.vec(2, T.i64), kv_lds_i64,
-                    [arith.index_cast(T.index, k_idx_i64)],
-                )
-                k_op = vector.bitcast(T.vec(8, T.bf16), kv_load)
-                qk_acc = rocdl.mfma_f32_16x16x32_bf16(
-                    T.f32x4, [k_op, q_chunks[chk], qk_acc, 0, 0, 0]
+                k_byte = data_bases_byte + chunk_in_tok * fx.Int32(16)
+                k_packed = buffer_ops.buffer_load(
+                    kv_rsrc, k_byte // fx.Int32(4),
+                    vec_width=4, dtype=T.i32,
                 )
 
-            # qk_acc layout: lane t holds C[token=(t/16)*4..+3, query=t%16]
-            # 4 fp32/lane = 4 different tokens at SAME query_row.
-
-            # Scale + mask out-of-context tokens.
-            qk_acc = _vsplat_mul(qk_acc, QK_SCALE)
-            for elem in range_constexpr(4):
-                kv_tok = (
-                    partition_start
-                    + fx.Int32(n_tile * TILE_SIZE)
-                    + mfma_col_grp * fx.Int32(4)
-                    + fx.Int32(elem)
+                # ---- HOISTED: issue V data + meta HBM loads early ---------
+                # These are async; their s_waitcnt is pushed by the compiler
+                # past the K dequant + QK MFMA + softmax block, hiding most
+                # of the V HBM latency behind compute.
+                v_byte = data_bases_byte + c_keydata + chunk_in_tok * fx.Int32(16)
+                v_packed = buffer_ops.buffer_load(
+                    kv_rsrc, v_byte // fx.Int32(4),
+                    vec_width=4, dtype=T.i32,
                 )
-                in_b = kv_tok < seq_len
-                v = vector.extract(qk_acc, static_position=[elem])
-                qk_acc = vector.insert(
-                    in_b.select(v, NEG_INF), qk_acc,
-                    static_position=[elem], dynamic_position=[],
+                vscale_u16 = (
+                    meta_region // fx.Int32(2)
+                    + kv_h * c_meta_u16_per_kvh
+                    + c_vscale_off_u16 + slot
+                )
+                vzero_u16 = (
+                    meta_region // fx.Int32(2)
+                    + kv_h * c_meta_u16_per_kvh
+                    + c_vzero_off_u16 + slot
+                )
+                vscale_raw = buffer_ops.buffer_load(
+                    kv_rsrc, vscale_u16, vec_width=1, dtype=T.i16,
+                )
+                vzero_raw = buffer_ops.buffer_load(
+                    kv_rsrc, vzero_u16, vec_width=1, dtype=T.i16,
                 )
 
-            # FA2 online softmax: per-query-row reduce.
-            # Per-row max: max over 4 fp32 in lane, then xor-shuffle 16, 32
-            # (across the 4 col_grps that share same mfma_row).
-            local_max = vector.reduction(T.f32, "maxnumf", qk_acc)
-            r1 = local_max.shuffle_xor(fx.Int32(16), c_w)
-            local_max = local_max.maximumf(r1)
-            r2 = local_max.shuffle_xor(fx.Int32(32), c_w)
-            tile_max = local_max.maximumf(r2)
-
-            new_max = running_max.maximumf(tile_max)
-            max_diff = running_max - new_max
-            safe_diff = (running_max > NEG_INF).select(max_diff, ZERO_F)
-            scale = (safe_diff * LOG2E_C).exp2(fastmath=arith.FastMathFlags.fast)
-            running_sum = running_sum * scale
-            for h in range_constexpr(PV_N_CHUNKS):
-                acc_pv[h] = _vsplat_mul(acc_pv[h], scale)
-            running_max = new_max
-
-            # Compute probs: p = exp((qk - new_max) * LOG2E)
-            tile_sum = ZERO_F
-            for elem in range_constexpr(4):
-                s = vector.extract(qk_acc, static_position=[elem])
-                d = s - new_max
-                d = (new_max > NEG_INF).select(d, NEG_INF)
-                p = (d * LOG2E_C).exp2(fastmath=arith.FastMathFlags.fast)
-                tile_sum = tile_sum + p
-                qk_acc = vector.insert(p, qk_acc,
-                                       static_position=[elem], dynamic_position=[])
-
-            ts1 = tile_sum.shuffle_xor(fx.Int32(16), c_w)
-            tile_sum = tile_sum + ts1
-            ts2 = tile_sum.shuffle_xor(fx.Int32(32), c_w)
-            tile_sum = tile_sum + ts2
-            running_sum = running_sum + tile_sum
-
-            # ---- V dequant → LDS (V/scale/zero raw loads were hoisted) -
-            # v_packed, vscale_raw, vzero_raw are already in flight from
-            # the top of this iteration; only the f32 conversion stays
-            # here so the actual consume site is still close to the use.
-            vscale_f32 = arith.extf(T.f32, arith.bitcast(T.f16, vscale_raw))
-            vzero_f32 = arith.extf(T.f32, arith.bitcast(T.f16, vzero_raw))
-
-            if USE_HW_TR:
-                # V dequant → LDS [token][head_dim] (ROW-MAJOR, no transpose).
-                # Each lane writes 32 contiguous bf16 (one token, head_dims
-                # chunk_in_tok*32..+31) as 4× ds_write_b128 = 4× vec(2,i64).
-                # Replaces 32× ds_write_b16 of the legacy transposed path.
-                v_lds_elem_base = (
-                    tok_in_tile * fx.Int32(HEAD_SIZE)
-                    + chunk_in_tok * fx.Int32(32)
+                knorm_u16 = (
+                    meta_region // fx.Int32(2)
+                    + kv_h * c_meta_u16_per_kvh
+                    + c_knorm_off_u16 + slot
                 )
+                knorm_raw = buffer_ops.buffer_load(
+                    kv_rsrc, knorm_u16, vec_width=1, dtype=T.i16,
+                )
+                knorm_f16 = arith.bitcast(T.f16, knorm_raw)
+                knorm_f32 = arith.extf(T.f32, knorm_f16)
+
+                # K dequant → LDS [token, head_dim] (natural)
+                # Lane writes 32 bf16 (= 4×8) for token=tok_in_tile,
+                # head_dims chunk_in_tok*32..+31 (4 sub-chunks of 8).
+                tok_kreg = tok_in_tile * fx.Int32(HEAD_SIZE * 2 // 8)
+                chunk_kreg = tok_kreg + chunk_in_tok * fx.Int32(8)
                 for w in range_constexpr(4):
-                    word_i32 = vector.extract(v_packed, static_position=[w])
+                    word_i32 = vector.extract(k_packed, static_position=[w])
                     bf16_elems = []
                     for n in range_constexpr(8):
                         nibble = (word_i32 >> fx.Int32(n * 4)) & fx.Int32(0xF)
-                        nibble_f32 = arith.sitofp(T.f32, nibble)
-                        elem_f32 = nibble_f32 * vscale_f32 + vzero_f32
-                        elem_bf16 = arith.trunc_f(T.bf16, elem_f32)
+                        nibble_idx = arith.index_cast(T.index, nibble)
+                        cent_f32 = cent_lds.load([nibble_idx])
+                        elem_bf16 = arith.trunc_f(T.bf16, cent_f32 * knorm_f32)
                         bf16_elems.append(elem_bf16)
                     v_bf16 = vector.from_elements(T.vec(8, T.bf16), bf16_elems)
                     v_i64 = vector.bitcast(T.vec(2, T.i64), v_bf16)
-                    v_lds_i64_idx = (
-                        v_lds_elem_base + fx.Int32(w * 8)
-                    ) // fx.Int32(4)
                     vector.store(
                         v_i64, kv_lds_i64,
-                        [arith.index_cast(T.index, v_lds_i64_idx)],
+                        [arith.index_cast(T.index, chunk_kreg + fx.Int32(w * 2))],
                     )
-                # ── HW V transpose: cross-lane LDS sync ─────────────────────
-                # ds_read_tr16_b64 below introduces a cross-lane LDS read:
-                # consumer lane t reads bytes written by source lanes
-                # 0,4,8,12 (etc.). The compiler's automatic waitcnt insertion
-                # is per-lane and has no awareness of the HW transpose's
-                # cross-lane forwarding, so it can sink the next iteration's
-                # ds_read ahead of these ds_write_b128 ops in the schedule.
-                #
-                # Two-part fence (mirrors mla_fwd_decode_m16x8_fp8_fp8.py):
-                #   1. sched_barrier(0): MachineScheduler reorder barrier
-                #      (mask=0 → no instruction class may cross). Pure hint,
-                #      generates no runtime instruction. Use the simple
-                #      sched_barrier (NOT sched_group_barrier, which is an
-                #      IGLP marker that requires partner barriers and
-                #      corrupts the schedule when used in isolation).
-                #   2. s_waitcnt lgkmcnt=0: runtime drain of the LDS write
-                #      queue. vmcnt/expcnt left at no-wait so we don't
-                #      stall on speculatively-issued HBM loads (which can
-                #      include OOB-but-masked buffer_load reads from the
-                #      next K-tile's hoisted V prefetch).
-                #
-                # The SW path below does NOT need this because each lane
-                # only reads cells it itself wrote (no cross-lane dep), and
-                # the per-lane same-address waitcnt the compiler emits is
-                # correct.
-                #
-                # Empirical: targets the -3.3pp GSM8K regression on
-                # Qwen3-32B (padded num_partitions=64, ~16 K-tiles each)
-                # while leaving Qwen2.5-72B (16 partitions) unchanged.
-                rocdl.sched_barrier(0)
-                # encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=0)
-                #   = 0xF | (7<<4) | (0<<8) | (3<<14) = 0xC07F
-                rocdl.s_waitcnt(0xC07F)
-            else:
-                # Legacy transposed V_LDS path: 32 ds_write_b16 per lane.
-                for w in range_constexpr(4):
-                    word_i32 = vector.extract(v_packed, static_position=[w])
-                    for n in range_constexpr(8):
-                        nibble = (word_i32 >> fx.Int32(n * 4)) & fx.Int32(0xF)
-                        nibble_f32 = arith.sitofp(T.f32, nibble)
-                        elem_f32 = nibble_f32 * vscale_f32 + vzero_f32
-                        elem_bf16 = arith.trunc_f(T.bf16, elem_f32)
-                        elem_i16 = arith.bitcast(T.i16, elem_bf16)
-                        head_dim = chunk_in_tok * fx.Int32(32) + fx.Int32(w * 8 + n)
-                        v_idx_i16 = head_dim * fx.Int32(TILE_SIZE) + tok_in_tile
-                        v_vec = vector.from_elements(T.vec(1, T.i16), [elem_i16])
-                        vector.store(v_vec, kv_lds_i16,
-                                     [arith.index_cast(T.index, v_idx_i16)])
-            gpu.barrier()
+                gpu.barrier()
 
-            # ---- PV MFMA: A=V[head_dim, token], B=P (=qk_acc bf16) -----
-            # P operand B layout matches qk_acc: lane t holds 4 bf16 at
-            # K=token=(t/16)*4..+3, N=query=t%16. Just trunc_f to bf16.
-            p_bf16 = arith.trunc_f(T.vec(4, T.bf16), qk_acc)
-            p_op = vector.bitcast(T.vec(4, T.i16), p_bf16)
-
-            if USE_HW_TR:
-                # HW-transpose PV path: V_lds is row-major V[token][head_dim].
-                # MFMA A operand layout: lane t holds 4 bf16 at
-                #   M=head_dim=mfma_row + h*16, K=token=(t/16)*4..+3
-                # ds_read_tr16_b64 (4-element 16-bit transpose, per-16-lane block):
-                #   result[lane=t, elem=e] = Input[source_lane=e*4 + (t%16)//4,
-                #                                   col=t%4]
-                # Per-lane address: token_idx = lane // 4 (covers 0..15 across
-                # all four 16-lane MFMA blocks), hd_sub = (lane % 4)*4 selects
-                # the 4-element column window inside the h*16 chunk.
-                # Total LDS byte offset = kv_off + token_idx*HEAD_SIZE*2
-                #                        + (h*16 + hd_sub)*2
-                token_idx = lane >> fx.Int32(2)
-                hd_sub = (lane & fx.Int32(3)) * fx.Int32(4)
-                v_lane_byte = (
-                    fx.Int32(kv_off)
-                    + token_idx * fx.Int32(HEAD_SIZE * 2)
-                    + hd_sub * fx.Int32(2)
-                )
-                for h in range_constexpr(PV_N_CHUNKS):
-                    v_byte_off = v_lane_byte + fx.Int32(h * 32)
-                    v_byte_i64 = fx.Int64(v_byte_off)
-                    v_ptr = buffer_ops.create_llvm_ptr(
-                        v_byte_i64, address_space=3,
-                    )
-                    v_op_raw = rocdl.ds_read_tr16_b64(
-                        T.vec(4, T.i16), v_ptr,
-                    ).result
-                    acc_pv[h] = rocdl.mfma_f32_16x16x16bf16_1k(
-                        T.f32x4, [v_op_raw, p_op, acc_pv[h], 0, 0, 0]
-                    )
-            else:
-                # Legacy transposed-LDS PV: 1 ds_read_b64 per chunk.
-                # Byte addr = (mfma_row + h*16) * TILE_SIZE * 2 + (col_grp*4) * 2
-                #          = (mfma_row + h*16) * 32 + col_grp*8
-                # i64 idx  = (mfma_row + h*16) * 4 + col_grp
-                for h in range_constexpr(PV_N_CHUNKS):
-                    v_idx_i64 = (
-                        (mfma_row + fx.Int32(h * 16)) * fx.Int32(4)
-                        + mfma_col_grp
+                # QK MFMA (CDNA4 wide-K): A=K[token, head_dim], B=Q (= Q^T).
+                # K read: lane t = K[token=mfma_row, head_dim=chunk*32+col_grp*8..+7]
+                # Same i64×2 indexing as Q.
+                qk_acc = zero_v4
+                for chk in range_constexpr(QK_K_CHUNKS):
+                    k_idx_i64 = (
+                        mfma_row * fx.Int32(HEAD_SIZE * 2 // 8)
+                        + fx.Int32(chk * 8)
+                        + mfma_col_grp * fx.Int32(2)
                     )
                     kv_load = vector.load_op(
-                        T.vec(1, T.i64), kv_lds_i64,
-                        [arith.index_cast(T.index, v_idx_i64)],
+                        T.vec(2, T.i64), kv_lds_i64,
+                        [arith.index_cast(T.index, k_idx_i64)],
                     )
-                    v_op = vector.bitcast(T.vec(4, T.i16), kv_load)
-                    acc_pv[h] = rocdl.mfma_f32_16x16x16bf16_1k(
-                        T.f32x4, [v_op, p_op, acc_pv[h], 0, 0, 0]
+                    k_op = vector.bitcast(T.vec(8, T.bf16), kv_load)
+                    qk_acc = rocdl.mfma_f32_16x16x32_bf16(
+                        T.f32x4, [k_op, q_chunks[chk], qk_acc, 0, 0, 0]
                     )
+
+                # qk_acc layout: lane t holds C[token=(t/16)*4..+3, query=t%16]
+                # 4 fp32/lane = 4 different tokens at SAME query_row.
+
+                # Scale + mask out-of-context tokens.
+                qk_acc = _vsplat_mul(qk_acc, QK_SCALE)
+                for elem in range_constexpr(4):
+                    kv_tok = (
+                        partition_start
+                        + fx.Int32(n_tile * TILE_SIZE)
+                        + mfma_col_grp * fx.Int32(4)
+                        + fx.Int32(elem)
+                    )
+                    in_b = kv_tok < seq_len
+                    v = vector.extract(qk_acc, static_position=[elem])
+                    qk_acc = vector.insert(
+                        in_b.select(v, NEG_INF), qk_acc,
+                        static_position=[elem], dynamic_position=[],
+                    )
+
+                # FA2 online softmax: per-query-row reduce.
+                # Per-row max: max over 4 fp32 in lane, then xor-shuffle 16, 32
+                # (across the 4 col_grps that share same mfma_row).
+                local_max = vector.reduction(T.f32, "maxnumf", qk_acc)
+                r1 = local_max.shuffle_xor(fx.Int32(16), c_w)
+                local_max = local_max.maximumf(r1)
+                r2 = local_max.shuffle_xor(fx.Int32(32), c_w)
+                tile_max = local_max.maximumf(r2)
+
+                new_max = running_max.maximumf(tile_max)
+                max_diff = running_max - new_max
+                safe_diff = (running_max > NEG_INF).select(max_diff, ZERO_F)
+                scale = (safe_diff * LOG2E_C).exp2(fastmath=arith.FastMathFlags.fast)
+                running_sum = running_sum * scale
+                for h in range_constexpr(PV_N_CHUNKS):
+                    acc_pv[h] = _vsplat_mul(acc_pv[h], scale)
+                running_max = new_max
+
+                # Compute probs: p = exp((qk - new_max) * LOG2E)
+                tile_sum = ZERO_F
+                for elem in range_constexpr(4):
+                    s = vector.extract(qk_acc, static_position=[elem])
+                    d = s - new_max
+                    d = (new_max > NEG_INF).select(d, NEG_INF)
+                    p = (d * LOG2E_C).exp2(fastmath=arith.FastMathFlags.fast)
+                    tile_sum = tile_sum + p
+                    qk_acc = vector.insert(p, qk_acc,
+                                           static_position=[elem], dynamic_position=[])
+
+                ts1 = tile_sum.shuffle_xor(fx.Int32(16), c_w)
+                tile_sum = tile_sum + ts1
+                ts2 = tile_sum.shuffle_xor(fx.Int32(32), c_w)
+                tile_sum = tile_sum + ts2
+                running_sum = running_sum + tile_sum
+
+                # ---- V dequant → LDS (V/scale/zero raw loads were hoisted) -
+                # v_packed, vscale_raw, vzero_raw are already in flight from
+                # the top of this iteration; only the f32 conversion stays
+                # here so the actual consume site is still close to the use.
+                vscale_f32 = arith.extf(T.f32, arith.bitcast(T.f16, vscale_raw))
+                vzero_f32 = arith.extf(T.f32, arith.bitcast(T.f16, vzero_raw))
+
+                if USE_HW_TR:
+                    # V dequant → LDS [token][head_dim] (ROW-MAJOR, no transpose).
+                    # Each lane writes 32 contiguous bf16 (one token, head_dims
+                    # chunk_in_tok*32..+31) as 4× ds_write_b128 = 4× vec(2,i64).
+                    # Replaces 32× ds_write_b16 of the legacy transposed path.
+                    v_lds_elem_base = (
+                        tok_in_tile * fx.Int32(HEAD_SIZE)
+                        + chunk_in_tok * fx.Int32(32)
+                    )
+                    for w in range_constexpr(4):
+                        word_i32 = vector.extract(v_packed, static_position=[w])
+                        bf16_elems = []
+                        for n in range_constexpr(8):
+                            nibble = (word_i32 >> fx.Int32(n * 4)) & fx.Int32(0xF)
+                            nibble_f32 = arith.sitofp(T.f32, nibble)
+                            elem_f32 = nibble_f32 * vscale_f32 + vzero_f32
+                            elem_bf16 = arith.trunc_f(T.bf16, elem_f32)
+                            bf16_elems.append(elem_bf16)
+                        v_bf16 = vector.from_elements(T.vec(8, T.bf16), bf16_elems)
+                        v_i64 = vector.bitcast(T.vec(2, T.i64), v_bf16)
+                        v_lds_i64_idx = (
+                            v_lds_elem_base + fx.Int32(w * 8)
+                        ) // fx.Int32(4)
+                        vector.store(
+                            v_i64, kv_lds_i64,
+                            [arith.index_cast(T.index, v_lds_i64_idx)],
+                        )
+                    # ── HW V transpose: cross-lane LDS sync ─────────────────────
+                    # ds_read_tr16_b64 below introduces a cross-lane LDS read:
+                    # consumer lane t reads bytes written by source lanes
+                    # 0,4,8,12 (etc.). The compiler's automatic waitcnt insertion
+                    # is per-lane and has no awareness of the HW transpose's
+                    # cross-lane forwarding, so it can sink the next iteration's
+                    # ds_read ahead of these ds_write_b128 ops in the schedule.
+                    #
+                    # Two-part fence (mirrors mla_fwd_decode_m16x8_fp8_fp8.py):
+                    #   1. sched_barrier(0): MachineScheduler reorder barrier
+                    #      (mask=0 → no instruction class may cross). Pure hint,
+                    #      generates no runtime instruction. Use the simple
+                    #      sched_barrier (NOT sched_group_barrier, which is an
+                    #      IGLP marker that requires partner barriers and
+                    #      corrupts the schedule when used in isolation).
+                    #   2. s_waitcnt lgkmcnt=0: runtime drain of the LDS write
+                    #      queue. vmcnt/expcnt left at no-wait so we don't
+                    #      stall on speculatively-issued HBM loads (which can
+                    #      include OOB-but-masked buffer_load reads from the
+                    #      next K-tile's hoisted V prefetch).
+                    #
+                    # The SW path below does NOT need this because each lane
+                    # only reads cells it itself wrote (no cross-lane dep), and
+                    # the per-lane same-address waitcnt the compiler emits is
+                    # correct.
+                    #
+                    # Empirical: targets the -3.3pp GSM8K regression on
+                    # Qwen3-32B (padded num_partitions=64, ~16 K-tiles each)
+                    # while leaving Qwen2.5-72B (16 partitions) unchanged.
+                    rocdl.sched_barrier(0)
+                    # encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=0)
+                    #   = 0xF | (7<<4) | (0<<8) | (3<<14) = 0xC07F
+                    rocdl.s_waitcnt(0xC07F)
+                else:
+                    # Legacy transposed V_LDS path: 32 ds_write_b16 per lane.
+                    for w in range_constexpr(4):
+                        word_i32 = vector.extract(v_packed, static_position=[w])
+                        for n in range_constexpr(8):
+                            nibble = (word_i32 >> fx.Int32(n * 4)) & fx.Int32(0xF)
+                            nibble_f32 = arith.sitofp(T.f32, nibble)
+                            elem_f32 = nibble_f32 * vscale_f32 + vzero_f32
+                            elem_bf16 = arith.trunc_f(T.bf16, elem_f32)
+                            elem_i16 = arith.bitcast(T.i16, elem_bf16)
+                            head_dim = chunk_in_tok * fx.Int32(32) + fx.Int32(w * 8 + n)
+                            v_idx_i16 = head_dim * fx.Int32(TILE_SIZE) + tok_in_tile
+                            v_vec = vector.from_elements(T.vec(1, T.i16), [elem_i16])
+                            vector.store(v_vec, kv_lds_i16,
+                                         [arith.index_cast(T.index, v_idx_i16)])
+                gpu.barrier()
+
+                # ---- PV MFMA: A=V[head_dim, token], B=P (=qk_acc bf16) -----
+                # P operand B layout matches qk_acc: lane t holds 4 bf16 at
+                # K=token=(t/16)*4..+3, N=query=t%16. Just trunc_f to bf16.
+                p_bf16 = arith.trunc_f(T.vec(4, T.bf16), qk_acc)
+                p_op = vector.bitcast(T.vec(4, T.i16), p_bf16)
+
+                if USE_HW_TR:
+                    # HW-transpose PV path: V_lds is row-major V[token][head_dim].
+                    # MFMA A operand layout: lane t holds 4 bf16 at
+                    #   M=head_dim=mfma_row + h*16, K=token=(t/16)*4..+3
+                    # ds_read_tr16_b64 (4-element 16-bit transpose, per-16-lane block):
+                    #   result[lane=t, elem=e] = Input[source_lane=e*4 + (t%16)//4,
+                    #                                   col=t%4]
+                    # Per-lane address: token_idx = lane // 4 (covers 0..15 across
+                    # all four 16-lane MFMA blocks), hd_sub = (lane % 4)*4 selects
+                    # the 4-element column window inside the h*16 chunk.
+                    # Total LDS byte offset = kv_off + token_idx*HEAD_SIZE*2
+                    #                        + (h*16 + hd_sub)*2
+                    token_idx = lane >> fx.Int32(2)
+                    hd_sub = (lane & fx.Int32(3)) * fx.Int32(4)
+                    v_lane_byte = (
+                        fx.Int32(kv_off)
+                        + token_idx * fx.Int32(HEAD_SIZE * 2)
+                        + hd_sub * fx.Int32(2)
+                    )
+                    for h in range_constexpr(PV_N_CHUNKS):
+                        v_byte_off = v_lane_byte + fx.Int32(h * 32)
+                        v_byte_i64 = fx.Int64(v_byte_off)
+                        v_ptr = buffer_ops.create_llvm_ptr(
+                            v_byte_i64, address_space=3,
+                        )
+                        v_op_raw = rocdl.ds_read_tr16_b64(
+                            T.vec(4, T.i16), v_ptr,
+                        ).result
+                        acc_pv[h] = rocdl.mfma_f32_16x16x16bf16_1k(
+                            T.f32x4, [v_op_raw, p_op, acc_pv[h], 0, 0, 0]
+                        )
+                else:
+                    # Legacy transposed-LDS PV: 1 ds_read_b64 per chunk.
+                    # Byte addr = (mfma_row + h*16) * TILE_SIZE * 2 + (col_grp*4) * 2
+                    #          = (mfma_row + h*16) * 32 + col_grp*8
+                    # i64 idx  = (mfma_row + h*16) * 4 + col_grp
+                    for h in range_constexpr(PV_N_CHUNKS):
+                        v_idx_i64 = (
+                            (mfma_row + fx.Int32(h * 16)) * fx.Int32(4)
+                            + mfma_col_grp
+                        )
+                        kv_load = vector.load_op(
+                            T.vec(1, T.i64), kv_lds_i64,
+                            [arith.index_cast(T.index, v_idx_i64)],
+                        )
+                        v_op = vector.bitcast(T.vec(4, T.i16), kv_load)
+                        acc_pv[h] = rocdl.mfma_f32_16x16x16bf16_1k(
+                            T.f32x4, [v_op, p_op, acc_pv[h], 0, 0, 0]
+                        )
+
+            _scf.YieldOp([
+                _ival(running_max),
+                _ival(running_sum),
+                *[_ival(p) for p in acc_pv],
+            ])
+        finally:
+            _for_ip.__exit__(None, None, None)
+        # Pull final accumulator values out of the for_op results.
+        running_max = _for_op.results[0]
+        running_sum = _for_op.results[1]
+        acc_pv = list(_for_op.results[2:])
 
         # ===== STEP G: Output ===========================================
         # acc_pv[h] layout: lane t holds 4 fp32 at M=head_dim=(t/16)*4..+3 + h*16,

@@ -262,7 +262,7 @@ def _tq_load_v_tile(
 
     Opt#3 SoA layout: packed V data is at `val_bases[t] + [0, VAL_DATA_BYTES)`
     (V-data immediately follows K-data within the slot's data region, and
-    `val_bases` is precomputed by the caller as `data_base + KEY_DATA_BYTES`).
+    `val_bases` is precomputed by the caller as `data_base + KPS`).
     V-scale / V-zero live in the per-block SoA metadata region at indices
     `vscale_u16_addrs` / `vzero_u16_addrs`. For tiles aligned to block
     boundaries, those addresses are contiguous → one coalesced wide load
@@ -357,14 +357,10 @@ def kernel_tq_unified_attention_2d(
     N_CENTROIDS: tl.constexpr,
     KEY_FP8: tl.constexpr,
     USE_PAIR_LUT: tl.constexpr,
-    # Opt#3 SoA layout constants
-    NUM_KV_HEADS: tl.constexpr,
-    KEY_DATA_BYTES: tl.constexpr,  # MSE_BYTES for MSE, HEAD_SIZE for FP8
-    META_REGION_OFFSET: tl.constexpr,  # bytes: bs * H * (KD+VD)
-    NUM_SOA_FIELDS: tl.constexpr,  # 3 for MSE, 2 for FP8
-    SOA_K_NORM: tl.constexpr,  # 0 for MSE, unused for FP8
-    SOA_V_SCALE: tl.constexpr,  # 1 (MSE) / 0 (FP8)
-    SOA_V_ZERO: tl.constexpr,  # 2 (MSE) / 1 (FP8)
+    # AoS per-slot layout constants (jiangyong's updated store format)
+    stride_cache_pos: tl.int64,   # kv_cache.stride(1) — bytes per block-position
+    stride_cache_head: tl.int64,  # kv_cache.stride(2) — bytes per head
+    KPS: tl.constexpr,            # key_packed_size: val data starts at slot_base+KPS
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,
     FUSE_Q_ROT: tl.constexpr = 0,  # Fused Q @ PiT prologue when 1 (MSE path)
@@ -457,7 +453,6 @@ def kernel_tq_unified_attention_2d(
     # max_seq_prefix_len — no tile boundary predicate needed on loads.
     # Tail tile (num_tiles-1) may be partial and uses the real tile_mask.
     # This eliminates predicated loads from ~(seq_len/TILE_SIZE - 1) tiles.
-    DATA_BYTES_PER_SLOT: tl.constexpr = KEY_DATA_BYTES + VAL_DATA_BYTES
     query_abs_pos = context_len + query_pos[:, None]
     dummy_tile_mask = tl.full([TILE_SIZE], 1, tl.int1)  # placeholder; UNMASKED=True skips it
 
@@ -466,12 +461,11 @@ def kernel_tq_unified_attention_2d(
         physical_block_idx = tl.load(block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE).to(tl.int64)
         slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
         block_base = physical_block_idx * stride_cache_block
-        data_bases = block_base + slot_within_block * (NUM_KV_HEADS * DATA_BYTES_PER_SLOT) + tl.cast(kv_head_idx, tl.int64) * DATA_BYTES_PER_SLOT
-        val_bases = data_bases + KEY_DATA_BYTES
-        head_meta_u16_base = (block_base + META_REGION_OFFSET) // 2 + tl.cast(kv_head_idx, tl.int64) * (NUM_SOA_FIELDS * BLOCK_SIZE)
-        knorm_u16_addrs = head_meta_u16_base + SOA_K_NORM * BLOCK_SIZE + slot_within_block
-        vscale_u16_addrs = head_meta_u16_base + SOA_V_SCALE * BLOCK_SIZE + slot_within_block
-        vzero_u16_addrs = head_meta_u16_base + SOA_V_ZERO * BLOCK_SIZE + slot_within_block
+        data_bases = block_base + slot_within_block * stride_cache_pos + tl.cast(kv_head_idx, tl.int64) * stride_cache_head
+        val_bases = data_bases + KPS
+        knorm_u16_addrs = (data_bases + MSE_BYTES) // 2
+        vscale_u16_addrs = (val_bases + VAL_DATA_BYTES) // 2
+        vzero_u16_addrs = (val_bases + VAL_DATA_BYTES + 2) // 2
         K_T = _tq_load_k_tile(KV_cache_ptr, KV_cache_u16_ptr, data_bases, knorm_u16_addrs, offs_d, dim_mask, dummy_tile_mask, Centroids_ptr, Pair_lut_ptr, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED, MSE_BITS=MSE_BITS, N_CENTROIDS=N_CENTROIDS, KEY_FP8=KEY_FP8, USE_PAIR_LUT=USE_PAIR_LUT, NORM_CORRECTION=NORM_CORRECTION, FP8_E4B15=FP8_E4B15, TILE_SIZE=TILE_SIZE, UNMASKED=True)
         V = _tq_load_v_tile(KV_cache_ptr, KV_cache_u16_ptr, val_bases, vscale_u16_addrs, vzero_u16_addrs, offs_d, dim_mask, dummy_tile_mask, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, VQB=VQB, UNMASKED=True)
         if USE_BF16_DOT:
@@ -501,12 +495,11 @@ def kernel_tq_unified_attention_2d(
         physical_block_idx = tl.load(block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE).to(tl.int64)
         slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
         block_base = physical_block_idx * stride_cache_block
-        data_bases = block_base + slot_within_block * (NUM_KV_HEADS * DATA_BYTES_PER_SLOT) + tl.cast(kv_head_idx, tl.int64) * DATA_BYTES_PER_SLOT
-        val_bases = data_bases + KEY_DATA_BYTES
-        head_meta_u16_base = (block_base + META_REGION_OFFSET) // 2 + tl.cast(kv_head_idx, tl.int64) * (NUM_SOA_FIELDS * BLOCK_SIZE)
-        knorm_u16_addrs = head_meta_u16_base + SOA_K_NORM * BLOCK_SIZE + slot_within_block
-        vscale_u16_addrs = head_meta_u16_base + SOA_V_SCALE * BLOCK_SIZE + slot_within_block
-        vzero_u16_addrs = head_meta_u16_base + SOA_V_ZERO * BLOCK_SIZE + slot_within_block
+        data_bases = block_base + slot_within_block * stride_cache_pos + tl.cast(kv_head_idx, tl.int64) * stride_cache_head
+        val_bases = data_bases + KPS
+        knorm_u16_addrs = (data_bases + MSE_BYTES) // 2
+        vscale_u16_addrs = (val_bases + VAL_DATA_BYTES) // 2
+        vzero_u16_addrs = (val_bases + VAL_DATA_BYTES + 2) // 2
         K_T = _tq_load_k_tile(KV_cache_ptr, KV_cache_u16_ptr, data_bases, knorm_u16_addrs, offs_d, dim_mask, tile_mask, Centroids_ptr, Pair_lut_ptr, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED, MSE_BITS=MSE_BITS, N_CENTROIDS=N_CENTROIDS, KEY_FP8=KEY_FP8, USE_PAIR_LUT=USE_PAIR_LUT, NORM_CORRECTION=NORM_CORRECTION, FP8_E4B15=FP8_E4B15, TILE_SIZE=TILE_SIZE, UNMASKED=False)
         V = _tq_load_v_tile(KV_cache_ptr, KV_cache_u16_ptr, val_bases, vscale_u16_addrs, vzero_u16_addrs, offs_d, dim_mask, tile_mask, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, VQB=VQB, UNMASKED=False)
         if USE_BF16_DOT:
@@ -600,13 +593,9 @@ def kernel_tq_unified_attention_3d(
     KEY_FP8: tl.constexpr,
     USE_PAIR_LUT: tl.constexpr,
     # Opt#3 SoA layout constants
-    NUM_KV_HEADS: tl.constexpr,
-    KEY_DATA_BYTES: tl.constexpr,
-    META_REGION_OFFSET: tl.constexpr,
-    NUM_SOA_FIELDS: tl.constexpr,
-    SOA_K_NORM: tl.constexpr,
-    SOA_V_SCALE: tl.constexpr,
-    SOA_V_ZERO: tl.constexpr,
+    stride_cache_pos: tl.int64,
+    stride_cache_head: tl.int64,
+    KPS: tl.constexpr,
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,
     FUSE_Q_ROT: tl.constexpr = 0,  # Fused Q @ PiT prologue when 1 (MSE path)
@@ -703,7 +692,6 @@ def kernel_tq_unified_attention_3d(
 
     # [Main/tail split] Same logic as 2D kernel: eliminate tile predicate on
     # loads for all tiles except the last in this segment.
-    DATA_BYTES_PER_SLOT: tl.constexpr = KEY_DATA_BYTES + VAL_DATA_BYTES
     query_abs_pos = context_len + query_pos[:, None]
     dummy_tile_mask = tl.full([TILE_SIZE], 1, tl.int1)
     tail = tile_hi - 1  # last tile in this segment (may be partial)
@@ -724,12 +712,11 @@ def kernel_tq_unified_attention_3d(
             physical_block_idx = tl.load(block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE).to(tl.int64)
             slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
         block_base = physical_block_idx * stride_cache_block
-        data_bases = block_base + slot_within_block * (NUM_KV_HEADS * DATA_BYTES_PER_SLOT) + tl.cast(kv_head_idx, tl.int64) * DATA_BYTES_PER_SLOT
-        val_bases = data_bases + KEY_DATA_BYTES
-        head_meta_u16_base = (block_base + META_REGION_OFFSET) // 2 + tl.cast(kv_head_idx, tl.int64) * (NUM_SOA_FIELDS * BLOCK_SIZE)
-        knorm_u16_addrs = head_meta_u16_base + SOA_K_NORM * BLOCK_SIZE + slot_within_block
-        vscale_u16_addrs = head_meta_u16_base + SOA_V_SCALE * BLOCK_SIZE + slot_within_block
-        vzero_u16_addrs = head_meta_u16_base + SOA_V_ZERO * BLOCK_SIZE + slot_within_block
+        data_bases = block_base + slot_within_block * stride_cache_pos + tl.cast(kv_head_idx, tl.int64) * stride_cache_head
+        val_bases = data_bases + KPS
+        knorm_u16_addrs = (data_bases + MSE_BYTES) // 2
+        vscale_u16_addrs = (val_bases + VAL_DATA_BYTES) // 2
+        vzero_u16_addrs = (val_bases + VAL_DATA_BYTES + 2) // 2
         K_T = _tq_load_k_tile(KV_cache_ptr, KV_cache_u16_ptr, data_bases, knorm_u16_addrs, offs_d, dim_mask, dummy_tile_mask, Centroids_ptr, Pair_lut_ptr, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED, MSE_BITS=MSE_BITS, N_CENTROIDS=N_CENTROIDS, KEY_FP8=KEY_FP8, USE_PAIR_LUT=USE_PAIR_LUT, NORM_CORRECTION=NORM_CORRECTION, FP8_E4B15=FP8_E4B15, TILE_SIZE=TILE_SIZE, UNMASKED=True)
         V = _tq_load_v_tile(KV_cache_ptr, KV_cache_u16_ptr, val_bases, vscale_u16_addrs, vzero_u16_addrs, offs_d, dim_mask, dummy_tile_mask, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, VQB=VQB, UNMASKED=True)
         if USE_BF16_DOT:
@@ -763,12 +750,11 @@ def kernel_tq_unified_attention_3d(
             physical_block_idx = tl.load(block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE).to(tl.int64)
             slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
         block_base = physical_block_idx * stride_cache_block
-        data_bases = block_base + slot_within_block * (NUM_KV_HEADS * DATA_BYTES_PER_SLOT) + tl.cast(kv_head_idx, tl.int64) * DATA_BYTES_PER_SLOT
-        val_bases = data_bases + KEY_DATA_BYTES
-        head_meta_u16_base = (block_base + META_REGION_OFFSET) // 2 + tl.cast(kv_head_idx, tl.int64) * (NUM_SOA_FIELDS * BLOCK_SIZE)
-        knorm_u16_addrs = head_meta_u16_base + SOA_K_NORM * BLOCK_SIZE + slot_within_block
-        vscale_u16_addrs = head_meta_u16_base + SOA_V_SCALE * BLOCK_SIZE + slot_within_block
-        vzero_u16_addrs = head_meta_u16_base + SOA_V_ZERO * BLOCK_SIZE + slot_within_block
+        data_bases = block_base + slot_within_block * stride_cache_pos + tl.cast(kv_head_idx, tl.int64) * stride_cache_head
+        val_bases = data_bases + KPS
+        knorm_u16_addrs = (data_bases + MSE_BYTES) // 2
+        vscale_u16_addrs = (val_bases + VAL_DATA_BYTES) // 2
+        vzero_u16_addrs = (val_bases + VAL_DATA_BYTES + 2) // 2
         K_T = _tq_load_k_tile(KV_cache_ptr, KV_cache_u16_ptr, data_bases, knorm_u16_addrs, offs_d, dim_mask, tile_mask, Centroids_ptr, Pair_lut_ptr, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED, MSE_BITS=MSE_BITS, N_CENTROIDS=N_CENTROIDS, KEY_FP8=KEY_FP8, USE_PAIR_LUT=USE_PAIR_LUT, NORM_CORRECTION=NORM_CORRECTION, FP8_E4B15=FP8_E4B15, TILE_SIZE=TILE_SIZE, UNMASKED=False)
         V = _tq_load_v_tile(KV_cache_ptr, KV_cache_u16_ptr, val_bases, vscale_u16_addrs, vzero_u16_addrs, offs_d, dim_mask, tile_mask, OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, VQB=VQB, UNMASKED=False)
         if USE_BF16_DOT:
@@ -1119,18 +1105,8 @@ def triton_turboquant_unified_attention(
     # original 2× uint8 + OR sequence for every per-token metadata fetch.
     kv_cache_u16 = kv_cache.view(torch.uint16)
 
-    # Opt#3 SoA layout constants (derived locally; matches the store-side
-    # computation so the launcher signature stays unchanged). Invariant:
-    # data_bytes_per_slot + meta_bytes_per_slot == slot_size_aligned.
     mse_bytes = cfg["mse_bytes"]
     val_data_bytes = cfg["val_data_bytes"]
-    key_data_bytes = D if key_fp8 else mse_bytes
-    data_bytes_per_slot = key_data_bytes + val_data_bytes
-    meta_region_offset = block_size * Hk * data_bytes_per_slot
-    num_soa_fields = 2 if key_fp8 else 3
-    soa_k_norm = 0  # unused for FP8; harmless constant
-    soa_v_scale = 0 if key_fp8 else 1
-    soa_v_zero = 1 if key_fp8 else 2
 
     # ------------------------------------------------------------------
     # Dispatch: 2D for prefill / chunked; 3D split-KV for pure decode with
@@ -1198,13 +1174,9 @@ def triton_turboquant_unified_attention(
             N_CENTROIDS=int(centroids.numel()),
             KEY_FP8=1 if key_fp8 else 0,
             USE_PAIR_LUT=1 if use_pair_lut else 0,
-            NUM_KV_HEADS=Hk,
-            KEY_DATA_BYTES=key_data_bytes,
-            META_REGION_OFFSET=meta_region_offset,
-            NUM_SOA_FIELDS=num_soa_fields,
-            SOA_K_NORM=soa_k_norm,
-            SOA_V_SCALE=soa_v_scale,
-            SOA_V_ZERO=soa_v_zero,
+            stride_cache_pos=kv_cache.stride(1),
+            stride_cache_head=kv_cache.stride(2),
+            KPS=key_packed_size,
             NORM_CORRECTION=1 if norm_correction else 0,
             FP8_E4B15=fp8_e4b15,
             FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
@@ -1279,13 +1251,9 @@ def triton_turboquant_unified_attention(
         N_CENTROIDS=int(centroids.numel()),
         KEY_FP8=1 if key_fp8 else 0,
         USE_PAIR_LUT=1 if use_pair_lut else 0,
-        NUM_KV_HEADS=Hk,
-        KEY_DATA_BYTES=key_data_bytes,
-        META_REGION_OFFSET=meta_region_offset,
-        NUM_SOA_FIELDS=num_soa_fields,
-        SOA_K_NORM=soa_k_norm,
-        SOA_V_SCALE=soa_v_scale,
-        SOA_V_ZERO=soa_v_zero,
+        stride_cache_pos=kv_cache.stride(1),
+        stride_cache_head=kv_cache.stride(2),
+        KPS=key_packed_size,
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
         FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,

@@ -2,11 +2,16 @@
 """FlyDSL TurboQuant decode v4 launcher (vLLM-side).
 
 Drop-in replacement for ``triton_turboquant_decode_attention_v3`` for the
-Qwen-class TQ decode profile (HEAD_SIZE=128, GQA group=16, MSE_BITS=4 K,
-VQB=4 V, N_CENTROIDS=16, BLOCK_SIZE=16).
+TQ decode profile HEAD_SIZE=128, MSE_BITS=4 K, VQB=4 V, N_CENTROIDS=16,
+BLOCK_SIZE in {16, 32}.
+
+Per-GQA kernel dispatch:
+  * GQA group ∈ {8, 16} → canonical kernels.tq_decode_v4 (Qwen-class)
+  * GQA group == 6      → kernels.tq_decode_v4_gqa6 sibling (MiniMax-M2.5)
 
 Opt-in via ``VLLM_TQ_DECODE_V4=1``. Falls back to v3 if FlyDSL is not
-importable (e.g. wrong arch, missing build tree).
+importable (e.g. wrong arch, missing build tree). The GQA-6 sibling is
+imported best-effort: missing it does not affect Qwen GQA-{8,16} paths.
 
 Architecture:
     1. Q rotation: ``q_rot = (query.float() @ PiT).bfloat16()`` — same
@@ -52,7 +57,8 @@ def _ensure_flydsl_paths() -> None:
 
 
 _FLYDSL_AVAILABLE: bool | None = None
-_TQ_MOD = None  # kernels.tq_decode_v4 module
+_TQ_MOD = None       # kernels.tq_decode_v4 module (Qwen GQA-{8,16})
+_TQ_MOD_GQA6 = None  # kernels.tq_decode_v4_gqa6 module (MiniMax GQA-6, optional)
 _FLYC = None    # flydsl.compiler
 _FX = None      # flydsl.expr
 _TYPING_T = None
@@ -61,8 +67,15 @@ _IR = None
 
 
 def is_flydsl_available() -> bool:
-    """Return True iff FlyDSL imports + kernel module load successfully."""
-    global _FLYDSL_AVAILABLE, _TQ_MOD, _FLYC, _FX, _TYPING_T, _CC, _IR
+    """Return True iff FlyDSL imports + canonical kernel module load successfully.
+
+    The GQA-6 sibling kernel (``kernels.tq_decode_v4_gqa6``) is imported
+    best-effort: if it's missing (older FlyDSL checkout that pre-dates
+    MiniMax support) the canonical Qwen path stays fully functional and
+    only GQA-6 dispatches will fail with a clear error at launch time.
+    """
+    global _FLYDSL_AVAILABLE, _TQ_MOD, _TQ_MOD_GQA6
+    global _FLYC, _FX, _TYPING_T, _CC, _IR
     if _FLYDSL_AVAILABLE is not None:
         return _FLYDSL_AVAILABLE
     try:
@@ -87,7 +100,33 @@ def is_flydsl_available() -> bool:
             "FlyDSL TQ decode v4 launcher: unavailable (%s). "
             "Falling back to Triton v3.", ex
         )
+        return _FLYDSL_AVAILABLE
+    # Best-effort GQA-6 sibling import (does NOT gate Qwen availability).
+    try:
+        import kernels.tq_decode_v4_gqa6 as tq_mod_gqa6
+        _TQ_MOD_GQA6 = tq_mod_gqa6
+        logger.info_once(
+            "FlyDSL TQ decode v4 GQA-6 sibling: available (MiniMax-class)"
+        )
+    except Exception as ex:  # noqa: BLE001
+        _TQ_MOD_GQA6 = None
+        logger.info_once(
+            "FlyDSL TQ decode v4 GQA-6 sibling: not available (%s); "
+            "GQA-6 models will fall back to Triton v3.", ex
+        )
     return _FLYDSL_AVAILABLE
+
+
+def is_flydsl_gqa6_available() -> bool:
+    """True iff the optional GQA-6 sibling kernel module loaded.
+
+    Used by the eligibility gate in turboquant_attn.py to decide whether
+    a layer with num_kv_groups==6 can run on FlyDSL v4 or must fall back
+    to Triton v3.
+    """
+    if _FLYDSL_AVAILABLE is None:
+        is_flydsl_available()
+    return _TQ_MOD_GQA6 is not None
 
 
 # -- Kernel module cache -------------------------------------------------------
@@ -205,29 +244,72 @@ def _hw_tr_enabled() -> bool:
     return _HW_TR_CACHED
 
 
+_GET_KERNEL_STATS = {"hits": 0, "misses": 0, "build_total_s": 0.0}
+
+
 def _get_kernel(num_kv_heads: int, num_partitions: int,
                 max_blocks_per_seq: int, scale: float,
                 query_group_size: int, kv_block_size: int,
-                use_hw_v_transpose: bool = False):
+                use_hw_v_transpose: bool = False,
+                num_seqs_hint: int = 1,
+                tile_groups_per_partition: int = 1):
+    # ``num_seqs_hint`` (= runtime B) is forwarded to the build for shape
+    # awareness; it does NOT participate in the cache key because the
+    # kernel body uses gpu.block_idx.x (= seq index at runtime) and is
+    # GQA-symmetric across B at build time.
+    #
+    # ``tile_groups_per_partition`` (Option A) IS in the cache key — each
+    # value compiles a different unrolled K-tile loop body.
     key = (num_kv_heads, int(num_partitions), int(max_blocks_per_seq),
            round(float(scale), 8), int(query_group_size), int(kv_block_size),
-           bool(use_hw_v_transpose))
+           bool(use_hw_v_transpose), int(tile_groups_per_partition))
     cached = _KERN_CACHE.get(key)
     if cached is not None:
+        _GET_KERNEL_STATS["hits"] += 1
         return cached
     assert is_flydsl_available()
-    kfn = _TQ_MOD.build_tq_decode_v4_module(
-        num_seqs=1,  # not used in body
-        num_kv_heads=num_kv_heads,
-        num_partitions=num_partitions,
-        max_blocks_per_seq=max_blocks_per_seq,
-        softmax_scale=float(scale),
-        query_group_size=int(query_group_size),
-        kv_block_size=int(kv_block_size),
-        use_hw_v_transpose=bool(use_hw_v_transpose),
-    )
-    al = _TQ_MOD.allocator
-    block_threads = _TQ_MOD.BLOCK_THREADS
+    # Time the FlyDSL build path so we can quantify cudagraph capture cost.
+    import time as _t
+    _build_t0 = _t.perf_counter()
+
+    # Per-GQA dispatch: GQA-6 (MiniMax-M2.5) lives in the sibling module
+    # tq_decode_v4_gqa6 to keep the Qwen kernel's invariants untouched.
+    # GQA-{8,16} (Qwen) keep using the canonical tq_decode_v4 kernel.
+    qg = int(query_group_size)
+    if qg == 6:
+        if _TQ_MOD_GQA6 is None:
+            raise RuntimeError(
+                "FlyDSL TQ v4 GQA-6 sibling module is not importable; "
+                "ensure /root/FlyDSL/kernels/tq_decode_v4_gqa6.py exists "
+                "(checkout from feat/tq-flydsl-v4-minimax-gqa6 or later)."
+            )
+        kmod = _TQ_MOD_GQA6
+        kfn = kmod.build_tq_decode_v4_gqa6_module(
+            num_seqs=int(num_seqs_hint),
+            num_kv_heads=num_kv_heads,
+            num_partitions=num_partitions,
+            max_blocks_per_seq=max_blocks_per_seq,
+            softmax_scale=float(scale),
+            query_group_size=qg,
+            kv_block_size=int(kv_block_size),
+            use_hw_v_transpose=bool(use_hw_v_transpose),
+            tile_groups_per_partition=int(tile_groups_per_partition),
+        )
+    else:
+        kmod = _TQ_MOD
+        kfn = kmod.build_tq_decode_v4_module(
+            num_seqs=int(num_seqs_hint),
+            num_kv_heads=num_kv_heads,
+            num_partitions=num_partitions,
+            max_blocks_per_seq=max_blocks_per_seq,
+            softmax_scale=float(scale),
+            query_group_size=qg,
+            kv_block_size=int(kv_block_size),
+            use_hw_v_transpose=bool(use_hw_v_transpose),
+            tile_groups_per_partition=int(tile_groups_per_partition),
+        )
+    al = kmod.allocator
+    block_threads = kmod.BLOCK_THREADS
 
     flyc = _FLYC
     fx = _FX
@@ -254,6 +336,14 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
         )
 
     _KERN_CACHE[key] = _launch
+    _build_dt = _t.perf_counter() - _build_t0
+    _GET_KERNEL_STATS["misses"] += 1
+    _GET_KERNEL_STATS["build_total_s"] += _build_dt
+    logger.info(
+        "FlyDSL v4 _get_kernel BUILD #%d dt=%.2fs (cumulative=%.1fs) key=%s",
+        _GET_KERNEL_STATS["misses"], _build_dt,
+        _GET_KERNEL_STATS["build_total_s"], key,
+    )
     return _launch
 
 
@@ -355,17 +445,19 @@ def flydsl_turboquant_decode_attention_v4(
 ) -> torch.Tensor:
     """v3-compatible launcher backed by the FlyDSL v4 decode kernel.
 
-    Constraints (Qwen-class profile only):
+    Constraints:
       * key_fp8 == False
       * mse_bits == 4
       * value_quant_bits == 4
       * centroids.numel() == 16
       * D == 128
-      * block_size == 16
-      * Hq // Hk in {8, 16}  (Qwen 72B GQA-8 or Qwen 32B GQA-16)
+      * block_size in {16, 32}
+      * Hq // Hk in {6, 8, 16}
+        - 8/16 → canonical tq_decode_v4 kernel (Qwen2.5-72B / Qwen3-32B)
+        - 6    → tq_decode_v4_gqa6 sibling kernel (MiniMax-M2.5)
 
-    Sinks/norm_correction are not implemented and silently ignored if
-    set; the caller is expected to disable them when toggling v4.
+    Sinks are NYI and silently ignored if set. norm_correction is honored
+    implicitly via the pre-folded stored K-norm (see footer comment).
     """
     del mid_o_buf, lse_buf, key_packed_size, value_packed_size
     if not is_flydsl_available():
@@ -387,7 +479,14 @@ def flydsl_turboquant_decode_attention_v4(
     assert block_size in (16, 32), (
         f"v4 supports kv_block_size 16 or 32, got {block_size}"
     )
-    assert QG in (8, 16), f"v4 supports GQA factor 8 or 16, got {QG}"
+    assert QG in (6, 8, 16), f"v4 supports GQA factor 6, 8 or 16, got {QG}"
+    if QG == 6 and _TQ_MOD_GQA6 is None:
+        raise RuntimeError(
+            "FlyDSL v4 launcher: GQA-6 requested (MiniMax-class) but the "
+            "tq_decode_v4_gqa6 sibling module is not available. Update your "
+            "FlyDSL checkout (must include kernels/tq_decode_v4_gqa6.py) or "
+            "set VLLM_TQ_DECODE_V4=0 to fall back to Triton v3."
+        )
     assert centroids.numel() == _TQ_MOD.N_CENTROIDS, (
         f"centroids.numel={centroids.numel()} != "
         f"{_TQ_MOD.N_CENTROIDS}"
@@ -424,21 +523,90 @@ def flydsl_turboquant_decode_attention_v4(
     q_rot = (query.float() @ PiT_f32).to(query.dtype).contiguous()
 
     # ---- Partition count (FA2 split-KV) ----------------------------------
-    if max_seq_len <= 0:
-        # Cheap upper bound from block table; no GPU sync.
-        max_seq_len = int(block_table.shape[1]) * int(block_size)
+    #
+    # v4 runs INSIDE FULL cudagraph (TurboQuantMetadataBuilder._cudagraph_
+    # support = UNIFORM_BATCH). That means the gridDim baked at capture
+    # time MUST equal the gridDim at replay — the kernel launch parameters
+    # are recorded into the captured graph. So `num_partitions` (which
+    # becomes gridDim.z) MUST be derived from a stable source that produces
+    # the same value at capture and at runtime.
+    #
+    # We use the worst-case context length implied by the block table's
+    # allocation (block_table.shape[1] * block_size) as that source. It's
+    # bounded by `max_model_len` (vLLM allocates the block table for the
+    # configured max), and it's identical at capture and at runtime
+    # because `block_table.shape[1]` is fixed once the model is loaded.
+    # Per-tile OOB redirects + the masked FA-2 reducer ensure that for
+    # short sequences the extra partitions contribute zero to the output.
+    #
+    # Override (for eager-mode testing only): set
+    # VLLM_TQ_DECODE_V4_DYNAMIC_PARTS=1 to size from per-step actual
+    # `max_seq_len` instead. This will crash if cudagraph is enabled
+    # because the captured gridDim won't match runtime; safe ONLY with
+    # --enforce-eager or unit-test harnesses.
     kv_compute_block = _TQ_MOD.KV_COMPUTE_BLOCK
+    worst_case_max_seq_len = int(block_table.shape[1]) * int(block_size)
+    if max_seq_len <= 0:
+        max_seq_len = worst_case_max_seq_len
+    if os.environ.get("VLLM_TQ_DECODE_V4_DYNAMIC_PARTS", "0") == "1":
+        sizing_max_seq_len = int(max_seq_len)
+    else:
+        sizing_max_seq_len = worst_case_max_seq_len
+
+    # ── Option A: bounded num_partitions + internal tile-group looping ──
+    # The kernel previously hardcoded one partition = 256 tokens (=
+    # KV_COMPUTE_BLOCK), forcing num_partitions to scale linearly with
+    # max_model_len. For 32K that gave grid.z = 256 and a 19.6 GiB
+    # cudagraph capture (Qwen 72B 32K, MI355X). The new kernel takes
+    # ``tile_groups_per_partition`` (TGPP); each CTA processes
+    # ``TGPP * 16`` K-tiles = ``TGPP * KV_COMPUTE_BLOCK`` tokens with the
+    # FA-2 online-softmax state accumulating across all of them. This
+    # mirrors what Triton v3 / HIP SoA-fusion already do.
+    #
+    # Strategy: cap num_partitions at ``MAX_PARTITIONS`` (default 32 — the
+    # same constant Triton v3's launcher uses, see
+    # triton_turboquant_unified_attention.py L1224 ``num_kv_splits=16``
+    # baseline + L370 HIP launcher ``max_num_kv_splits=32``), then derive
+    # TGPP so that ``num_partitions * TGPP * KV_COMPUTE_BLOCK >=
+    # sizing_max_seq_len``.
+    #
+    # Examples (block_size=32 → worst_case max_bps*32):
+    #   max_model_len=8K:   required=32, parts=32, TGPP=1  (no waste)
+    #   max_model_len=16K:  required=64, parts=32, TGPP=2  (no waste)
+    #   max_model_len=32K:  required=128, parts=32, TGPP=4 (no waste)
+    #   max_model_len=64K:  required=256, parts=32, TGPP=8 (no waste)
+    #   max_model_len=128K: required=512, parts=32, TGPP=16
+    #
+    # Override via VLLM_TQ_DECODE_V4_MAX_PARTITIONS (default 32). Smaller
+    # gives even less graph memory but more work per CTA; larger gives
+    # more parallelism but more graph memory.
+    MAX_PARTITIONS = int(os.environ.get(
+        "VLLM_TQ_DECODE_V4_MAX_PARTITIONS", "32"))
+    MAX_PARTITIONS = max(2, MAX_PARTITIONS)
+    required_num_partitions = (
+        sizing_max_seq_len + kv_compute_block - 1) // kv_compute_block
+    # max_num_kv_splits acts as a parallelism floor (ensure at least this
+    # many CTAs along grid.z), but is itself capped by MAX_PARTITIONS.
+    parallelism_floor = min(MAX_PARTITIONS, max(1, max_num_kv_splits))
+    # Cap num_partitions at MAX_PARTITIONS, but never go below the floor.
     num_partitions_actual = max(
-        1, min(max_num_kv_splits,
-               (int(max_seq_len) + kv_compute_block - 1) // kv_compute_block)
+        parallelism_floor,
+        min(MAX_PARTITIONS, required_num_partitions),
     )
     # Round up to next power of 2 for the Triton reducer's tl.arange(0, N)
-    # constraint (Triton requires power-of-2 ≥ 2). The FlyDSL kernel iterates
-    # exactly num_partitions partitions; for padded partitions whose K-tile
-    # start exceeds seq_len, the kernel's per-tile mask rejects all tokens and
-    # writes -inf / 0 to segm_max / segm_sum (per the empty-partition
-    # contract in this module's docstring).
+    # constraint (Triton requires power-of-2 ≥ 2).
     num_partitions = max(2, triton.next_power_of_2(num_partitions_actual))
+    # Now derive tile_groups_per_partition (TGPP) so total coverage
+    # ``num_partitions * TGPP * KV_COMPUTE_BLOCK`` is >= sizing_max_seq_len.
+    # This guarantees no work is dropped at runtime regardless of seq_len.
+    # Round TGPP up to the next power-of-2 so the JIT cache key is bounded
+    # to a small set of values (e.g. {1, 2, 4, 8, 16}) — limits the number
+    # of distinct kernel binaries that need to be compiled across requests.
+    _tgpp_required = max(
+        1,
+        (required_num_partitions + num_partitions - 1) // num_partitions,
+    )
+    tile_groups_per_partition = int(triton.next_power_of_2(_tgpp_required))
 
     # ---- T1.2: pooled buffers (no per-call cudaMalloc / memset) ----------
     # The FlyDSL kernel writes the FULL [B, Hk, P, QG, D] segm_out and the
@@ -463,6 +631,8 @@ def flydsl_turboquant_decode_attention_v4(
     launch = _get_kernel(
         Hk, num_partitions, max_bps, scale, QG, block_size,
         use_hw_v_transpose=use_hw_tr,
+        num_seqs_hint=int(B),
+        tile_groups_per_partition=int(tile_groups_per_partition),
     )
     # T1.3: zero-overhead one-shot info log (replaces logger.info_once which
     # hashes its format string on every call to dedup).
@@ -470,13 +640,32 @@ def flydsl_turboquant_decode_attention_v4(
     if not _LOG_INVOKED_ONCE:
         _LOG_INVOKED_ONCE = True
         logger.info(
-            "FlyDSL v4 launcher invoked: B=%d Hk=%d Hq=%d D=%d QG=%d "
-            "num_partitions=%d (actual=%d) max_bps=%d block_size=%d "
-            "max_seq_len=%d hw_v_transpose=%s (Tier-1: PiT_f32 cache, "
-            "segm pool, logger dedup, centroids cache)",
+            "FlyDSL v4 launcher invoked (UNIFORM_BATCH cudagraph): "
+            "B=%d Hk=%d Hq=%d D=%d QG=%d num_partitions=%d (actual=%d, "
+            "cap=%d) TGPP=%d max_bps=%d block_size=%d max_seq_len=%d "
+            "hw_v_transpose=%s (coverage=%d tokens, worst_case=%d tokens, "
+            "sizing=%s)",
             B, Hk, Hq, D, QG, num_partitions, num_partitions_actual,
+            MAX_PARTITIONS, tile_groups_per_partition,
             max_bps, int(block_size), int(max_seq_len), use_hw_tr,
+            num_partitions * tile_groups_per_partition * kv_compute_block,
+            worst_case_max_seq_len,
+            "per-step actual" if (
+                os.environ.get("VLLM_TQ_DECODE_V4_DYNAMIC_PARTS", "0") == "1"
+            ) else "worst_case",
         )
+    # T1.4: time the launch() so we can see if first-call-per-shape
+    # triggers a hidden FlyDSL JIT specialization (separate from the build
+    # in _get_kernel). Logs once per unique B in capture/eager paths.
+    import time as _t_launch
+    _LAUNCH_BSEEN = getattr(flydsl_turboquant_decode_attention_v4,
+                             "_LAUNCH_BSEEN", set())
+    _is_first_for_B = int(B) not in _LAUNCH_BSEEN
+    if _is_first_for_B:
+        _LAUNCH_BSEEN.add(int(B))
+        flydsl_turboquant_decode_attention_v4._LAUNCH_BSEEN = _LAUNCH_BSEEN
+        torch.cuda.synchronize()
+        _launch_t0 = _t_launch.perf_counter()
     launch(
         segm_out, segm_sum, segm_max,
         q_rot, kv_cache, centroids_c,
@@ -484,6 +673,13 @@ def flydsl_turboquant_decode_attention_v4(
         B, Hk, num_partitions,
         torch.cuda.current_stream(),
     )
+    if _is_first_for_B:
+        torch.cuda.synchronize()
+        _launch_dt = _t_launch.perf_counter() - _launch_t0
+        logger.info(
+            "FlyDSL v4 first launch B=%d dt=%.3fs (#unique_B_seen=%d)",
+            int(B), _launch_dt, len(_LAUNCH_BSEEN),
+        )
 
     # ---- Reduce partitions -> [B, Hq, D] --------------------------------
     _reduce_partitions_v4[(B, Hq)](

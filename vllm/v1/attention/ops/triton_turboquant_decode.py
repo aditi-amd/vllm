@@ -722,13 +722,6 @@ def _tq_decode_stage1(
                      tl.where(mse_idx == 14, c14,
                      c15)))))))))))))))
 
-            # Norm correction: re-normalize centroid vector to unit norm
-            if NORM_CORRECTION:
-                # OPTIMIZATION: d_mask is always True when HEAD_DIM == BLOCK_D
-                c_norm_sq = tl.sum(c_vals * c_vals, axis=1)
-                c_inv_norm = tl.rsqrt(c_norm_sq + 1e-16)
-                c_vals = c_vals * c_inv_norm[:, None]
-
             # OPTIMIZATION: d_mask is always True when HEAD_DIM == BLOCK_D
             term1 = tl.sum(q_rot[None, :] * c_vals, axis=1)
 

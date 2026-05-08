@@ -1,18 +1,23 @@
 /**
- * Fused TQ Store HIP Kernel — SoA Layout
+ * Fused TQ Store HIP Kernel — AoS Layout
  *
- * Adapted from tq_store_fused_v1.hip (AoS) to SoA cache layout.
+ * Writes to jiangyong's AoS (Array-of-Structures) per-slot KV cache format.
  *
- * SoA layout per block (stride_cache_block bytes):
- *   Data region [0, block_size * H * DATA_BYTES_PER_SLOT):
- *     For each (pos, head): [K_MSE_indices(64B) | V_packed(64B)] = 128B
- *     data_base = block_base + pos * (H * 128) + head * 128
+ * AoS layout per slot (stride_cache_head bytes per [block, pos, head] entry):
+ *   kv_cache shape: (num_blocks, block_size, num_kv_heads, stride_cache_head)
+ *   Per slot (134 bytes for D=128, 4-bit MSE+value):
+ *     [K_MSE_indices(64B) | K_norm(2B fp16) | V_packed(64B) | V_scale(2B fp16) | V_zero(2B fp16)]
  *
- *   Meta region [meta_region_offset, ...):
- *     For each (head, field, pos): one fp16 value
- *     meta_u16_addr = (block_base + meta_offset) / 2
- *                   + head * (NUM_SOA_FIELDS * block_size) + field * block_size + pos
- *     field 0 = K_norm, field 1 = V_scale, field 2 = V_zero
+ *   Addresses within a slot (byte offsets from slot_base):
+ *     K_data:  [0,  63]   — 4-bit packed MSE indices
+ *     K_norm:  [64, 65]   — fp16, at MSE_BYTES=64
+ *     V_data:  [66, 129]  — 4-bit packed uniform quant values, at KPS=66
+ *     V_scale: [130, 131] — fp16, at KPS + VAL_DATA_BYTES = 130
+ *     V_zero:  [132, 133] — fp16, at KPS + VAL_DATA_BYTES + 2 = 132
+ *
+ *   slot_base = block_num * stride_cache_block
+ *             + pos * (num_kv_heads * stride_cache_head)
+ *             + head * stride_cache_head
  *
  * Fuses 5 operations into 1 kernel launch:
  *   1. bf16/fp16 -> fp32 cast
@@ -20,7 +25,7 @@
  *   3. GEMV rotation (x_hat @ PiT)
  *   4. MSE bucketize + pack
  *   5. Value quantize + pack
- *   + metadata (K_norm, V_scale, V_zero) written to SoA meta region
+ *   + metadata (K_norm, V_scale, V_zero) written inline per slot
  */
 
 #include <hip/hip_runtime.h>
@@ -40,36 +45,21 @@ __device__ __forceinline__ float wave_sum(float val) {
 #define D 128
 #define N_CENTROIDS 16
 #define N_MIDPOINTS 15
-#define MSE_BYTES 64
-#define VAL_DATA_BYTES 64
-#define DATA_BYTES_PER_SLOT (MSE_BYTES + VAL_DATA_BYTES)
-#define NUM_SOA_FIELDS 3
-#define SOA_K_NORM 0
-#define SOA_V_SCALE 1
-#define SOA_V_ZERO 2
+#define MSE_BYTES 64          // bytes for K MSE indices per slot
+#define KPS 66                // key_packed_size: offset from slot_base to V data start
+                              // = MSE_BYTES(64) + K_norm(2)
+#define VAL_DATA_BYTES 64     // bytes for V data per slot
 #define N_WAVES 4
 #define TILE_SIZE 32
 
-__device__ __forceinline__ long long soa_data_base(
+// AoS slot base: each (block, pos, head) occupies stride_cache_head bytes
+__device__ __forceinline__ long long aos_slot_base(
     int block_num, int page_off, int head_idx,
-    int stride_cache_block, int num_kv_heads
+    int stride_cache_block, int stride_cache_head, int num_kv_heads
 ) {
     return (long long)block_num * stride_cache_block
-         + (long long)page_off * (num_kv_heads * DATA_BYTES_PER_SLOT)
-         + (long long)head_idx * DATA_BYTES_PER_SLOT;
-}
-
-__device__ __forceinline__ long long soa_meta_u16_addr(
-    int block_num, int page_off, int head_idx,
-    int stride_cache_block, int block_size,
-    int num_kv_heads, int field
-) {
-    const long long block_base = (long long)block_num * stride_cache_block;
-    const long long meta_region_offset =
-        (long long)block_size * num_kv_heads * DATA_BYTES_PER_SLOT;
-    const long long head_meta_base = (block_base + meta_region_offset) / 2
-        + (long long)head_idx * (NUM_SOA_FIELDS * block_size);
-    return head_meta_base + (long long)field * block_size + page_off;
+         + (long long)page_off * (num_kv_heads * stride_cache_head)
+         + (long long)head_idx * stride_cache_head;
 }
 
 __global__ __launch_bounds__(256, 2)
@@ -82,7 +72,8 @@ void tq_store_fused_soa_kernel(
     unsigned char* __restrict__ kv_cache,
     unsigned short* __restrict__ kv_cache_u16,  // u16 aliased view
     const long long* __restrict__ slot_map,
-    int stride_cache_block,
+    int stride_cache_block,   // kv_cache.stride(0): bytes per block
+    int stride_cache_head,    // kv_cache.stride(2): bytes per (pos,head) slot = 134 for 4-bit MSE
     int H,
     int block_size,
     int NH,
@@ -108,13 +99,16 @@ void tq_store_fused_soa_kernel(
         if (slot >= 0) {
             blk = (int)(slot / block_size);
             off = (int)(slot % block_size);
-            data_base = soa_data_base(blk, off, head_idx, stride_cache_block, H);
-            knorm_addr = soa_meta_u16_addr(blk, off, head_idx,
-                stride_cache_block, block_size, H, SOA_K_NORM);
-            vscale_addr = soa_meta_u16_addr(blk, off, head_idx,
-                stride_cache_block, block_size, H, SOA_V_SCALE);
-            vzero_addr = soa_meta_u16_addr(blk, off, head_idx,
-                stride_cache_block, block_size, H, SOA_V_ZERO);
+            // AoS slot base: each (block, pos, head) occupies stride_cache_head bytes
+            data_base = aos_slot_base(blk, off, head_idx,
+                                      stride_cache_block, stride_cache_head, H);
+            // Inline AoS metadata — byte offsets within slot:
+            //   K_norm  at MSE_BYTES     (byte 64)
+            //   V_scale at KPS + VAL_DATA_BYTES      (byte 130)
+            //   V_zero  at KPS + VAL_DATA_BYTES + 2  (byte 132)
+            knorm_addr  = (data_base + MSE_BYTES) / 2;
+            vscale_addr = (data_base + KPS + VAL_DATA_BYTES) / 2;
+            vzero_addr  = (data_base + KPS + VAL_DATA_BYTES + 2) / 2;
         }
     }
 
@@ -209,11 +203,11 @@ void tq_store_fused_soa_kernel(
         if (y1 >= m_reg[i]) idx1++;
     }
 
-    // Pack MSE indices and store to SoA DATA region
+    // Pack MSE indices and store to AoS K_data region (bytes 0–63 of slot)
     unsigned char packed_idx = (unsigned char)((idx0 & 0xF) | ((idx1 & 0xF) << 4));
     kv_cache[data_base + lane_id] = packed_idx;
 
-    // Store K_norm to SoA META region (u16 write)
+    // Store K_norm inline at byte MSE_BYTES=64 within slot (u16 write, lane 0 only)
     if (lane_id == 0) {
         __half vn_h = __float2half(vec_norm);
         kv_cache_u16[knorm_addr] = *reinterpret_cast<unsigned short*>(&vn_h);
@@ -248,11 +242,11 @@ void tq_store_fused_soa_kernel(
     q0 = max(0, min(15, q0));
     q1 = max(0, min(15, q1));
 
-    // Pack V data and store to SoA DATA region (offset by MSE_BYTES)
+    // Pack V data and store to AoS V_data region (bytes KPS–KPS+63 of slot)
     unsigned char packed_val = (unsigned char)((q0 & 0xF) | ((q1 & 0xF) << 4));
-    kv_cache[data_base + MSE_BYTES + lane_id] = packed_val;
+    kv_cache[data_base + KPS + lane_id] = packed_val;
 
-    // Store V_scale and V_zero to SoA META region (u16 writes)
+    // Store V_scale and V_zero inline (bytes 130–131, 132–133 of slot)
     if (lane_id == 0) {
         __half sc_h = __float2half(v_scale);
         kv_cache_u16[vscale_addr] = *reinterpret_cast<unsigned short*>(&sc_h);
@@ -271,7 +265,8 @@ extern "C" void launch_tq_store_fused_soa(
     unsigned char* kv_cache,
     unsigned short* kv_cache_u16,
     const long long* slot_map,
-    int stride_cache_block,
+    int stride_cache_block,   // kv_cache.stride(0): bytes per block
+    int stride_cache_head,    // kv_cache.stride(2): bytes per slot (e.g. 134)
     int H,
     int block_size,
     int NH,
@@ -287,7 +282,7 @@ extern "C" void launch_tq_store_fused_soa(
         key, value,
         PiT, centroids, midpoints,
         kv_cache, kv_cache_u16, slot_map,
-        stride_cache_block,
+        stride_cache_block, stride_cache_head,
         H, block_size, NH, kv_dtype
     );
 }

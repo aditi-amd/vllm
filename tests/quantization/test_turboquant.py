@@ -570,20 +570,19 @@ class TestStoreDecodeRoundTrip:
         )
         slot_mapping = torch.tensor([0], device=device, dtype=torch.int32)
 
-        # Store
+        # Store (centroids before midpoints in jiangyong's updated signature)
         triton_turboquant_store(
             key,
             value,
             kv_cache,
             slot_mapping,
             PiT,
+            c_sorted,
             midpoints,
             mse_bits=cfg.key_mse_bits,
             key_packed_size=cfg.key_packed_size,
             value_quant_bits=cfg.effective_value_quant_bits,
             key_fp8=cfg.key_fp8,
-            centroids=c_sorted,
-            norm_correction=cfg.norm_correction,
         )
 
         # Decode: use key as query so attention = softmax([1]) * V = V
@@ -683,13 +682,12 @@ class TestDecodeV2Equivalence:
             kv_cache,
             slot_mapping,
             PiT,
+            c_sorted,
             midpoints,
             mse_bits=cfg.key_mse_bits,
             key_packed_size=cfg.key_packed_size,
             value_quant_bits=cfg.effective_value_quant_bits,
             key_fp8=cfg.key_fp8,
-            centroids=c_sorted,
-            norm_correction=cfg.norm_correction,
         )
         return cfg, Pi, PiT, centroids, kv_cache, num_blocks
 
@@ -889,13 +887,12 @@ class TestDecodeV2Equivalence:
             kv_cache,
             slot_mapping,
             PiT,
+            c_sorted,
             midpoints,
             mse_bits=cfg.key_mse_bits,
             key_packed_size=cfg.key_packed_size,
             value_quant_bits=cfg.effective_value_quant_bits,
             key_fp8=cfg.key_fp8,
-            centroids=c_sorted,
-            norm_correction=cfg.norm_correction,
         )
         return (cfg, Pi, PiT, centroids, kv_cache, num_blocks, raw_k, raw_v)
 

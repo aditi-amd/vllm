@@ -351,7 +351,8 @@ def _load_soa_fused_store():
             ctypes.c_void_p,  # kv_cache uint8
             ctypes.c_void_p,  # kv_cache_u16 uint16 alias
             ctypes.c_void_p,  # slot_map int64 [N]
-            ctypes.c_int,     # stride_cache_block
+            ctypes.c_int,     # stride_cache_block: kv_cache.stride(0) bytes per block
+            ctypes.c_int,     # stride_cache_head: kv_cache.stride(2) bytes per slot
             ctypes.c_int,     # H (num_kv_heads)
             ctypes.c_int,     # block_size
             ctypes.c_int,     # NH
