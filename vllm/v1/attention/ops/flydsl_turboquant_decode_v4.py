@@ -144,24 +144,69 @@ _LOG_SINKS_WARNED: bool = False
 _LOG_NORM_WARNED: bool = False
 
 
+def _detect_max_capture_B() -> int:
+    """Probe vLLM compilation config for the largest cudagraph capture size.
+
+    Returns max(cudagraph_capture_sizes) if available, else falls back to
+    ``VLLM_TQ_DECODE_V4_B_BUCKET`` (default 512 = vLLM default cap).
+
+    Used to size the segm-pool bucket once, so that all distinct B's
+    (whether captured in a graph, or hit eagerly in mixed batches) share
+    a single allocation per shape — eliminating the per-B 52 MiB growth
+    that previously dominated dense-capture VRAM cost (1.3 GiB at the
+    25-size custom set, ~2.8 GiB at vLLM's full default sweep).
+    """
+    env = os.environ.get("VLLM_TQ_DECODE_V4_B_BUCKET")
+    if env is not None:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    try:
+        from vllm.config import get_current_vllm_config
+        cfg = get_current_vllm_config()
+        sizes = cfg.compilation_config.cudagraph_capture_sizes
+        if sizes:
+            return int(max(sizes))
+    except Exception:  # noqa: BLE001
+        pass
+    return 512
+
+
 class _SegmBufPool:
-    """Per-shape buffer pool for segm_out/segm_max/segm_sum/output.
+    """Single-bucket buffer pool for segm_out/segm_max/segm_sum/output.
+
+    Each unique shape signature (Hk, Hq, num_partitions, QG, D, device,
+    dtype) is backed by ONE allocation sized at ``max_B`` (= max captured
+    cudagraph batch size, or env override). Per-call ``get(B, ...)``
+    returns ``[:B]`` views — same data_ptr base, narrower N dim. The
+    kernel grid is ``(B, ...)`` so it only ever writes the first B rows
+    of segm_out / segm_max / segm_sum; downstream readers (Triton
+    reducer + caller) only consume the first B rows of output.
+
+    Why a single bucket: cudagraph records launch pointers at capture
+    time. With per-B allocations, every captured size triggered a fresh
+    52-MiB-each allocation (M2.5 64K shape) → 1.3 GiB at our 25-size
+    capture set, ~2.8 GiB at vLLM's full default sweep up to B=512.
+    With single-bucket, the pool tops out at one max_B-sized buffer per
+    shape (~213 MiB at B_max=512 for M2.5), shared across ALL captured
+    sizes and ALL eager mixed-batch calls. The data_ptr is stable from
+    first allocation onward, so cudagraph capture is happy across all
+    captured B's.
 
     Eliminates per-decode-step ``cudaMalloc`` (× 4) plus the device-side
     memset kernels behind ``torch.full(-inf)`` and ``torch.zeros``.
-
-    Buffers are keyed by the full shape signature, so cudagraph capture
-    sees a stable address per shape (which is what cudagraph requires).
     The kernel always writes the FULL ``[B, Hk, P, QG, D]`` slice and
     every (n, kv_h, p, qg) position of segm_max / segm_sum (it stores
-    ``-inf`` and ``0`` for empty partitions itself), so no reset is
-    needed between calls at the same shape.
+    ``-inf`` and ``0`` for empty partitions itself), so uninitialized
+    bytes from the pool are safe to reuse for any B ≤ B_bucket.
     """
 
-    __slots__ = ("_bufs",)
+    __slots__ = ("_bufs", "_max_B")
 
     def __init__(self) -> None:
         self._bufs: dict[tuple, dict[str, torch.Tensor]] = {}
+        self._max_B: int | None = None  # lazy-init on first get()
 
     def get(
         self,
@@ -174,35 +219,73 @@ class _SegmBufPool:
         device: torch.device,
         q_dtype: torch.dtype,
     ) -> dict[str, torch.Tensor]:
+        if self._max_B is None:
+            self._max_B = _detect_max_capture_B()
+        # B may exceed the detected max if user set max-num-seqs higher
+        # than the largest captured size — still safe, we'll grow once.
+        # Note: growing AFTER cudagraph capture would invalidate captured
+        # pointers, so this should only happen during warmup or in
+        # always-eager configs.
+        B_bucket = max(self._max_B, int(B))
         key = (
-            int(B), int(Hk), int(Hq), int(num_partitions),
+            int(Hk), int(Hq), int(num_partitions),
             int(QG), int(D), str(device), q_dtype,
         )
         bufs = self._bufs.get(key)
-        if bufs is None:
+        if bufs is None or bufs["segm_out"].shape[0] < B_bucket:
+            if bufs is not None and bufs["segm_out"].shape[0] < B_bucket:
+                # First-time grow: warn so user knows cudagraphs may be
+                # invalidated. In practice this means VLLM_TQ_DECODE_V4_
+                # B_BUCKET should have been set higher.
+                logger.warning_once(
+                    "FlyDSL v4 _SegmBufPool: growing bucket from %d to %d "
+                    "(B=%d). If you see this AFTER cudagraph warmup, the "
+                    "previously-captured graphs hold stale pointers and "
+                    "will GPU-fault. Set VLLM_TQ_DECODE_V4_B_BUCKET=%d "
+                    "before launch to avoid this.",
+                    bufs["segm_out"].shape[0], B_bucket, B, B_bucket,
+                )
             bufs = {
                 "segm_out": torch.empty(
-                    (B, Hk, num_partitions, QG, D),
+                    (B_bucket, Hk, num_partitions, QG, D),
                     dtype=torch.bfloat16, device=device,
                 ),
                 "segm_max": torch.empty(
-                    (B, Hk, num_partitions, QG),
+                    (B_bucket, Hk, num_partitions, QG),
                     dtype=torch.float32, device=device,
                 ),
                 "segm_sum": torch.empty(
-                    (B, Hk, num_partitions, QG),
+                    (B_bucket, Hk, num_partitions, QG),
                     dtype=torch.float32, device=device,
                 ),
                 "output": torch.empty(
-                    (B, Hq, D), dtype=q_dtype, device=device,
+                    (B_bucket, Hq, D), dtype=q_dtype, device=device,
                 ),
             }
             self._bufs[key] = bufs
-        return bufs
+            self._max_B = B_bucket
+            logger.info_once(
+                "FlyDSL v4 _SegmBufPool: allocated single-bucket "
+                "shape=(Hk=%d, Hq=%d, P=%d, QG=%d, D=%d, dtype=%s) "
+                "B_bucket=%d (covers all captured + eager B's). "
+                "VRAM = %.1f MiB / shape.",
+                Hk, Hq, num_partitions, QG, D, q_dtype,
+                B_bucket,
+                sum(t.numel() * t.element_size() for t in bufs.values())
+                / (1 << 20),
+            )
+        # Return [:B] views — same data_ptr base, narrower N dim.
+        return {
+            "segm_out": bufs["segm_out"][:B],
+            "segm_max": bufs["segm_max"][:B],
+            "segm_sum": bufs["segm_sum"][:B],
+            "output": bufs["output"][:B],
+        }
 
     def stats(self) -> dict[str, int]:
         return {
             "shapes": len(self._bufs),
+            "max_B": int(self._max_B or 0),
             "bytes": sum(
                 sum(t.numel() * t.element_size() for t in d.values())
                 for d in self._bufs.values()
