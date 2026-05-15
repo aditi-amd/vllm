@@ -56,6 +56,22 @@ from vllm.v1.attention.ops.triton_turboquant_decode_v2 import (
     triton_turboquant_decode_attention_v2,
 )
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
+
+
+def _lazy_soa_store_imports():
+    """Lazy imports to avoid circular import: turboquant_soa_fusion.__init__
+    imports from turboquant_attn, so we cannot import it at module level."""
+    from vllm.v1.attention.ops.turboquant_soa_fusion.triton_turboquant_store import (
+        triton_turboquant_store as soa_store,
+    )
+    from vllm.v1.attention.ops.turboquant_soa_fusion.external_ops import (
+        _load_soa_fused_store as load_soa_fn,
+        _soa_fused_store_safe as soa_safe,
+    )
+    from vllm.v1.attention.ops.turboquant_soa_fusion.triton_turboquant_decode import (
+        _tq_full_dequant_kv as soa_dequant,
+    )
+    return soa_store, load_soa_fn, soa_safe, soa_dequant
 from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
     triton_turboquant_decode_attention_v3,
 )
@@ -348,12 +364,22 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
+        # Cache max_model_len now (config is available at __init__ time but
+        # NOT during CUDA graph capture when _ensure_on_device is re-entered).
+        self._max_model_len = vllm_config.model_config.max_model_len
 
         # Sink tokens support: store reference from kwargs if provided.
         # Sinks are pre-computed attention logits [Hq] that anchor attention
         # to sink tokens at the start of context (used by GPT-OSS and similar).
         # Note: sinks is passed directly via **extra_impl_args spread, not nested.
         self.sinks = kwargs.get("sinks")
+
+        # SOA store flag: when VLLM_TQ_SOA_FUSION_STORE=1, the store writes SoA
+        # layout (data region + metadata region separated per block). The FlyDSL v4
+        # decode kernel reads exclusively from SoA layout, so this flag must be True
+        # when VLLM_TQ_DECODE_V4=1.
+        import os as _os_init
+        self._soa_store = _os_init.environ.get("VLLM_TQ_SOA_FUSION_STORE", "0") == "1"
 
     def _ensure_on_device(self, layer, device):
         """One-time derivation of TQ buffers (rotation matrix, midpoints).
@@ -363,6 +389,58 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         quantizer is symmetric around zero (sign-flipping a coordinate
         maps it to the mirror centroid with identical distortion).
         """
+        # Pre-allocate _arange_cache and _cu_2 on the correct device before
+        # any CUDA graph capture.  These are lazily initialised in forward();
+        # if the lazy path fires during piecewise graph replay, the new
+        # torch.arange / torch.zeros allocation receives an address already
+        # owned by the captured HIP graph pool on ROCm → GPU memory fault or
+        # garbage outputs.  Sizing to max_model_len+2 ensures the cache is
+        # never re-grown during replay (_ac.shape[0] > any valid max_seq_len).
+        # Use self._max_model_len (set in __init__) — get_current_vllm_config()
+        # cannot be called here because _ensure_on_device is re-entered during
+        # CUDA graph capture when the config context is not set.
+        _max_len = self._max_model_len
+        _already_ok = (
+            hasattr(self, "_arange_cache")
+            and self._arange_cache.device.type == str(device).split(":")[0]
+            and self._arange_cache.shape[0] >= _max_len + 2
+        )
+        if not _already_ok:
+            self._arange_cache = torch.arange(
+                0, _max_len + 2, device=device, dtype=torch.int32
+            )
+        if not hasattr(self, "_cu_2") or self._cu_2.device != torch.device(device):
+            self._cu_2 = torch.zeros(2, device=device, dtype=torch.int32)
+
+        # Pre-warm the WorkspaceManager to the maximum size needed by
+        # _decode_attention BEFORE any CUDA graph capture begins.
+        #
+        # _decode_attention calls WorkspaceManager.get_simultaneous() with
+        # shape (B, Hq, S, D+1) × fp32 + (B, Hq, D) × query_dtype + (B, Hq) × fp32.
+        # If the workspace grows DURING the piecewise capture loop (when a larger
+        # batch size is warmed up mid-capture), some already-captured batch sizes
+        # have the OLD (now freed) workspace address baked in → GPU fault on replay.
+        # Pre-warming at the maximum captured batch size + maximum kv splits here
+        # ensures the workspace reaches its final size before any capture starts.
+        if is_workspace_manager_initialized() and not current_workspace_manager().is_locked():
+            B_max = self._max_capture_batch_size()
+            D = self.head_size
+            Hq = self.num_heads
+            S = self.max_num_kv_splits
+            _pre_warm_bytes = (
+                B_max * Hq * (S * (D + 1) + D) * 4  # fp32 mid_o + fp32 lse
+                + B_max * Hq * D * 2                  # query_dtype output (bf16=2B)
+                + 512                                  # alignment padding
+            )
+            _ws = current_workspace_manager()
+            # Touch the workspace to trigger growth to this size before capture.
+            # _ensure_workspace_size is not exposed, so use get_simultaneous with
+            # a single flat allocation of the required size.
+            try:
+                _ws.get_simultaneous(((_pre_warm_bytes,), torch.uint8))
+            except AssertionError:
+                pass  # Already locked (shouldn't happen here, but be safe)
+
         if not hasattr(layer, "_tq_cached"):
             D = self.head_size
 
@@ -382,6 +460,23 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             c_sorted, _ = layer._tq_centroids.sort()
             layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
             layer._tq_cached = True
+
+    def _max_capture_batch_size(self) -> int:
+        """Return the largest batch size that will be captured in CUDA graphs.
+
+        Used to pre-warm the WorkspaceManager before capture begins so that
+        workspace growth cannot happen mid-capture and invalidate baked-in ptrs.
+        Falls back to a generous heuristic (512) if config is unavailable.
+        """
+        try:
+            from vllm.v1.utils import get_current_vllm_config as _gcvc
+            cfg = _gcvc()
+            sizes = cfg.compilation_config.cudagraph_capture_sizes
+            if sizes:
+                return int(max(sizes))
+        except Exception:
+            pass
+        return 512
 
     def do_kv_cache_update(
         self,
@@ -477,9 +572,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
         else:
             # Mixed batch: decodes first (guaranteed by reorder_batch).
-            attn_out = torch.zeros(
-                N, self.num_heads, self.head_size, device=device, dtype=q.dtype
-            )
+            # Bug-2 fix: avoid fresh torch.zeros allocation for attn_out —
+            # on ROCm, post-capture allocations can land in the HIP graph
+            # memory pool and cause GPU faults in the eager mixed-batch path.
+            # Write decode and prefill results directly into the pre-allocated
+            # output buffer instead.
 
             # --- Decode portion (first num_decodes requests) ---
             # Use full-batch max_seq_len as safe upper bound (no GPU sync).
@@ -493,9 +590,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seq_len=attn_metadata.max_seq_len,
                 is_prefill=False,
             )
-            attn_out[:num_decode_tokens] = self._decode_attention(
+            _decode_out = self._decode_attention(
                 q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
             )
+            # Write decode result directly into output (no intermediate attn_out)
+            if output.ndim == 3:
+                output[:num_decode_tokens] = _decode_out.to(output.dtype)
+            else:
+                output[:num_decode_tokens] = _decode_out.reshape(
+                    num_decode_tokens, -1
+                ).to(output.dtype)
 
             # --- Prefill portion (remaining requests) ---
             # CRITICAL: use prefill-specific max_seq_len so flash_attn's
@@ -520,7 +624,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             k = key[:N].view(N, self.num_kv_heads, self.head_size)
             v = value[:N].view(N, self.num_kv_heads, self.head_size)
-            attn_out[num_decode_tokens:] = self._prefill_attention(
+            _prefill_out = self._prefill_attention(
                 q[num_decode_tokens:],
                 k[num_decode_tokens:],
                 v[num_decode_tokens:],
@@ -531,6 +635,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 PiT,
                 layer=layer,
             )
+            # Write prefill result directly into output
+            n_pref = N - num_decode_tokens
+            if output.ndim == 3:
+                output[num_decode_tokens:N] = _prefill_out.to(output.dtype)
+            else:
+                output[num_decode_tokens:N] = _prefill_out.reshape(
+                    n_pref, -1
+                ).to(output.dtype)
+            # Return early — output already filled, skip the common copy below
+            return output
 
         # Write into output buffer: attn_out is (N, Hq, D)
         # output may be 2D (N, Hq*D) or 3D (N, Hq, D)
@@ -552,19 +666,44 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         layer: Any,
     ):
         """Quantize + store via fused Triton kernel."""
-        triton_turboquant_store(
-            key,
-            value,
-            kv_cache,
-            slot_mapping,
-            layer._tq_PiT,
-            layer._tq_centroids,
-            layer._tq_midpoints,
-            mse_bits=self.tq_config.key_mse_bits,
-            key_packed_size=self.tq_config.key_packed_size,
-            value_quant_bits=self.tq_config.effective_value_quant_bits,
-            key_fp8=self.tq_config.key_fp8,
-        )
+        if self._soa_store:
+            # SOA layout: data region + metadata region separated per block.
+            # Required by FlyDSL v4 decode kernel (DATA_BYTES_PER_SLOT=128).
+            #
+            # NOTE: tq_store_fused_soa.hip (the "HIP SOA store") is intentionally
+            # bypassed here — despite its name it writes AoS layout (confirmed by
+            # its own source comments: "Fused TQ Store HIP Kernel — AoS Layout").
+            # Only the Triton SOA store correctly writes SoA (data region +
+            # metadata region, DATA_BYTES_PER_SLOT=128) compatible with v4.
+            _soa_triton_turboquant_store, _, _, _ = _lazy_soa_store_imports()
+            _soa_triton_turboquant_store(
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                slot_mapping=slot_mapping,
+                PiT=layer._tq_PiT,
+                midpoints=layer._tq_midpoints,
+                mse_bits=self.tq_config.key_mse_bits,
+                key_packed_size=self.tq_config.key_packed_size,
+                value_quant_bits=self.tq_config.effective_value_quant_bits,
+                key_fp8=self.tq_config.key_fp8,
+                centroids=layer._tq_centroids,
+                norm_correction=self.tq_config.norm_correction,
+            )
+        else:
+            triton_turboquant_store(
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+                layer._tq_PiT,
+                layer._tq_centroids,
+                layer._tq_midpoints,
+                mse_bits=self.tq_config.key_mse_bits,
+                key_packed_size=self.tq_config.key_packed_size,
+                value_quant_bits=self.tq_config.effective_value_quant_bits,
+                key_fp8=self.tq_config.key_fp8,
+            )
 
     # ------------------------------------------------------------------ #
     #  Prefill: SDPA on raw Q/K/V with causal mask                        #
@@ -771,6 +910,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                             PiT=PiT,
                         )
                     else:
+                        # v1 baseline: continuation fast-path using the
+                        # Triton v1 decode kernel per synthetic query token.
                         out = triton_turboquant_decode_attention(
                             query=q_seq,
                             kv_cache=kv_cache,
@@ -855,11 +996,43 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     (buf_shape, torch.float16),
                 )
             except AssertionError:
-                k_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
-                v_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
+                # WorkspaceManager too small — fall back to layer-cached buffer
+                # (same grow-only pattern as FusionTurboQuantAttentionImpl).
+                # Never use a bare torch.empty here: that allocation can receive
+                # an address inside the captured HIP graph pool on ROCm.
+                _kbuf = getattr(layer, "_tq_k_dequant_buf", None)
+                _vbuf = getattr(layer, "_tq_v_dequant_buf", None)
+                if _kbuf is None or _kbuf.shape[2] < alloc_len:
+                    _kbuf = torch.empty(
+                        (1, Hk, block_table.shape[1] * block_size, D),
+                        dtype=torch.float16, device=device,
+                    )
+                    layer._tq_k_dequant_buf = _kbuf
+                if _vbuf is None or _vbuf.shape[2] < alloc_len:
+                    _vbuf = torch.empty(
+                        (1, Hk, block_table.shape[1] * block_size, D),
+                        dtype=torch.float16, device=device,
+                    )
+                    layer._tq_v_dequant_buf = _vbuf
+                k_buf = _kbuf
+                v_buf = _vbuf
         else:
-            k_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
-            v_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
+            _kbuf = getattr(layer, "_tq_k_dequant_buf", None)
+            _vbuf = getattr(layer, "_tq_v_dequant_buf", None)
+            if _kbuf is None or _kbuf.shape[2] < alloc_len:
+                _kbuf = torch.empty(
+                    (1, Hk, block_table.shape[1] * block_size, D),
+                    dtype=torch.float16, device=device,
+                )
+                layer._tq_k_dequant_buf = _kbuf
+            if _vbuf is None or _vbuf.shape[2] < alloc_len:
+                _vbuf = torch.empty(
+                    (1, Hk, block_table.shape[1] * block_size, D),
+                    dtype=torch.float16, device=device,
+                )
+                layer._tq_v_dequant_buf = _vbuf
+            k_buf = _kbuf
+            v_buf = _vbuf
         # Skip .zero_() — kernel writes all positions up to cached_len,
         # and we only read [:cached_len] afterwards.
         k_cached = k_buf[:, :, :alloc_len, :]
@@ -877,45 +1050,92 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         kv_cache_u16 = kv_cache.view(torch.uint16)
 
         grid = (alloc_len, 1 * Hk)
-        _tq_full_dequant_kv[grid](
-            kv_cache,
-            block_table,
-            centroids,
-            k_cached,
-            v_cached,
-            k_cached.stride(0),
-            k_cached.stride(1),
-            k_cached.stride(2),
-            v_cached.stride(0),
-            v_cached.stride(1),
-            v_cached.stride(2),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
-            block_table.stride(0),
-            HEAD_DIM=D,
-            BLOCK_SIZE=block_size,
-            NUM_KV_HEADS=Hk,
-            MSE_BYTES=mse_bytes,
-            KPS=self.tq_config.key_packed_size,
-            VQB=self.tq_config.effective_value_quant_bits,
-            VAL_DATA_BYTES=val_data_bytes,
-            MSE_BITS=self.tq_config.key_mse_bits,
-            N_CENTROIDS=2 ** self.tq_config.key_mse_bits,
-            KEY_FP8=1 if key_fp8 else 0,
-            BLOCK_D=BLOCK_D,
-            NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
-            FP8_E4B15=_use_fp8_e4b15(device.index or 0),
-            OUT_BF16=0,
-            num_warps=4,
-        )
+        if self._soa_store:
+            # SoA layout: use the SOA-aware dequant kernel.
+            _, _, _, _soa_tq_full_dequant_kv = _lazy_soa_store_imports()
+            _soa_tq_full_dequant_kv[grid](
+                kv_cache,
+                kv_cache_u16,
+                block_table,
+                centroids,
+                k_cached,
+                v_cached,
+                k_cached.stride(0),
+                k_cached.stride(1),
+                k_cached.stride(2),
+                v_cached.stride(0),
+                v_cached.stride(1),
+                v_cached.stride(2),
+                kv_cache.stride(0),
+                block_table.stride(0),
+                HEAD_DIM=D,
+                BLOCK_SIZE=block_size,
+                NUM_KV_HEADS=Hk,
+                MSE_BYTES=mse_bytes,
+                VQB=self.tq_config.effective_value_quant_bits,
+                VAL_DATA_BYTES=val_data_bytes,
+                MSE_BITS=self.tq_config.key_mse_bits,
+                KEY_FP8=1 if key_fp8 else 0,
+                KEY_DATA_BYTES=key_data_bytes,
+                META_REGION_OFFSET=meta_region_offset,
+                NUM_SOA_FIELDS=num_soa_fields,
+                SOA_K_NORM=soa_k_norm,
+                SOA_V_SCALE=soa_v_scale,
+                SOA_V_ZERO=soa_v_zero,
+                BLOCK_D=BLOCK_D,
+                NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
+                FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+                num_warps=4,
+            )
+        else:
+            _tq_full_dequant_kv[grid](
+                kv_cache,
+                block_table,
+                centroids,
+                k_cached,
+                v_cached,
+                k_cached.stride(0),
+                k_cached.stride(1),
+                k_cached.stride(2),
+                v_cached.stride(0),
+                v_cached.stride(1),
+                v_cached.stride(2),
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                kv_cache.stride(2),
+                block_table.stride(0),
+                HEAD_DIM=D,
+                BLOCK_SIZE=block_size,
+                NUM_KV_HEADS=Hk,
+                MSE_BYTES=mse_bytes,
+                KPS=self.tq_config.key_packed_size,
+                VQB=self.tq_config.effective_value_quant_bits,
+                VAL_DATA_BYTES=val_data_bytes,
+                MSE_BITS=self.tq_config.key_mse_bits,
+                N_CENTROIDS=2 ** self.tq_config.key_mse_bits,
+                KEY_FP8=1 if key_fp8 else 0,
+                BLOCK_D=BLOCK_D,
+                NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
+                FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+                OUT_BF16=0,
+                num_warps=4,
+            )
 
         # Inverse-rotate MSE keys back to original space
         if not self.tq_config.key_fp8:
             # fp16 matmul for rotation (2× less bandwidth, uses fp16 tensor cores)
+            # Use a layer-cached output buffer for the matmul to avoid variable-size
+            # torch allocations that can conflict with the ROCm HIP graph pool.
             Pi_half = layer._tq_Pi_half
             k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
-            k_flat = k_flat @ Pi_half
+            _kflat_rows = k_flat.shape[0]  # = Hk * cached_len
+            _kflat_max = block_table.shape[1] * block_size * Hk
+            _kflat_buf: torch.Tensor | None = getattr(layer, "_tq_kflat_buf", None)
+            if _kflat_buf is None or _kflat_buf.shape[0] < _kflat_max:
+                _kflat_buf = torch.empty(_kflat_max, D, dtype=torch.float16, device=device)
+                layer._tq_kflat_buf = _kflat_buf
+            torch.mm(k_flat, Pi_half, out=_kflat_buf[:_kflat_rows])
+            k_flat = _kflat_buf[:_kflat_rows]
             k_cached_trim = k_flat.reshape(Hk, cached_len, D).transpose(
                 0, 1
             )  # (cached_len, Hk, D) — already fp16
@@ -927,11 +1147,26 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Skip .contiguous() — the copy into k_full/v_full handles layout
         v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
 
-        # Concatenate cached + current chunk K/V (match query dtype)
-        # Pre-allocate full K/V buffer, copy into slices (no cat alloc)
+        # Concatenate cached + current chunk K/V (match query dtype).
+        # Cache k_full/v_full on the layer object so they are allocated once
+        # at worst-case size during warmup and reused on every subsequent call
+        # — including during piecewise CUDA graph replay.  This matches the
+        # pattern FusionTurboQuantAttentionImpl uses for its k_buf/v_buf and
+        # eliminates the variable-size torch.empty() calls that cause ROCm HIP
+        # graph pool address collisions (→ garbage outputs at 32K, GPU fault at
+        # 128K).  Worst-case capacity = all KV blocks × block_size.
         qdtype = query.dtype
-        k_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
-        v_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
+        _kfull_cap = block_table.shape[1] * block_size
+        _kfull_buf: torch.Tensor | None = getattr(layer, "_tq_kfull_buf", None)
+        if _kfull_buf is None or _kfull_buf.shape[0] < _kfull_cap or _kfull_buf.dtype != qdtype:
+            _kfull_buf = torch.empty(_kfull_cap, Hk, D, dtype=qdtype, device=device)
+            layer._tq_kfull_buf = _kfull_buf
+        _vfull_buf: torch.Tensor | None = getattr(layer, "_tq_vfull_buf", None)
+        if _vfull_buf is None or _vfull_buf.shape[0] < _kfull_cap or _vfull_buf.dtype != qdtype:
+            _vfull_buf = torch.empty(_kfull_cap, Hk, D, dtype=qdtype, device=device)
+            layer._tq_vfull_buf = _vfull_buf
+        k_full = _kfull_buf[:seq_len]
+        v_full = _vfull_buf[:seq_len]
         k_full[:cached_len] = k_cached_trim.to(qdtype)
         k_full[cached_len:] = key_chunk
         v_full[:cached_len] = v_cached_trim.to(qdtype)
@@ -941,7 +1176,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         if _HAS_FLASH_ATTN:
             cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
             cu_seqlens_k = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
-            return flash_attn_varlen_func(
+            _fa_out = flash_attn_varlen_func(
                 q=query,
                 k=k_full,
                 v=v_full,
@@ -952,6 +1187,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 softmax_scale=self.scale,
                 causal=True,
             )
+            return _fa_out
         else:
             # SDPA fallback: expand KV for GQA, build causal mask
             q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)

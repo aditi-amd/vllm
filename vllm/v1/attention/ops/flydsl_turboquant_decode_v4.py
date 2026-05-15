@@ -261,6 +261,27 @@ class _SegmBufPool:
                 "output": torch.empty(
                     (B_bucket, Hq, D), dtype=q_dtype, device=device,
                 ),
+                # q_rot fix: stable pre-allocated buffer for the rotated query
+                # tensor. On ROCm, fresh torch.empty / matmul-result allocations
+                # after HIP graph capture can land in the graph memory pool and
+                # cause GPU memory faults when passed as kernel arguments in the
+                # eager mixed-batch path. By pooling q_rot here (same pattern as
+                # segm_out/output above), the data_ptr is stable from first
+                # allocation onward — same for all captured B's and eager calls.
+                "q_rot": torch.empty(
+                    (B_bucket, Hq, D), dtype=q_dtype, device=device,
+                ),
+                # q_float: fp32 copy of query (bf16→fp32 for mm input).
+                # Pooled to avoid fresh allocations post-capture.
+                "q_float": torch.empty(
+                    (B_bucket, Hq, D), dtype=torch.float32, device=device,
+                ),
+                # q_rot_fp32: fp32 output of the rotation mm (before bf16 cast).
+                # Using torch.mm(..., out=this) eliminates the fresh mm-result
+                # allocation that would otherwise land in the HIP graph pool.
+                "q_rot_fp32": torch.empty(
+                    (B_bucket, Hq, D), dtype=torch.float32, device=device,
+                ),
             }
             self._bufs[key] = bufs
             self._max_B = B_bucket
@@ -280,6 +301,9 @@ class _SegmBufPool:
             "segm_max": bufs["segm_max"][:B],
             "segm_sum": bufs["segm_sum"][:B],
             "output": bufs["output"][:B],
+            "q_rot": bufs["q_rot"][:B],
+            "q_float": bufs["q_float"][:B],
+            "q_rot_fp32": bufs["q_rot_fp32"][:B],
         }
 
     def stats(self) -> dict[str, int]:
@@ -603,7 +627,16 @@ def flydsl_turboquant_decode_attention_v4(
         )
         centroids_c = centroids.contiguous()
 
-    q_rot = (query.float() @ PiT_f32).to(query.dtype).contiguous()
+    # ---- T1.0: pooled q_rot (Bug-1 fix: stable data_ptr post-capture) ------
+    # On ROCm, fresh tensor allocations made AFTER HIP graph capture can land
+    # in the graph memory pool and cause GPU memory faults when passed as kernel
+    # pointer arguments in the eager mixed-batch path. We pool q_rot and the
+    # fp32 intermediate the same way segm_out/output are pooled: one max-B
+    # allocation per shape, reused across all B's.
+    #
+    # Note: pool_bufs is computed BELOW after num_partitions is determined;
+    # q_rot needs pool_bufs["q_float"] and pool_bufs["q_rot"]. We compute the
+    # rotation inline after the pool is fetched (see T1.2).
 
     # ---- Partition count (FA2 split-KV) ----------------------------------
     #
@@ -708,6 +741,22 @@ def flydsl_turboquant_decode_attention_v4(
     else:
         output = output_buf[:B] if output_buf.shape[0] != B else output_buf
 
+    # ---- T1.0 (continued): stable q_rot via pooled buffers ---------------
+    # Use pre-allocated pool buffers so q_rot has a stable data_ptr that never
+    # changes after warmup — fixes ROCm HIP graph pool / eager path conflict.
+    _q_float = pool_bufs["q_float"]          # [B, Hq, D] fp32, stable
+    _q_rot_f32 = pool_bufs["q_rot_fp32"]     # [B, Hq, D] fp32, stable mm output
+    _q_rot_out = pool_bufs["q_rot"]          # [B, Hq, D] query.dtype, stable
+    _q_float.copy_(query)                    # bf16 → fp32 in-place, no alloc
+    # mm into stable fp32 buffer via out= to avoid any fresh allocation.
+    # PiT_f32 is cached on buf_holder (stable ptr since first layer warmup).
+    torch.mm(
+        _q_float.view(B * Hq, D), PiT_f32,
+        out=_q_rot_f32.view(B * Hq, D),     # in-place into pool buffer, no alloc
+    )
+    _q_rot_out.copy_(_q_rot_f32)             # fp32 → bf16, into stable buf [B,Hq,D]
+    q_rot = _q_rot_out                       # stable pointer for kernel launch
+
     # ---- FlyDSL kernel launch -------------------------------------------
     max_bps = int(block_table.shape[1])
     use_hw_tr = _hw_tr_enabled()
@@ -737,18 +786,6 @@ def flydsl_turboquant_decode_attention_v4(
                 os.environ.get("VLLM_TQ_DECODE_V4_DYNAMIC_PARTS", "0") == "1"
             ) else "worst_case",
         )
-    # T1.4: time the launch() so we can see if first-call-per-shape
-    # triggers a hidden FlyDSL JIT specialization (separate from the build
-    # in _get_kernel). Logs once per unique B in capture/eager paths.
-    import time as _t_launch
-    _LAUNCH_BSEEN = getattr(flydsl_turboquant_decode_attention_v4,
-                             "_LAUNCH_BSEEN", set())
-    _is_first_for_B = int(B) not in _LAUNCH_BSEEN
-    if _is_first_for_B:
-        _LAUNCH_BSEEN.add(int(B))
-        flydsl_turboquant_decode_attention_v4._LAUNCH_BSEEN = _LAUNCH_BSEEN
-        torch.cuda.synchronize()
-        _launch_t0 = _t_launch.perf_counter()
     launch(
         segm_out, segm_sum, segm_max,
         q_rot, kv_cache, centroids_c,
@@ -756,13 +793,6 @@ def flydsl_turboquant_decode_attention_v4(
         B, Hk, num_partitions,
         torch.cuda.current_stream(),
     )
-    if _is_first_for_B:
-        torch.cuda.synchronize()
-        _launch_dt = _t_launch.perf_counter() - _launch_t0
-        logger.info(
-            "FlyDSL v4 first launch B=%d dt=%.3fs (#unique_B_seen=%d)",
-            int(B), _launch_dt, len(_LAUNCH_BSEEN),
-        )
 
     # ---- Reduce partitions -> [B, Hq, D] --------------------------------
     _reduce_partitions_v4[(B, Hq)](
@@ -777,7 +807,6 @@ def flydsl_turboquant_decode_attention_v4(
         NUM_PARTS=num_partitions,
         HEAD_SIZE=D,
     )
-
     if sinks is not None and not _LOG_SINKS_WARNED:
         _LOG_SINKS_WARNED = True
         logger.warning(
