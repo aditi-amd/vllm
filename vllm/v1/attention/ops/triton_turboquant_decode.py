@@ -51,7 +51,7 @@ def _tq_decode_stage1(
     Q_rot_ptr,  # [B, Hq, D] float32
     # Compressed KV cache (combined K+V)
     KV_cache_ptr,  # [num_blocks, block_size, Hk, padded_slot] uint8
-    KV_cache_u16_ptr,  # uint16 view of same storage — Opt#3 SoA loads
+    KV_cache_u16_ptr,  # uint16 view of same storage
     # Block table and sequence info
     Block_table_ptr,  # [B, max_num_blocks] int32
     Seq_lens_ptr,  # [B] int32
@@ -63,35 +63,31 @@ def _tq_decode_stage1(
     Sink_ptr,  # [Hq] float32, pre-computed sink attention logits per head
     # Strides
     stride_qb,
-    stride_qh,  # Q strides: [B, Hq, D]
-    stride_cache_block,  # bytes per block (bs*H*slot_aligned)
-    stride_bt_b,  # block_table stride per batch
+    stride_qh,       # Q strides: [B, Hq, D]
+    stride_cache_block,  # bytes per block (kv_cache.stride(0))
+    stride_cache_pos,    # bytes per slot-position (kv_cache.stride(1))
+    stride_cache_head,   # bytes per head (kv_cache.stride(2))
+    stride_bt_b,     # block_table stride per batch
     stride_mid_b,
     stride_mid_h,
-    stride_mid_s,  # mid_o strides
+    stride_mid_s,    # mid_o strides
     # Constexpr dims
     NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,  # KV cache block_size (pages)
     NUM_KV_SPLITS: tl.constexpr,
     KV_GROUP_SIZE: tl.constexpr,  # Hq // Hk
-    # TQ layout constants
+    # TQ layout constants — AoS per-slot format matching triton_turboquant_store
     MSE_BITS: tl.constexpr,  # 3 or 4
     MSE_BYTES: tl.constexpr,  # ceil(D * mse_bits / 8)
+    KPS: tl.constexpr,        # key_packed_size: V data starts at slot_base+KPS
     VQB: tl.constexpr,  # value_quant_bits (4 or 8=FP8)
     VAL_DATA_BYTES: tl.constexpr,  # ceil(D * vqb / 8) or D for FP8
-    # Opt#3 SoA layout
-    KEY_DATA_BYTES: tl.constexpr,  # MSE_BYTES (MSE) or HEAD_DIM (FP8)
-    META_REGION_OFFSET: tl.constexpr,  # bytes from block start to SoA region
-    NUM_SOA_FIELDS: tl.constexpr,  # 3 (MSE) or 2 (FP8)
-    SOA_K_NORM: tl.constexpr,  # 0 (MSE); unused for FP8
-    SOA_V_SCALE: tl.constexpr,  # 1 (MSE) / 0 (FP8)
-    SOA_V_ZERO: tl.constexpr,  # 2 (MSE) / 1 (FP8)
     # Score constants
     ATTN_SCALE: tl.constexpr,  # 1/sqrt(D)
     # Block tile sizes
     BLOCK_D: tl.constexpr,  # next_power_of_2(HEAD_DIM)
-    BLOCK_KV: tl.constexpr,  # tokens per tile (16)
+    BLOCK_KV: tl.constexpr,  # tokens per tile
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
@@ -170,27 +166,19 @@ def _tq_decode_stage1(
             other=0,
         ).to(tl.int64)
 
-        # Opt#3 SoA addressing: data region then metadata region per block.
+        # AoS per-slot addressing: matches triton_turboquant_store layout.
+        # slot layout: [MSE_BYTES key | 2B norm | 2B gamma | VAL_DATA_BYTES val | 2B scale | 2B zero]
         slot_within_block = page_off.to(tl.int64)
         block_base = block_nums * stride_cache_block
-        DATA_BYTES_PER_SLOT: tl.constexpr = KEY_DATA_BYTES + VAL_DATA_BYTES
         data_bases = (
             block_base
-            + slot_within_block * (NUM_KV_HEADS * DATA_BYTES_PER_SLOT)
-            + tl.cast(kv_head, tl.int64) * DATA_BYTES_PER_SLOT
+            + slot_within_block * stride_cache_pos
+            + tl.cast(kv_head, tl.int64) * stride_cache_head
         )
-        head_meta_u16_base = (block_base + META_REGION_OFFSET) // 2 + tl.cast(
-            kv_head, tl.int64
-        ) * (NUM_SOA_FIELDS * BLOCK_SIZE)
-        knorm_u16_addrs = (
-            head_meta_u16_base + SOA_K_NORM * BLOCK_SIZE + slot_within_block
-        )
-        vscale_u16_addrs = (
-            head_meta_u16_base + SOA_V_SCALE * BLOCK_SIZE + slot_within_block
-        )
-        vzero_u16_addrs = (
-            head_meta_u16_base + SOA_V_ZERO * BLOCK_SIZE + slot_within_block
-        )
+        knorm_u16_addrs = (data_bases + MSE_BYTES) // 2
+        val_bases = data_bases + KPS
+        vscale_u16_addrs = (val_bases + VAL_DATA_BYTES) // 2
+        vzero_u16_addrs = (val_bases + VAL_DATA_BYTES + 2) // 2
 
         # ============================================================
         # COMPUTE ATTENTION SCORES: [BLOCK_KV]
@@ -267,11 +255,9 @@ def _tq_decode_stage1(
 
         # ============================================================
         # VALUE LOAD + DEQUANTIZE: [BLOCK_KV, BLOCK_D]
-        # Opt#3: V data immediately follows K data in the slot (no
-        # interleaved metadata). Scale/zero come from the SoA metadata
-        # region as single u16 loads per field per token.
+        # V data starts at slot_base + KPS (after K quant + norm + gamma).
+        # Scale/zero follow V quant data inline in the AoS slot.
         # ============================================================
-        val_bases = data_bases + KEY_DATA_BYTES
 
         if VQB == 3:
             val_addrs0 = val_bases[:, None] + val_byte_idx[None, :]
@@ -529,14 +515,6 @@ def triton_turboquant_decode_attention(
 
     cfg = _get_layout(D, mse_bits, value_quant_bits, key_packed_size)
 
-    # Opt#3 SoA layout constants (derived locally; match store-side values).
-    key_data_bytes = D if key_fp8 else cfg["mse_bytes"]
-    data_bytes_per_slot = key_data_bytes + cfg["val_data_bytes"]
-    meta_region_offset = block_size * Hk * data_bytes_per_slot
-    num_soa_fields = 2 if key_fp8 else 3
-    soa_k_norm = 0
-    soa_v_scale = 0 if key_fp8 else 1
-    soa_v_zero = 1 if key_fp8 else 2
     kv_cache_u16 = kv_cache.view(torch.uint16)
 
     # Compute q_rot = q @ Pi.T (rotated query for MSE key scoring)
@@ -590,6 +568,8 @@ def triton_turboquant_decode_attention(
         q_rot.stride(0),
         q_rot.stride(1),
         kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
         block_table.stride(0),
         mid_o.stride(0),
         mid_o.stride(1),
@@ -601,14 +581,9 @@ def triton_turboquant_decode_attention(
         KV_GROUP_SIZE=kv_group_size,
         MSE_BITS=mse_bits,
         MSE_BYTES=cfg["mse_bytes"],
+        KPS=key_packed_size,
         VQB=value_quant_bits,
         VAL_DATA_BYTES=cfg["val_data_bytes"],
-        KEY_DATA_BYTES=key_data_bytes,
-        META_REGION_OFFSET=meta_region_offset,
-        NUM_SOA_FIELDS=num_soa_fields,
-        SOA_K_NORM=soa_k_norm,
-        SOA_V_SCALE=soa_v_scale,
-        SOA_V_ZERO=soa_v_zero,
         ATTN_SCALE=scale,
         BLOCK_D=cfg["BLOCK_D"],
         BLOCK_KV=BLOCK_KV,

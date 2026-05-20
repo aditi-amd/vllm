@@ -75,6 +75,53 @@ HSA_NO_SCRATCH_RECLAIM=1
 VLLM_ROCM_USE_AITER=1
 ```
 
+#### FlyDSL v4 — butterfly optimizations (opt-in)
+
+Two in-kernel Walsh-Hadamard butterfly opts can be enabled independently on top
+of the base v4 config above.  Both default OFF for backward compatibility.
+
+**Decode Q-rotation butterfly** (`+6.6% TPS, −10.8 ms ITL` on MiniMax-M2.5 32K/1K C=64):
+
+```bash
+VLLM_TQ_DECODE_V4_WHT_BUTTERFLY=1
+```
+
+Replaces the launcher-side rocBLAS GEMM (`q_rot = q @ PiT`) with a 7-stage
+in-register Fast Walsh-Hadamard Transform (FWHT) computed inside the FlyDSL
+kernel (STEP B').  The raw `query` tensor is passed instead of the pre-rotated
+`q_rot`, eliminating the external GEMM and the `q_rot` HBM round-trip entirely.
+Constraints: D=128, `bf16` query.
+
+**Store K-rotation butterfly** (negligible E2E gain at C=64; eliminates HBM load of PiT matrix at store time):
+
+```bash
+VLLM_TQ_STORE_WHT_BUTTERFLY=1
+```
+
+Replaces the O(D²) PiT GEMV inside `_tq_fully_fused_store_mse` with a 7-stage
+in-register WHT butterfly (O(D log₂D) = 896 additions for D=128).  No PiT
+matrix is loaded from HBM at store time.  Constraints: D must be a power of 2,
+non-FP8 keys only.
+
+**Recommended production config (both opts on):**
+
+```bash
+VLLM_TQ_DECODE_V4=1 VLLM_TQ_DECODE_V3=0 VLLM_TQ_DECODE_V2=0 \
+VLLM_TQ_SOA_FUSION_STORE=1 VLLM_TQ_SOA_FUSION=0 \
+VLLM_TQ_DECODE_V4_WHT_BUTTERFLY=1 \
+VLLM_TQ_STORE_WHT_BUTTERFLY=1 \
+HSA_NO_SCRATCH_RECLAIM=1 VLLM_ROCM_USE_AITER=1
+```
+
+Benchmark results (MiniMax-M2.5, 32K/1K, C=64, N=80, TP=2, MI355X):
+
+| Config                         |  TPS  | vs baseline | TPOT (ms) | ITL (ms) |
+|--------------------------------|------:|------------:|----------:|---------:|
+| baseline  (dec=0, store=0)     | 343.1 |      —      |   117.98  |   66.25  |
+| dec-bf    (dec=1, store=0)     | 365.6 |    +6.56%   |   109.58  |   55.41  |
+| store-bf  (dec=0, store=1)     | 345.2 |    +0.62%   |   117.21  |   65.42  |
+| both-bf   (dec=1, store=1)     | 366.0 |    +6.68%   |   109.51  |   55.39  |
+
 ---
 
 ### HIP v3
@@ -127,7 +174,7 @@ VLLM_ROCM_USE_AITER=1
 
 ---
 
-## Part 3 — Full launch example (MiniMax-M2.5, FlyDSL v4, TP=2)
+## Part 3 — Full launch example (MiniMax-M2.5, FlyDSL v4 + butterfly, TP=2)
 
 ```bash
 HIP_VISIBLE_DEVICES=4,5 \
@@ -136,6 +183,8 @@ VLLM_FLYDSL_PKGS=/opt/FlyDSL/build-fly/python_packages \
 PYTHONPATH="${VLLM_FLYDSL_ROOT}:${VLLM_FLYDSL_PKGS}" \
 VLLM_TQ_DECODE_V4=1 VLLM_TQ_DECODE_V3=0 VLLM_TQ_DECODE_V2=0 \
 VLLM_TQ_SOA_FUSION_STORE=1 VLLM_TQ_SOA_FUSION=0 \
+VLLM_TQ_DECODE_V4_WHT_BUTTERFLY=1 \
+VLLM_TQ_STORE_WHT_BUTTERFLY=1 \
 HSA_NO_SCRATCH_RECLAIM=1 VLLM_ROCM_USE_AITER=1 \
 vllm serve /shareddata/larryli2/MiniMax-M2.5 \
     --tensor-parallel-size 2 \

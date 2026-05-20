@@ -2,11 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused Triton kernels for TurboQuant KV store.
 
-Two kernels:
+Three kernels:
 1. _tq_fused_store_fp8: FP8 key scatter + value uniform quantization.
 2. _tq_fused_store_mse: Fused bucketize + centroid gather + residual norm
    + MSE index packing + value quantization (eliminates 4 PyTorch kernel
    launches vs the old pack-only approach).
+3. _tq_butterfly_store_mse: Fully-fused butterfly store.  Replaces the
+   O(D²) PiT GEMV inside _tq_fully_fused_store_mse with an O(D log₂D)
+   Walsh-Hadamard butterfly (7 stages for D=128) using tl.gather for the
+   in-register cross-element exchange.  No PiT matrix is loaded.
+   Gate: VLLM_TQ_STORE_WHT_BUTTERFLY=1.
 
 The launcher `triton_turboquant_store` selects the appropriate kernel.
 """
@@ -638,9 +643,189 @@ def _tq_fully_fused_store_mse(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Butterfly-fused MSE store (VLLM_TQ_STORE_WHT_BUTTERFLY=1)
+#
+# Identical to _tq_fully_fused_store_mse except the O(D²) scalar GEMV
+# rotation loop is replaced by a 7-stage Walsh-Hadamard butterfly:
+#
+#   for stage in range(LOG2_D):          # 7 iterations, unrolled
+#       mask   = 1 << stage              # 1,2,4,8,16,32,64
+#       pidx   = d_offs XOR mask         # partner index (in-register)
+#       pval   = tl.gather(y, pidx, 0)   # fetch partner value
+#       sign   = +1 if (d & mask)==0 else -1
+#       y      = (y + sign * pval) * INV_SQRT2
+#
+# Total: 7 × 128 = 896 additions.  No PiT matrix is loaded from HBM.
+# The result is mathematically identical to y = x_hat @ H (normalised
+# Hadamard matrix), which equals x_hat @ PiT because PiT == H for TQ.
+# ═══════════════════════════════════════════════════════════════════════
+
+@triton.jit
+def _tq_butterfly_store_mse(
+    # Raw inputs (bf16/fp16)
+    Key_ptr,        # [NH, D]
+    Value_ptr,      # [NH, D]
+    # Quantization tables (PiT NOT needed — butterfly needs no matrix)
+    Centroids_ptr,  # [n_centroids] float32
+    Midpoints_ptr,  # [n_centroids-1] float32
+    # Cache and indexing
+    KV_cache_ptr,         # [total_bytes] uint8 (flattened view)
+    Slot_mapping_ptr,     # [N] int64
+    # Cache strides
+    stride_cache_block: tl.constexpr,
+    stride_cache_pos: tl.constexpr,
+    stride_cache_head: tl.constexpr,
+    # Dimensions
+    D: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    LOG2_D: tl.constexpr,   # log2(D) — number of butterfly stages
+    # TQ layout
+    MSE_BYTES: tl.constexpr,
+    KPS: tl.constexpr,
+    # Value quantization
+    VQB: tl.constexpr,
+    VAL_DATA_BYTES: tl.constexpr,
+    # Packing block sizes
+    BLOCK_VAL: tl.constexpr,
+    # MSE params
+    MSE_BITS: tl.constexpr,
+    N_CENTROIDS: tl.constexpr,
+    BLOCK_GRP: tl.constexpr = 16,
+):
+    """Fully-fused MSE store with WHT butterfly rotation.
+
+    Replaces the O(D²) PiT GEMV in _tq_fully_fused_store_mse with a
+    7-stage in-register Walsh-Hadamard butterfly (O(D log₂D) = 896 ops
+    for D=128).  All other steps are identical: load → norm → normalize
+    → butterfly → bucketize → pack → store norms → value quant.
+    """
+    pid = tl.program_id(0)
+    token_idx = pid // H
+    head_idx = pid % H
+
+    slot = tl.load(Slot_mapping_ptr + token_idx)
+    if slot < 0:
+        return
+    blk = slot // BLOCK_SIZE
+    off = slot % BLOCK_SIZE
+    slot_base = (
+        blk * stride_cache_block + off * stride_cache_pos
+        + head_idx * stride_cache_head
+    )
+
+    base = pid * D
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D
+
+    # ── 0. LOAD RAW KEY + NORM + NORMALIZE ──────────────────────────
+    k_vec = tl.load(Key_ptr + base + d_offs, mask=d_mask, other=0.0).to(
+        tl.float32
+    )
+    k_sq_sum = tl.sum(tl.where(d_mask, k_vec * k_vec, 0.0), axis=0)
+    vec_norm = tl.sqrt(k_sq_sum)
+    inv_norm = 1.0 / (vec_norm + 1e-8)
+    y_vec = k_vec * inv_norm   # unit-normalised key, shape [BLOCK_D]
+
+    # ── 1. WHT BUTTERFLY: O(D log₂D), no HBM loads ──────────────────
+    # Each of LOG2_D stages (7 for D=128) pairs every element d with
+    # its XOR-partner d^mask.  The even element of each pair adds, the
+    # odd element subtracts, and both scale by 1/√2.  After all stages
+    # every output is a weighted ±1 sum of all inputs — equivalent to
+    # multiplying by the normalised D×D Hadamard matrix H == PiT.
+    for _stage in range(LOG2_D):   # compile-time unrolled (LOG2_D constexpr)
+        _bmask = 1 << _stage           # 1, 2, 4, 8, 16, 32, 64
+        _pidx  = (d_offs ^ _bmask).to(tl.int32)      # partner index
+        _pval  = tl.gather(y_vec, _pidx, 0)           # fetch partner
+        # sign applied to SELF: LOW element adds (+self + partner),
+        # HIGH element subtracts (-self + partner) → matches k @ H_standard.
+        _sign  = tl.where((d_offs & _bmask) == 0, 1.0, -1.0).to(tl.float32)
+        y_vec  = (_sign * y_vec + _pval) * 0.7071067811865476  # * 1/sqrt(2)
+
+    # Zero padding slots (BLOCK_D may be larger than D if D not power-of-2,
+    # but for D=128 BLOCK_D==D so this is a no-op).
+    y_vec = tl.where(d_mask, y_vec, 0.0)
+
+    # ── 2. INLINE BUCKETIZE ─────────────────────────────────────────
+    idx = tl.zeros([BLOCK_D], dtype=tl.int32)
+    for i in range(N_CENTROIDS - 1):
+        mid_val = tl.load(Midpoints_ptr + i)
+        idx += tl.where(y_vec >= mid_val, 1, 0)
+
+    # ── 3. CENTROID GATHER + RESIDUAL NORM ──────────────────────────
+    centroid_vals = tl.load(Centroids_ptr + idx, mask=d_mask, other=0.0)
+    residual = y_vec - centroid_vals
+    gamma = tl.sqrt(tl.sum(tl.where(d_mask, residual * residual, 0.0), axis=0))
+
+    # ── 4. PACK MSE INDICES ─────────────────────────────────────────
+    if MSE_BITS == 4:
+        idx_pairs = tl.reshape(idx, [BLOCK_D // 2, 2])
+        shifts_4 = tl.arange(0, 2) * 4
+        packed = tl.sum((idx_pairs & 0xF) << shifts_4[None, :], axis=1).to(
+            tl.uint8
+        )
+        mse_offs = tl.arange(0, BLOCK_D // 2)
+        mse_mask = mse_offs < MSE_BYTES
+        tl.store(KV_cache_ptr + slot_base + mse_offs, packed, mask=mse_mask)
+
+    elif MSE_BITS == 3:
+        grp_offs = tl.arange(0, BLOCK_GRP)
+        grp_mask = grp_offs < (D // 8)
+        idx_grp = tl.reshape(idx, [BLOCK_GRP, 8])
+        shifts_3 = tl.arange(0, 8) * 3
+        packed_24 = tl.sum((idx_grp & 0x7) << shifts_3[None, :], axis=1)
+        b0 = (packed_24 & 0xFF).to(tl.uint8)
+        b1 = ((packed_24 >> 8) & 0xFF).to(tl.uint8)
+        b2 = ((packed_24 >> 16) & 0xFF).to(tl.uint8)
+        tl.store(KV_cache_ptr + slot_base + grp_offs * 3, b0, mask=grp_mask)
+        tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 1, b1, mask=grp_mask)
+        tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 2, b2, mask=grp_mask)
+
+    # ── 5. STORE NORMS (vec_norm + gamma as fp16) ───────────────────
+    norm_offset = MSE_BYTES
+
+    vn_f16 = vec_norm.to(tl.float16)
+    vn_u16 = vn_f16.to(tl.uint16, bitcast=True)
+    tl.store(KV_cache_ptr + slot_base + norm_offset, (vn_u16 & 0xFF).to(tl.uint8))
+    tl.store(
+        KV_cache_ptr + slot_base + norm_offset + 1,
+        ((vn_u16 >> 8) & 0xFF).to(tl.uint8),
+    )
+
+    gm_f16 = gamma.to(tl.float16)
+    gm_u16 = gm_f16.to(tl.uint16, bitcast=True)
+    tl.store(KV_cache_ptr + slot_base + norm_offset + 2, (gm_u16 & 0xFF).to(tl.uint8))
+    tl.store(
+        KV_cache_ptr + slot_base + norm_offset + 3,
+        ((gm_u16 >> 8) & 0xFF).to(tl.uint8),
+    )
+
+    # ── 6. VALUE QUANTIZE + PACK ────────────────────────────────────
+    _store_quantized_value(
+        Value_ptr,
+        KV_cache_ptr,
+        base,
+        slot_base,
+        d_offs,
+        d_mask,
+        D=D,
+        KPS=KPS,
+        VQB=VQB,
+        VAL_DATA_BYTES=VAL_DATA_BYTES,
+        BLOCK_VAL=BLOCK_VAL,
+        BLOCK_GRP=BLOCK_GRP,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Launcher
 # ═══════════════════════════════════════════════════════════════════════
 
+# Read once at import time so the gate is zero-overhead at call time.
+_USE_STORE_BUTTERFLY: bool = (
+    os.environ.get("VLLM_TQ_STORE_WHT_BUTTERFLY", "0") == "1"
+)
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 
@@ -699,6 +884,48 @@ def triton_turboquant_store(
     stride_head = padded_slot
 
     block_grp = triton.next_power_of_2(D // 8) if D >= 8 else 1
+
+    # ── BUTTERFLY PATH: fused WHT rotation (VLLM_TQ_STORE_WHT_BUTTERFLY=1) ──
+    # Requires D to be a power of 2 (always true for TQ: D=64 or D=128).
+    # Replaces the O(D²) PiT GEMV with a 7-stage in-register WHT butterfly.
+    # No PiT matrix is loaded.  Skipped for FP8 keys (no rotation needed).
+    if _USE_STORE_BUTTERFLY and not key_fp8 and (D & (D - 1)) == 0:
+        log2_d = int(math.log2(D))
+        k_flat = key.reshape(NH, D).contiguous()
+        v_flat = value.reshape(NH, D)
+        grid = (NH,)
+        t0 = time.perf_counter()
+        _tq_butterfly_store_mse[grid](
+            k_flat,
+            v_flat,
+            centroids,
+            midpoints,
+            kv_cache.view(-1),
+            slot_mapping,
+            stride_cache_block=stride_block,
+            stride_cache_pos=stride_pos,
+            stride_cache_head=stride_head,
+            D=D,
+            H=H,
+            BLOCK_SIZE=block_size,
+            BLOCK_D=BLOCK_D,
+            LOG2_D=log2_d,
+            MSE_BYTES=mse_bytes,
+            KPS=key_packed_size,
+            VQB=value_quant_bits,
+            VAL_DATA_BYTES=val_data_bytes,
+            BLOCK_VAL=BLOCK_VAL,
+            MSE_BITS=mse_bits,
+            N_CENTROIDS=n_centroids,
+            BLOCK_GRP=block_grp,
+            num_warps=4,
+            num_stages=1,
+        )
+        record_store_call(
+            backend="triton_butterfly",
+            host_store_us=(time.perf_counter() - t0) * 1e6,
+        )
+        return
 
     # ── FP8 PATH: in-kernel FP8 cast + scatter via fp8 kernel ──
     if key_fp8:

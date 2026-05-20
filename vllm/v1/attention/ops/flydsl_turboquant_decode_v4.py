@@ -321,6 +321,29 @@ _SEGM_POOL = _SegmBufPool()
 
 
 _HW_TR_CACHED: bool | None = None
+_WHT_BF_CACHED: bool | None = None
+
+
+def _wht_butterfly_enabled() -> bool:
+    """Return True iff the in-kernel WHT butterfly path is requested.
+
+    Set ``VLLM_TQ_DECODE_V4_WHT_BUTTERFLY=1`` to enable.  When enabled
+    the launcher skips the external T1.0 GEMM (``q @ PiT``) and passes
+    the raw ``query`` tensor to a butterfly-capable kernel that computes
+    ``H @ q`` in-register, eliminating the HBM round-trip for q_rot.
+    """
+    global _WHT_BF_CACHED
+    if _WHT_BF_CACHED is not None:
+        return _WHT_BF_CACHED
+    _WHT_BF_CACHED = (
+        os.environ.get("VLLM_TQ_DECODE_V4_WHT_BUTTERFLY", "0") == "1"
+    )
+    if _WHT_BF_CACHED:
+        logger.info_once(
+            "FlyDSL TQ v4: WHT butterfly ON "
+            "(VLLM_TQ_DECODE_V4_WHT_BUTTERFLY=1)"
+        )
+    return _WHT_BF_CACHED
 
 
 def _hw_tr_enabled() -> bool:
@@ -359,7 +382,8 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
                 query_group_size: int, kv_block_size: int,
                 use_hw_v_transpose: bool = False,
                 num_seqs_hint: int = 1,
-                tile_groups_per_partition: int = 1):
+                tile_groups_per_partition: int = 1,
+                use_wht_butterfly: bool = False):
     # ``num_seqs_hint`` (= runtime B) is forwarded to the build for shape
     # awareness; it does NOT participate in the cache key because the
     # kernel body uses gpu.block_idx.x (= seq index at runtime) and is
@@ -369,7 +393,8 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
     # value compiles a different unrolled K-tile loop body.
     key = (num_kv_heads, int(num_partitions), int(max_blocks_per_seq),
            round(float(scale), 8), int(query_group_size), int(kv_block_size),
-           bool(use_hw_v_transpose), int(tile_groups_per_partition))
+           bool(use_hw_v_transpose), int(tile_groups_per_partition),
+           bool(use_wht_butterfly))
     cached = _KERN_CACHE.get(key)
     if cached is not None:
         _GET_KERNEL_STATS["hits"] += 1
@@ -414,6 +439,7 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
             kv_block_size=int(kv_block_size),
             use_hw_v_transpose=bool(use_hw_v_transpose),
             tile_groups_per_partition=int(tile_groups_per_partition),
+            use_wht_butterfly=bool(use_wht_butterfly),
         )
     al = kmod.allocator
     block_threads = kmod.BLOCK_THREADS
@@ -741,21 +767,30 @@ def flydsl_turboquant_decode_attention_v4(
     else:
         output = output_buf[:B] if output_buf.shape[0] != B else output_buf
 
-    # ---- T1.0 (continued): stable q_rot via pooled buffers ---------------
-    # Use pre-allocated pool buffers so q_rot has a stable data_ptr that never
-    # changes after warmup — fixes ROCm HIP graph pool / eager path conflict.
-    _q_float = pool_bufs["q_float"]          # [B, Hq, D] fp32, stable
-    _q_rot_f32 = pool_bufs["q_rot_fp32"]     # [B, Hq, D] fp32, stable mm output
-    _q_rot_out = pool_bufs["q_rot"]          # [B, Hq, D] query.dtype, stable
-    _q_float.copy_(query)                    # bf16 → fp32 in-place, no alloc
-    # mm into stable fp32 buffer via out= to avoid any fresh allocation.
-    # PiT_f32 is cached on buf_holder (stable ptr since first layer warmup).
-    torch.mm(
-        _q_float.view(B * Hq, D), PiT_f32,
-        out=_q_rot_f32.view(B * Hq, D),     # in-place into pool buffer, no alloc
-    )
-    _q_rot_out.copy_(_q_rot_f32)             # fp32 → bf16, into stable buf [B,Hq,D]
-    q_rot = _q_rot_out                       # stable pointer for kernel launch
+    # ---- T1.0 (continued): q rotation -----------------------------------
+    # Normal path: GEMM q @ PiT via stable pooled buffers.
+    # Butterfly path (VLLM_TQ_DECODE_V4_WHT_BUTTERFLY=1): skip the GEMM
+    # entirely; the kernel computes H @ q in-register (STEP B').  We still
+    # allocate/preserve the pool slots so the pool state is consistent, but
+    # no computation is performed on them.
+    use_wht_bf = _wht_butterfly_enabled()
+    if not use_wht_bf:
+        _q_float = pool_bufs["q_float"]          # [B, Hq, D] fp32, stable
+        _q_rot_f32 = pool_bufs["q_rot_fp32"]     # [B, Hq, D] fp32, stable mm output
+        _q_rot_out = pool_bufs["q_rot"]          # [B, Hq, D] query.dtype, stable
+        _q_float.copy_(query)                    # bf16 → fp32 in-place, no alloc
+        # mm into stable fp32 buffer via out= to avoid fresh allocations.
+        # PiT_f32 is cached on buf_holder (stable ptr since first layer warmup).
+        torch.mm(
+            _q_float.view(B * Hq, D), PiT_f32,
+            out=_q_rot_f32.view(B * Hq, D),     # in-place into pool buffer
+        )
+        _q_rot_out.copy_(_q_rot_f32)             # fp32 → bf16, into stable buf
+        q_for_kernel = _q_rot_out                # stable ptr for kernel launch
+    else:
+        # Butterfly: pass raw query directly.  query is [B, Hq, D] bf16,
+        # contiguous (guaranteed by the attention backend).
+        q_for_kernel = query
 
     # ---- FlyDSL kernel launch -------------------------------------------
     max_bps = int(block_table.shape[1])
@@ -765,6 +800,7 @@ def flydsl_turboquant_decode_attention_v4(
         use_hw_v_transpose=use_hw_tr,
         num_seqs_hint=int(B),
         tile_groups_per_partition=int(tile_groups_per_partition),
+        use_wht_butterfly=use_wht_bf,
     )
     # T1.3: zero-overhead one-shot info log (replaces logger.info_once which
     # hashes its format string on every call to dedup).
@@ -775,11 +811,12 @@ def flydsl_turboquant_decode_attention_v4(
             "FlyDSL v4 launcher invoked (UNIFORM_BATCH cudagraph): "
             "B=%d Hk=%d Hq=%d D=%d QG=%d num_partitions=%d (actual=%d, "
             "cap=%d) TGPP=%d max_bps=%d block_size=%d max_seq_len=%d "
-            "hw_v_transpose=%s (coverage=%d tokens, worst_case=%d tokens, "
-            "sizing=%s)",
+            "hw_v_transpose=%s wht_butterfly=%s "
+            "(coverage=%d tokens, worst_case=%d tokens, sizing=%s)",
             B, Hk, Hq, D, QG, num_partitions, num_partitions_actual,
             MAX_PARTITIONS, tile_groups_per_partition,
             max_bps, int(block_size), int(max_seq_len), use_hw_tr,
+            use_wht_bf,
             num_partitions * tile_groups_per_partition * kv_compute_block,
             worst_case_max_seq_len,
             "per-step actual" if (
@@ -788,7 +825,7 @@ def flydsl_turboquant_decode_attention_v4(
         )
     launch(
         segm_out, segm_sum, segm_max,
-        q_rot, kv_cache, centroids_c,
+        q_for_kernel, kv_cache, centroids_c,
         block_table, seq_lens,
         B, Hk, num_partitions,
         torch.cuda.current_stream(),
