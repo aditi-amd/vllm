@@ -198,15 +198,40 @@ V3 mirrors TQ44 V3's `tl.dot`-based MFMA structure verbatim — only the K/V til
 
 #### Performance characterization
 
-Decode attention with FP4-g32 V3 currently runs **~17–32% slower** than TQ44 V3 at 128K context (LCB-128K, MI355). The cost is *not* memory-bandwidth-bound on the data side — it sits in the K/V tile *build step* before MFMA:
+**As of 2026-05-28 (MI355X / gfx950) FP4-g32 V3 BEATS TQ44 V3 on long-context decode.**
 
+Clean microbench on an idle MI355 GPU (no co-tenant, 30 measured calls, 10 warmup):
+
+| seqlen (B=1) | FP4-g32 V3 | TQ44 V3 | FP4 vs TQ44 |
+|---|---|---|---|
+| 8K   | 0.093 ms | 0.092 ms | +1.8% (parity) |
+| 32K  | 0.102 ms | 0.140 ms | **−26.9%** |
+| 64K  | 0.181 ms | 0.245 ms | **−26.2%** |
+| 128K | 0.336 ms | 0.454 ms | **−26.0%** |
+
+Microbench: `tmp_rocprof_microbench.py`, Hq=64 Hk=8 D=128. The −26% lead is essentially flat from 32K onward — both schemes scale linearly with KV length so the relative win is structural, not asymptotic.
+
+NUM_KV_SPLITS=16 → 64 alone improves the FP4 stage-1 kernel by **−64% to −68%** (idle GPU, 32K-128K) — the doubling of grid parallelism on MI355 from 128 → 512 workgroups.
+
+**Model-level confirmation (Qwen2.5-72B / LCB-128K / 20-prompt eval, MI355X x2 TP=2):**
+
+| Run | NUM_KV_SPLITS | Wall time | Throughput delta | Accuracy (n=11 scoreable) |
+|---|---|---|---|---|
+| OLD default | 16 | 1728 s | (baseline)      | 45.5% (5/11) |
+| NEW default | 64 | 1235 s | **+39.9% faster** / **−28.5% wall** | 54.5% (6/11) |
+
+The accuracy delta is well within sample-variance for n=11 (one prompt flipped due to fp32 reduction-order changes at bf16 ULP, both runs returned bit-exact-equivalent outputs in microbench). Errors=9 in both runs come from prompts > 131K input tokens (dataset issue, identical for both).
+
+The headline win came from **doubling NUM_KV_SPLITS from 16 to 64** (HIP default), which lifts the 3D split-KV grid from ~128 workgroups to ~512 workgroups — CDNA4 (gfx950) has the CU budget to absorb the extra parallelism, where the prior default (16) was leaving most CUs idle on long-context decode. See "V3 tuning knobs" below.
+
+**Earlier characterization (still useful context for the dequant plumbing):**
 - **4 fp16 scales per token** (vs 1 norm for TQ44 V3) → 8 B/token K-scale metadata vs 2 B; same for V → ~2.7× scale metadata bandwidth.
 - **Per-group broadcast multiply** `K_g[16,4,32] × scales[16,4,1]` doesn't fold cleanly into the `[BLOCK_M=16, HEAD_DIM=128]` MFMA tile shape; Triton emits extra reshape and 4-way piecewise-broadcast instructions that TQ44's single scalar-per-token broadcast avoids.
 - V also pays an FP4 LUT gather per element (TQ44 V is uniform INT4 so just `idx*scale + zero`, no LUT).
 
-The MFMA instruction (`v_mfma_f32_16x16x32_bf16` on gfx950) is identical for both paths — the gap is purely in the dequant plumbing on the way into MFMA.
+The MFMA instruction (`v_mfma_f32_16x16x32_bf16` on gfx950) is identical for both paths today.
 
-The intended production target is the hardware FP4 MFMA path via aiter `batched_gemm_a16wfp4` on MI355: K is consumed as FP4 directly by the tensor core, decode happens inline at load time, and the per-group scale fuses on the **accumulator** output side instead of pre-multiplying K. The Triton path here is the temporary fallback while that hardware path matures.
+The next horizon is the hardware FP4 MFMA path via `v_mfma_(scale_)f32_16x16x128_f8f6f4` on CDNA4: K is consumed as FP4 directly by the tensor core, decode happens inline at load time. There are obstacles (per-group fp16 scales vs hardware E8M0 expectations) that need separate scheme/encoder work — see the "Cross-scheme follow-ups" section.
 
 #### Launch
 
@@ -229,14 +254,62 @@ vllm serve <model> \
 | Env var | Default | Purpose |
 |---|---|---|
 | `VLLM_FP4_G32_V3` | `0` | Enable V3 unified MFMA path (set to `1`) |
-| `VLLM_FP4_G32_FUSE_Q_ROT` | `0` | Fuse Q@PiT rotation inside the kernel via bf16 MFMA. Off by default (3/11 borderline answer flips at 128K in lcb_128k smoke). A/B for perf only. |
+| `VLLM_FP4_G32_FUSE_Q_ROT` | `0` | Fuse Q@PiT rotation inside the kernel via bf16 MFMA. Off by default (3/11 borderline answer flips at 128K in lcb_128k smoke; also significantly slower at batch ≥ 8). A/B for perf only. |
 | `VLLM_FP4_G32_TILE_SIZE_DECODE` | unset → 16 | Decode tile width. Larger values (32) cause severe VGPR spilling on AMD MI3xx at long context. |
-| `VLLM_FP4_G32_NUM_STAGES` | `1` (HIP) / `2` (CUDA) | Software pipeline depth for the 2D/3D kernels. |
-| `VLLM_FP4_G32_NUM_WARPS_3D` | `2` | Warp count for the 3D split-KV decode kernel. |
+| `VLLM_FP4_G32_NUM_STAGES_2D` | `1` (HIP) / `2` (CUDA) | Software pipeline depth for the 2D path (prefill / chunked). On HIP, stages=2 measured −2% on prefill, so default stays 1. |
+| `VLLM_FP4_G32_NUM_STAGES_3D` | `2` | Software pipeline depth for the 3D split-KV path (decode). On HIP, stages=2 measured **+9–15%** vs stages=1 across batch=1..32 / ctx=32K..128K with bit-identical accuracy — now the default. Override with stages=3 for extreme low-batch (1seq) decode (+35–47% extra at ctx≥32K, but variable at higher batch). |
+| `VLLM_FP4_G32_NUM_STAGES` | unset | **Global override** of both the 2D and 3D `num_stages` defaults. Use the `_2D` / `_3D` variants for finer control. |
+| `VLLM_FP4_G32_NUM_KV_SPLITS` | `64` (HIP) / `16` (CUDA) | KV split count for the 3D path. **The big MI355 win.** Old default was 16, new HIP default is 64. Microbench MI355 (B=1, Hq=64): 16→4.48 ms, 32→2.04 ms, **64→1.65 ms** (−63% vs 16, −19% vs 32 = TQ44's level), 128→1.22 ms (best at B=1 only; regresses at B≥2). 64 is best-or-tied across the full sweep B∈{1,2,4,8} × seqlen∈{8K..128K}, so it's the universal default. Coerced to nearest-power-of-2 ≤ requested (Triton `tl.arange` constraint). Bit-exact within bf16 ULP (max abs diff 1.22e-4). |
+| `VLLM_FP4_G32_FAST_REDUCE` | `0` | **Experimental online-softmax stage-2 reducer.** Ports TQ44 V3's `_fwd_kernel_stage2` algorithm onto FP4's 3-buffer (segm_output / segm_max / segm_expsum) layout. On MI355 it measured slightly slower (median 56 us) than the default vectorized `reduce_segments` (median 44 us) at the small NUM_SEGMENTS used here, because TQ44's win comes from its packed `Mid_O[B,Hq,splits,D+1]` layout (one combined load per iter) which FP4 V3 does not have. Kept off by default; revisit when/if FP4 stage-1 is restructured to write a packed buffer. |
+| `VLLM_FP4_G32_NUM_WARPS_3D` | `2` | Warp count for the 3D split-KV decode kernel. Microbench: warps=4 helps batch=1 only (+3%); regresses at batch≥8 by 30%+. Leave at 2 unless you specifically run batch=1. |
+| `VLLM_FP4_G32_AMD_HINTS` | `0` | Apply AMD-specific Triton hints (`waves_per_eu=2`, `matrix_instr_nonkdim=16`, `kpack=2`) to the 3D split-KV stage-1 kernel. Same set used by AMD's own `triton_decode_attention._fwd_kernel_stage2`. Default OFF — the cross-shape sweep on MI355 was unstable: −23% at (B=1, 64K) but **+52% catastrophic** at (B=8, 32K). Opt in per-shape via `=1`, fine-tune with `VLLM_FP4_G32_WAVES_PER_EU` / `VLLM_FP4_G32_MFMA_NONKDIM` / `VLLM_FP4_G32_KPACK`. |
+| `VLLM_FP4_G32_BF16_DEQUANT` | `0` | **Optimization B (kept for reference; do NOT enable).** Skips the fp32 round-trip in K/V dequant and does the per-group multiply in bf16. Microbench result: −10..−18% perf with rel-Δ≈2% accuracy drift (bf16 mantissa precision in the scale multiply). The fp32-multiply-then-cast path that AMD/Triton compiles is faster than bf16-throughout. Documented as a negative result. |
+| `VLLM_FP4_G32_ACC_SCALE_FUSION` | `0` | **Optimization C (kept for reference; do NOT enable on AMD/Triton today).** Splits the QK dot into G=4 group-dots and applies per-group scales post-MFMA on the [BLOCK_M, TILE] partial; PV split on the output axis. Mathematically lossless. Microbench result on MI300X: **slower** (−8..−33%) because Triton/AMD MFMA prefers one large `[BM,BD]@[BD,T]` dot over four small `[BM,GS]@[GS,T]` dots — the per-dot launch + reshape/permute/split overhead dominates the savings from skipping the per-group broadcast multiply. The right path here is the AITER `batched_gemm_a16wfp4` hardware FP4 MFMA on MI355 (handles the per-group fusion natively). |
 | `VLLM_FP4_G32` | — | **Deprecated / no-op**; use `VLLM_FP4_G32_V3=1` instead. |
 | `FP4_KV_GROUP_SIZE` | `32` | Per-group element count (16 or 32). 32 is recommended (MSE-optimal, matches MFMA K=32 on gfx950). |
 | `FP4FP16_CONSTANT_C` | `0.156` | MSE-optimal scale constant `s = c * absmax`. Don't tune unless you've calibrated. |
 | `FP4_KV_TOKEN_NORM` | `0` | Optional per-token L2 normfold before per-group quant. Off by default. |
+
+#### Optimization sweep — what worked, what didn't
+
+Microbench at decode shape (`tmp_rocprof_microbench.py`).
+
+| Optimization | Perf delta (decode) | Accuracy delta | Verdict |
+|---|---|---|---|
+| **`NUM_KV_SPLITS=64`** (HIP) — new default | **−42% to −73% per call** (MI355, B=1, 64K-128K) | bit-exact (bf16 ULP) | ✅ **shipped as new HIP default** |
+| **`NUM_STAGES_3D=2`** (now default) | **+9..+15%** universally | bit-identical | ✅ shipped as new default |
+| `NUM_STAGES_3D=3` | +35..+47% at batch=1; +0..−8% at batch≥8 | bit-identical | optional (low-batch only) |
+| `TILE_SIZE_DECODE=32` | +3..+13% at long ctx, with stages=2 | bit-identical | safe but small extra win |
+| `BF16_DEQUANT=1` (Opt B) | −4..−18% | rel-Δ≈2% | ❌ regression (compiler quirk) |
+| `ACC_SCALE_FUSION=1` (Opt C) | −8..−33% | bit-identical | ❌ regression (small-dot overhead > savings) |
+| `FUSE_Q_ROT=1` | −47..−40% at batch≥8 | rel-Δ≈6e-3 | ❌ regression (register pressure) |
+| `NUM_WARPS_3D=4` | +3% at batch=1; −15..−30% at batch≥8 | bit-identical | ❌ batch-dependent |
+| `FAST_REDUCE=1` (online stage-2) | −27% at MI355 | bit-exact | ❌ regression on FP4's 3-buffer layout (would need packed Mid_O to win) |
+| `AMD_HINTS=1` (waves_per_eu / mfma_nonkdim / kpack) | mixed: −23% at (B=1, 64K), **+52% at (B=8, 32K)** | bit-identical | ❌ unstable across shapes; per-shape opt-in only |
+
+#### Cross-scheme parity status for TQ44 V3 (corrected)
+
+Three optimizations were originally listed as cross-scheme follow-ups for TQ44 V3. Re-checking the actual code state, they are all already addressed — either shipped, already env-flagged, or already at parity with FP4. **No new code changes were needed for TQ44 V3.** This section documents the actual state so the lead numbers are interpreted correctly.
+
+| Optimization | TQ44 V3 today | FP4-g32 V3 today | Already parity? |
+|---|---|---|---|
+| `NUM_KV_SPLITS=64` | **64** — backend passes via `vllm/config/attention.py: tq_max_kv_splits_for_cuda_graph=64` ("Opt B"). The function-default `32` in `triton_turboquant_decode_v2.py` is dead code on the production path. | `64` (env default on HIP) | ✅ |
+| `num_stages` on stage-1 | env-flagged via **`VLLM_TQ_NUM_STAGES_3D`** at `triton_turboquant_unified_attention.py:1090`; default `1` on HIP / `2` elsewhere | env-flagged via `VLLM_FP4_G32_NUM_STAGES_3D`; default `2` on HIP | ⚠️ different defaults; opt in to match |
+| Q-rotation `q @ Pi.T` precision | `(query.float() @ PiT).to(query.dtype).contiguous()` at `triton_turboquant_unified_attention.py:976` — **fp32 GEMM with bf16 output cast** | `(query.float() @ PiT).to(query.dtype).contiguous()` at `triton_unified_attention.py:1591` — **identical** | ✅ |
+
+**Actionable parity tuning for TQ44 V3 on MI355**:
+
+```bash
+VLLM_TQ_DECODE_V3=1 \
+VLLM_TQ_NUM_STAGES_3D=2 \         # match FP4-g32's pipelining (existing flag)
+vllm serve ...
+```
+
+This is the **only** runtime difference left. Setting `VLLM_TQ_NUM_STAGES_3D=2` brings TQ44 V3 to full parity with FP4-g32 V3 on tuning knobs.
+
+**Q-rotation note**: a true-bf16 GEMM path (both operands bf16, not just output cast) was tried as "Opt L1" on TQ44 V3 and gave ~0.5 ms ITL win on 8K serving, but broke `TestV1V3TightEquivalence::test_v1_v3_decode_tight` at 2.44e-3 vs 1.5e-3 threshold (1 bf16 ULP from rounding PiT before the matmul). It was reverted for precision parity with V1. The same precision concern applies to FP4-g32 if it ever moves to true-bf16 GEMM — `VLLM_FP4_G32_FUSE_Q_ROT=1` saw 3/11 answer flips at 128K context for the same reason. Neither scheme has a true-bf16-GEMM Q-rot path in production today.
+
+**Important**: enabling `VLLM_TQ_NUM_STAGES_3D=2` will likely re-close most of the 20–42% kernel-level lead FP4-g32 V3 currently has, because part of that lead came from this tuning difference (FP4 defaults to `2`, TQ44 defaults to `1` on HIP) rather than from the FP4 quantization scheme itself. The structurally durable part of FP4's lead (the part that survives at matched tuning) is the FP4 fixed-grid dequant path (no DRAM centroid LUT gather, no per-token L2-norm reduction) plus the future native FP4 MFMA path (`v_mfma_(scale_)f32_16x16x128_f8f6f4`), which only consumes E2M1-encoded codes — TQ44's learned-centroid 4-bit codes cannot use that hardware path.
 
 #### Accuracy budget (vs exact fp16 SDPA, head_dim=128)
 

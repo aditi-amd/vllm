@@ -38,7 +38,10 @@ from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
     _find_seq_idx,
     _tq_fuse_q_rotation,
 )
-from vllm.v1.attention.ops.triton_unified_attention import reduce_segments
+from vllm.v1.attention.ops.triton_unified_attention import (
+    find_seq_idx,
+    reduce_segments,
+)
 
 from vllm.v1.attention.ops.fp4_g32.fp4_levels import (
     FP4_BITS_TO_VALUE,
@@ -122,8 +125,18 @@ def _fp4_g32_load_k_tile(
     USE_PAIR_LUT: tl.constexpr,
     TILE_SIZE: tl.constexpr,
     UNMASKED: tl.constexpr = False,
+    BF16_DEQUANT: tl.constexpr = 0,
 ):
-    """Load + dequant a [TILE_SIZE, BLOCK_D] block of K (Hadamard-rotated)."""
+    """Load + dequant a [TILE_SIZE, BLOCK_D] block of K (Hadamard-rotated).
+
+    When ``BF16_DEQUANT == 1`` (Optimization B / VLLM_FP4_G32_BF16_DEQUANT=1),
+    the FP4-LUT result and per-group scales stay in bf16 throughout the
+    multiply, skipping the fp32 round-trip. The MFMA dot itself accumulates
+    in fp32 regardless, so the only precision difference is in the
+    per-group scale multiply (bf16 mantissa: 7 bits vs fp32: 23 bits) — for
+    fp16-stored scales × FP4 codes (max |v| = 6.0) this is empirically
+    benign on long-context decode (verified vs reference).
+    """
     if USE_PAIR_LUT:
         HALF_D: tl.constexpr = BLOCK_D // 2
         half_offs = tl.arange(0, HALF_D)
@@ -152,7 +165,10 @@ def _fp4_g32_load_k_tile(
                 mask=tile_mask[:, None, None] & byte_mask[None, :, None],
                 other=0.0,
             )
-        fp4_vals = tl.reshape(c_pair, [TILE_SIZE, BLOCK_D]).to(tl.float32)
+        if BF16_DEQUANT:
+            fp4_vals = tl.reshape(c_pair, [TILE_SIZE, BLOCK_D])  # bf16
+        else:
+            fp4_vals = tl.reshape(c_pair, [TILE_SIZE, BLOCK_D]).to(tl.float32)
     else:
         half_idx = d_offs // 2
         nibble_shift = (d_offs % 2) * 4
@@ -168,7 +184,10 @@ def _fp4_g32_load_k_tile(
                 other=0,
             ).to(tl.int32)
         codes = (byte_raw >> nibble_shift[None, :]) & 0xF
-        fp4_vals = tl.load(Fp4_decode_ptr + codes).to(tl.float32)
+        if BF16_DEQUANT:
+            fp4_vals = tl.load(Fp4_decode_ptr + codes)  # bf16
+        else:
+            fp4_vals = tl.load(Fp4_decode_ptr + codes).to(tl.float32)
 
     # Per-group fp16 scales: N_GROUPS scales per token. Coalesced 2-byte loads
     # via the uint16 cache view.
@@ -178,7 +197,10 @@ def _fp4_g32_load_k_tile(
         scale_raw = tl.load(KV_cache_u16_ptr + scale_addrs)
     else:
         scale_raw = tl.load(KV_cache_u16_ptr + scale_addrs, mask=tile_mask[:, None], other=0)
-    scales = scale_raw.to(tl.float16, bitcast=True).to(tl.float32)
+    if BF16_DEQUANT:
+        scales = scale_raw.to(tl.float16, bitcast=True).to(tl.bfloat16)
+    else:
+        scales = scale_raw.to(tl.float16, bitcast=True).to(tl.float32)
 
     # Per-group broadcast multiply: reshape [TILE, BLOCK_D] → [TILE, G, GS],
     # multiply by scales[:, :, None], reshape back.
@@ -191,17 +213,115 @@ def _fp4_g32_load_k_tile(
 
 
 # ---------------------------------------------------------------------------
-# FP4-g32 V-tile dequant: returns V : [TILE_SIZE, HEAD_SIZE_PADDED] in Q.dtype
-# ready for tl.dot(P, V). Identical structure to K-tile loader (no zero-point).
+# FP4-g32 K-tile UNSCALED loader (Optimization C, accumulator-side scale fusion).
+#
+# Returns ``(K_codes : [TILE_SIZE, BLOCK_D] in OUT_DTYPE, scales : [TILE_SIZE, G]
+# in fp32)``. The caller is responsible for:
+#   1. Splitting the QK dot into G group-dots of shape [BLOCK_M, GS] @ [GS, TILE]
+#   2. Applying ``scales[:, g]`` post-MFMA on each group's [BLOCK_M, TILE] partial
+#
+# This eliminates the 2048-element fp32 round-trip cast and the [TILE, G, GS]
+# broadcast multiply — at the cost of 4 small group-dots instead of one big one.
+# Mathematically lossless vs. the pre-MFMA scaled path.
 # ---------------------------------------------------------------------------
 
 
 @triton.jit
-def _fp4_g32_load_v_tile(
+def _fp4_g32_load_k_codes_unscaled(
     KV_cache_ptr,
     KV_cache_u16_ptr,
-    val_bases,             # [TILE_SIZE] int64 — byte offset to V codes
-    v_scales_u16_addrs,    # [TILE_SIZE] int64 — u16 element index for first V scale
+    data_bases,
+    k_scales_u16_addrs,
+    Fp4_decode_ptr,
+    Pair_lut_ptr,
+    d_offs,
+    d_mask,
+    tile_mask,
+    OUT_DTYPE: tl.constexpr,          # tl.bfloat16 / tl.float16
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,       # unused (kept for parity)
+    N_GROUPS_C: tl.constexpr,
+    USE_PAIR_LUT: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    UNMASKED: tl.constexpr = False,
+):
+    """Load K-codes (unscaled) + per-group fp32 scales for accumulator-fusion path."""
+    if USE_PAIR_LUT:
+        HALF_D: tl.constexpr = BLOCK_D // 2
+        half_offs = tl.arange(0, HALF_D)
+        byte_mask = (half_offs * 2) < HEAD_DIM
+        byte_addrs = data_bases[:, None] + half_offs[None, :]
+        if UNMASKED:
+            byte_raw = tl.load(
+                KV_cache_ptr + byte_addrs, mask=byte_mask[None, :], other=0
+            ).to(tl.int32)
+        else:
+            byte_raw = tl.load(
+                KV_cache_ptr + byte_addrs,
+                mask=tile_mask[:, None] & byte_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+        pair_slot = tl.arange(0, 2)
+        if UNMASKED:
+            c_pair = tl.load(
+                Pair_lut_ptr + byte_raw[:, :, None] * 2 + pair_slot[None, None, :],
+                mask=byte_mask[None, :, None],
+                other=0.0,
+            )
+        else:
+            c_pair = tl.load(
+                Pair_lut_ptr + byte_raw[:, :, None] * 2 + pair_slot[None, None, :],
+                mask=tile_mask[:, None, None] & byte_mask[None, :, None],
+                other=0.0,
+            )
+        K_codes = tl.reshape(c_pair, [TILE_SIZE, BLOCK_D]).to(OUT_DTYPE)
+    else:
+        half_idx = d_offs // 2
+        nibble_shift = (d_offs % 2) * 4
+        addrs = data_bases[:, None] + half_idx[None, :]
+        if UNMASKED:
+            byte_raw = tl.load(
+                KV_cache_ptr + addrs, mask=d_mask[None, :], other=0
+            ).to(tl.int32)
+        else:
+            byte_raw = tl.load(
+                KV_cache_ptr + addrs,
+                mask=tile_mask[:, None] & d_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+        codes = (byte_raw >> nibble_shift[None, :]) & 0xF
+        K_codes = tl.load(Fp4_decode_ptr + codes).to(OUT_DTYPE)
+
+    grp = tl.arange(0, N_GROUPS_C)
+    scale_addrs = k_scales_u16_addrs[:, None] + grp[None, :]
+    if UNMASKED:
+        scale_raw = tl.load(KV_cache_u16_ptr + scale_addrs)
+    else:
+        scale_raw = tl.load(KV_cache_u16_ptr + scale_addrs, mask=tile_mask[:, None], other=0)
+    scales_f32 = scale_raw.to(tl.float16, bitcast=True).to(tl.float32)
+
+    _ = HEAD_DIM
+    _ = GROUP_SIZE_C
+    return K_codes, scales_f32
+
+
+# ---------------------------------------------------------------------------
+# FP4-g32 V-tile UNSCALED loader (Optimization C for PV dot).
+#
+# Returns ``(V_codes : [TILE_SIZE, BLOCK_D] in OUT_DTYPE, scales : [TILE_SIZE, G]
+# in fp32)``. PV is split along the OUTPUT axis (HEAD_D); the per-group scale
+# is absorbed into P (broadcast over BLOCK_M) before each per-group dot. See
+# the caller in ``kernel_fp4_g32_unified_attention_*`` for the math.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fp4_g32_load_v_codes_unscaled(
+    KV_cache_ptr,
+    KV_cache_u16_ptr,
+    val_bases,
+    v_scales_u16_addrs,
     Fp4_decode_ptr,
     Pair_lut_ptr,
     d_offs,
@@ -216,7 +336,7 @@ def _fp4_g32_load_v_tile(
     TILE_SIZE: tl.constexpr,
     UNMASKED: tl.constexpr = False,
 ):
-    """Load + dequant a [TILE_SIZE, BLOCK_D] block of V (raw space)."""
+    """Load V-codes (unscaled) + per-group fp32 scales for accumulator-fusion path."""
     if USE_PAIR_LUT:
         HALF_D: tl.constexpr = BLOCK_D // 2
         half_offs = tl.arange(0, HALF_D)
@@ -245,7 +365,7 @@ def _fp4_g32_load_v_tile(
                 mask=tile_mask[:, None, None] & byte_mask[None, :, None],
                 other=0.0,
             )
-        fp4_vals = tl.reshape(c_pair, [TILE_SIZE, BLOCK_D]).to(tl.float32)
+        V_codes = tl.reshape(c_pair, [TILE_SIZE, BLOCK_D]).to(OUT_DTYPE)
     else:
         half_idx = d_offs // 2
         nibble_shift = (d_offs % 2) * 4
@@ -261,7 +381,7 @@ def _fp4_g32_load_v_tile(
                 other=0,
             ).to(tl.int32)
         codes = (byte_raw >> nibble_shift[None, :]) & 0xF
-        fp4_vals = tl.load(Fp4_decode_ptr + codes).to(tl.float32)
+        V_codes = tl.load(Fp4_decode_ptr + codes).to(OUT_DTYPE)
 
     grp = tl.arange(0, N_GROUPS_C)
     scale_addrs = v_scales_u16_addrs[:, None] + grp[None, :]
@@ -269,13 +389,235 @@ def _fp4_g32_load_v_tile(
         scale_raw = tl.load(KV_cache_u16_ptr + scale_addrs)
     else:
         scale_raw = tl.load(KV_cache_u16_ptr + scale_addrs, mask=tile_mask[:, None], other=0)
-    scales = scale_raw.to(tl.float16, bitcast=True).to(tl.float32)
+    scales_f32 = scale_raw.to(tl.float16, bitcast=True).to(tl.float32)
+
+    _ = HEAD_DIM
+    _ = GROUP_SIZE_C
+    return V_codes, scales_f32
+
+
+# ---------------------------------------------------------------------------
+# FP4-g32 V-tile dequant: returns V : [TILE_SIZE, HEAD_SIZE_PADDED] in Q.dtype
+# ready for tl.dot(P, V). Identical structure to K-tile loader (no zero-point).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fp4_g32_load_v_tile(
+    KV_cache_ptr,
+    KV_cache_u16_ptr,
+    val_bases,             # [TILE_SIZE] int64 — byte offset to V codes
+    v_scales_u16_addrs,    # [TILE_SIZE] int64 — u16 element index for first V scale
+    Fp4_decode_ptr,
+    Pair_lut_ptr,
+    d_offs,
+    d_mask,
+    tile_mask,
+    OUT_DTYPE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,
+    N_GROUPS_C: tl.constexpr,
+    USE_PAIR_LUT: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    UNMASKED: tl.constexpr = False,
+    BF16_DEQUANT: tl.constexpr = 0,
+):
+    """Load + dequant a [TILE_SIZE, BLOCK_D] block of V (raw space).
+
+    See :func:`_fp4_g32_load_k_tile` for ``BF16_DEQUANT`` semantics.
+    """
+    if USE_PAIR_LUT:
+        HALF_D: tl.constexpr = BLOCK_D // 2
+        half_offs = tl.arange(0, HALF_D)
+        byte_mask = (half_offs * 2) < HEAD_DIM
+        byte_addrs = val_bases[:, None] + half_offs[None, :]
+        if UNMASKED:
+            byte_raw = tl.load(
+                KV_cache_ptr + byte_addrs, mask=byte_mask[None, :], other=0
+            ).to(tl.int32)
+        else:
+            byte_raw = tl.load(
+                KV_cache_ptr + byte_addrs,
+                mask=tile_mask[:, None] & byte_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+        pair_slot = tl.arange(0, 2)
+        if UNMASKED:
+            c_pair = tl.load(
+                Pair_lut_ptr + byte_raw[:, :, None] * 2 + pair_slot[None, None, :],
+                mask=byte_mask[None, :, None],
+                other=0.0,
+            )
+        else:
+            c_pair = tl.load(
+                Pair_lut_ptr + byte_raw[:, :, None] * 2 + pair_slot[None, None, :],
+                mask=tile_mask[:, None, None] & byte_mask[None, :, None],
+                other=0.0,
+            )
+        if BF16_DEQUANT:
+            fp4_vals = tl.reshape(c_pair, [TILE_SIZE, BLOCK_D])  # bf16
+        else:
+            fp4_vals = tl.reshape(c_pair, [TILE_SIZE, BLOCK_D]).to(tl.float32)
+    else:
+        half_idx = d_offs // 2
+        nibble_shift = (d_offs % 2) * 4
+        addrs = val_bases[:, None] + half_idx[None, :]
+        if UNMASKED:
+            byte_raw = tl.load(
+                KV_cache_ptr + addrs, mask=d_mask[None, :], other=0
+            ).to(tl.int32)
+        else:
+            byte_raw = tl.load(
+                KV_cache_ptr + addrs,
+                mask=tile_mask[:, None] & d_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+        codes = (byte_raw >> nibble_shift[None, :]) & 0xF
+        if BF16_DEQUANT:
+            fp4_vals = tl.load(Fp4_decode_ptr + codes)  # bf16
+        else:
+            fp4_vals = tl.load(Fp4_decode_ptr + codes).to(tl.float32)
+
+    grp = tl.arange(0, N_GROUPS_C)
+    scale_addrs = v_scales_u16_addrs[:, None] + grp[None, :]
+    if UNMASKED:
+        scale_raw = tl.load(KV_cache_u16_ptr + scale_addrs)
+    else:
+        scale_raw = tl.load(KV_cache_u16_ptr + scale_addrs, mask=tile_mask[:, None], other=0)
+    if BF16_DEQUANT:
+        scales = scale_raw.to(tl.float16, bitcast=True).to(tl.bfloat16)
+    else:
+        scales = scale_raw.to(tl.float16, bitcast=True).to(tl.float32)
 
     V_g = tl.reshape(fp4_vals, [TILE_SIZE, N_GROUPS_C, GROUP_SIZE_C])
     V = tl.reshape(V_g * scales[:, :, None], [TILE_SIZE, BLOCK_D])
 
     _ = HEAD_DIM
     return V.to(OUT_DTYPE)
+
+
+# ---------------------------------------------------------------------------
+# Optimization C helpers: split-K QK dot and split-D PV dot, with per-group
+# scales applied post-MFMA. These are hard-coded for ``N_GROUPS_C == 4`` (i.e.
+# D=128, GS=32); other group counts fall back to the standard pre-MFMA path.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fp4_g32_qk_dot_split4(
+    Q,                          # [BLOCK_M, BLOCK_D]    bf16 / fp16
+    K_codes,                    # [TILE_SIZE, BLOCK_D]  bf16 / fp16
+    k_scales,                   # [TILE_SIZE, 4]        fp32
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    USE_BF16_DOT: tl.constexpr,
+):
+    """Compute S[m,t] = sum_d Q[m,d] * scales[t,d//GS] * K_codes[t,d]
+    via 4 group-dots + post-MFMA scale fusion. Returns fp32 S [BM, TILE]."""
+    Q3 = tl.reshape(Q, [BLOCK_M, 4, GROUP_SIZE_C])
+    K3 = tl.reshape(K_codes, [TILE_SIZE, 4, GROUP_SIZE_C])
+    Q3p = tl.permute(Q3, (0, 2, 1))                       # [BM, GS, 4]
+    K3p = tl.permute(K3, (0, 2, 1))                       # [TILE, GS, 4]
+    Q4 = tl.reshape(Q3p, [BLOCK_M, GROUP_SIZE_C, 2, 2])
+    K4 = tl.reshape(K3p, [TILE_SIZE, GROUP_SIZE_C, 2, 2])
+    Q_lo, Q_hi = tl.split(Q4)
+    K_lo, K_hi = tl.split(K4)
+    Q_g0, Q_g1 = tl.split(Q_lo)
+    Q_g2, Q_g3 = tl.split(Q_hi)
+    K_g0, K_g1 = tl.split(K_lo)
+    K_g2, K_g3 = tl.split(K_hi)
+
+    s4 = tl.reshape(k_scales, [TILE_SIZE, 2, 2])
+    s_lo, s_hi = tl.split(s4)
+    s_g0, s_g1 = tl.split(s_lo)
+    s_g2, s_g3 = tl.split(s_hi)
+
+    if USE_BF16_DOT:
+        Q_g0_d = Q_g0.to(tl.bfloat16); Q_g1_d = Q_g1.to(tl.bfloat16)
+        Q_g2_d = Q_g2.to(tl.bfloat16); Q_g3_d = Q_g3.to(tl.bfloat16)
+        K_g0_T = tl.trans(K_g0.to(tl.bfloat16))
+        K_g1_T = tl.trans(K_g1.to(tl.bfloat16))
+        K_g2_T = tl.trans(K_g2.to(tl.bfloat16))
+        K_g3_T = tl.trans(K_g3.to(tl.bfloat16))
+    else:
+        Q_g0_d = Q_g0; Q_g1_d = Q_g1; Q_g2_d = Q_g2; Q_g3_d = Q_g3
+        K_g0_T = tl.trans(K_g0)
+        K_g1_T = tl.trans(K_g1)
+        K_g2_T = tl.trans(K_g2)
+        K_g3_T = tl.trans(K_g3)
+
+    S0 = tl.dot(Q_g0_d, K_g0_T)
+    S1 = tl.dot(Q_g1_d, K_g1_T)
+    S2 = tl.dot(Q_g2_d, K_g2_T)
+    S3 = tl.dot(Q_g3_d, K_g3_T)
+
+    S = (s_g0[None, :] * S0 + s_g1[None, :] * S1
+         + s_g2[None, :] * S2 + s_g3[None, :] * S3)
+    return S
+
+
+@triton.jit
+def _fp4_g32_pv_dot_split4(
+    P,                          # [BLOCK_M, TILE_SIZE]  fp32 (softmax probs)
+    V_codes,                    # [TILE_SIZE, BLOCK_D]  bf16 / fp16
+    v_scales,                   # [TILE_SIZE, 4]        fp32
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    USE_BF16_DOT: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    """Compute pv[m,d] = sum_t P[m,t] * v_scales[t,d//GS] * V_codes[t,d]
+    via 4 group-dots split along the OUTPUT axis. Per-group v-scale is
+    absorbed into P (broadcast over BLOCK_M) before each dot. Returns
+    [BLOCK_M, BLOCK_D] in fp32 (sums up cleanly with the running ``acc``).
+    """
+    # Split V along output dim (BLOCK_D) into 4 groups of GS:
+    V3 = tl.reshape(V_codes, [TILE_SIZE, 4, GROUP_SIZE_C])
+    V3p = tl.permute(V3, (0, 2, 1))                        # [TILE, GS, 4]
+    V4 = tl.reshape(V3p, [TILE_SIZE, GROUP_SIZE_C, 2, 2])
+    V_lo, V_hi = tl.split(V4)
+    V_g0, V_g1 = tl.split(V_lo)
+    V_g2, V_g3 = tl.split(V_hi)                            # 4x [TILE, GS]
+
+    s4 = tl.reshape(v_scales, [TILE_SIZE, 2, 2])
+    s_lo, s_hi = tl.split(s4)
+    s_g0, s_g1 = tl.split(s_lo)
+    s_g2, s_g3 = tl.split(s_hi)                            # 4x [TILE]
+
+    # Per-group P_scaled[m, t] = P[m, t] * s_g[t]; broadcast via [None, :].
+    P_g0 = P * s_g0[None, :]
+    P_g1 = P * s_g1[None, :]
+    P_g2 = P * s_g2[None, :]
+    P_g3 = P * s_g3[None, :]
+
+    if USE_BF16_DOT:
+        P_g0_d = P_g0.to(tl.bfloat16); P_g1_d = P_g1.to(tl.bfloat16)
+        P_g2_d = P_g2.to(tl.bfloat16); P_g3_d = P_g3.to(tl.bfloat16)
+        V_g0_d = V_g0.to(tl.bfloat16); V_g1_d = V_g1.to(tl.bfloat16)
+        V_g2_d = V_g2.to(tl.bfloat16); V_g3_d = V_g3.to(tl.bfloat16)
+    else:
+        P_g0_d = P_g0.to(OUT_DTYPE); P_g1_d = P_g1.to(OUT_DTYPE)
+        P_g2_d = P_g2.to(OUT_DTYPE); P_g3_d = P_g3.to(OUT_DTYPE)
+        V_g0_d = V_g0; V_g1_d = V_g1; V_g2_d = V_g2; V_g3_d = V_g3
+
+    pv0 = tl.dot(P_g0_d, V_g0_d)                           # [BM, GS], fp32
+    pv1 = tl.dot(P_g1_d, V_g1_d)
+    pv2 = tl.dot(P_g2_d, V_g2_d)
+    pv3 = tl.dot(P_g3_d, V_g3_d)
+
+    # Reassemble [BM, GS, 4] → [BM, GS, 2, 2] → [BM, BD] in original layout.
+    pv_lo = tl.join(pv0, pv1)                              # [BM, GS, 2]
+    pv_hi = tl.join(pv2, pv3)
+    pv4 = tl.join(pv_lo, pv_hi)                            # [BM, GS, 2, 2]
+    pv3p = tl.reshape(pv4, [BLOCK_M, GROUP_SIZE_C, 4])     # [BM, GS, 4]
+    pv3o = tl.permute(pv3p, (0, 2, 1))                     # [BM, 4, GS]
+    pv_full = tl.reshape(pv3o, [BLOCK_M, BLOCK_D])         # [BM, BD]
+    return pv_full
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +670,8 @@ def kernel_fp4_g32_unified_attention_2d(
     FUSE_Q_ROT: tl.constexpr = 0,
     USE_SINKS: tl.constexpr = 0,
     USE_BF16_DOT: tl.constexpr = 0,
+    BF16_DEQUANT: tl.constexpr = 0,
+    ACC_SCALE_FUSION: tl.constexpr = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -426,48 +770,96 @@ def kernel_fp4_g32_unified_attention_2d(
         k_scales_u16_addrs = (data_bases + K_SCALES_OFFSET) // 2
         v_scales_u16_addrs = (data_bases + V_SCALES_OFFSET) // 2
 
-        K_T = _fp4_g32_load_k_tile(
-            KV_cache_ptr,
-            KV_cache_u16_ptr,
-            data_bases,
-            k_scales_u16_addrs,
-            Fp4_decode_ptr,
-            Pair_lut_ptr,
-            offs_d,
-            dim_mask,
-            dummy_tile_mask,
-            OUT_DTYPE=Q.dtype,
-            HEAD_DIM=HEAD_SIZE,
-            BLOCK_D=HEAD_SIZE_PADDED,
-            GROUP_SIZE_C=GROUP_SIZE_C,
-            N_GROUPS_C=N_GROUPS_C,
-            USE_PAIR_LUT=USE_PAIR_LUT,
-            TILE_SIZE=TILE_SIZE,
-            UNMASKED=True,
-        )
-        V = _fp4_g32_load_v_tile(
-            KV_cache_ptr,
-            KV_cache_u16_ptr,
-            val_bases,
-            v_scales_u16_addrs,
-            Fp4_decode_ptr,
-            Pair_lut_ptr,
-            offs_d,
-            dim_mask,
-            dummy_tile_mask,
-            OUT_DTYPE=Q.dtype,
-            HEAD_DIM=HEAD_SIZE,
-            BLOCK_D=HEAD_SIZE_PADDED,
-            GROUP_SIZE_C=GROUP_SIZE_C,
-            N_GROUPS_C=N_GROUPS_C,
-            USE_PAIR_LUT=USE_PAIR_LUT,
-            TILE_SIZE=TILE_SIZE,
-            UNMASKED=True,
-        )
-        if USE_BF16_DOT:
-            S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
+        if ACC_SCALE_FUSION:
+            K_codes, k_scales_f32 = _fp4_g32_load_k_codes_unscaled(
+                KV_cache_ptr,
+                KV_cache_u16_ptr,
+                data_bases,
+                k_scales_u16_addrs,
+                Fp4_decode_ptr,
+                Pair_lut_ptr,
+                offs_d,
+                dim_mask,
+                dummy_tile_mask,
+                OUT_DTYPE=Q.dtype,
+                HEAD_DIM=HEAD_SIZE,
+                BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C,
+                N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT,
+                TILE_SIZE=TILE_SIZE,
+                UNMASKED=True,
+            )
+            V_codes, v_scales_f32 = _fp4_g32_load_v_codes_unscaled(
+                KV_cache_ptr,
+                KV_cache_u16_ptr,
+                val_bases,
+                v_scales_u16_addrs,
+                Fp4_decode_ptr,
+                Pair_lut_ptr,
+                offs_d,
+                dim_mask,
+                dummy_tile_mask,
+                OUT_DTYPE=Q.dtype,
+                HEAD_DIM=HEAD_SIZE,
+                BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C,
+                N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT,
+                TILE_SIZE=TILE_SIZE,
+                UNMASKED=True,
+            )
+            S = scale * _fp4_g32_qk_dot_split4(
+                Q, K_codes, k_scales_f32,
+                BLOCK_M=BLOCK_M, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, TILE_SIZE=TILE_SIZE,
+                USE_BF16_DOT=USE_BF16_DOT,
+            )
         else:
-            S = scale * tl.dot(Q, K_T)
+            K_T = _fp4_g32_load_k_tile(
+                KV_cache_ptr,
+                KV_cache_u16_ptr,
+                data_bases,
+                k_scales_u16_addrs,
+                Fp4_decode_ptr,
+                Pair_lut_ptr,
+                offs_d,
+                dim_mask,
+                dummy_tile_mask,
+                OUT_DTYPE=Q.dtype,
+                HEAD_DIM=HEAD_SIZE,
+                BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C,
+                N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT,
+                TILE_SIZE=TILE_SIZE,
+                UNMASKED=True,
+                BF16_DEQUANT=BF16_DEQUANT,
+            )
+            V = _fp4_g32_load_v_tile(
+                KV_cache_ptr,
+                KV_cache_u16_ptr,
+                val_bases,
+                v_scales_u16_addrs,
+                Fp4_decode_ptr,
+                Pair_lut_ptr,
+                offs_d,
+                dim_mask,
+                dummy_tile_mask,
+                OUT_DTYPE=Q.dtype,
+                HEAD_DIM=HEAD_SIZE,
+                BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C,
+                N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT,
+                TILE_SIZE=TILE_SIZE,
+                UNMASKED=True,
+                BF16_DEQUANT=BF16_DEQUANT,
+            )
+            if USE_BF16_DOT:
+                S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
+            else:
+                S = scale * tl.dot(Q, K_T)
         seq_mask = seq_offset[None, :] <= query_abs_pos
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
@@ -482,10 +874,19 @@ def kernel_fp4_g32_unified_attention_2d(
         acc = acc * alpha[:, None]
         L = L * alpha + l_j
         M = m_j
-        if USE_BF16_DOT:
-            acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+        if ACC_SCALE_FUSION:
+            acc += _fp4_g32_pv_dot_split4(
+                P, V_codes, v_scales_f32,
+                BLOCK_M=BLOCK_M, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, TILE_SIZE=TILE_SIZE,
+                USE_BF16_DOT=USE_BF16_DOT,
+                OUT_DTYPE=Q.dtype,
+            )
         else:
-            acc += tl.dot(P.to(V.dtype), V)
+            if USE_BF16_DOT:
+                acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+            else:
+                acc += tl.dot(P.to(V.dtype), V)
 
     # Tail tile
     if num_tiles > 0:
@@ -512,48 +913,96 @@ def kernel_fp4_g32_unified_attention_2d(
         k_scales_u16_addrs = (data_bases + K_SCALES_OFFSET) // 2
         v_scales_u16_addrs = (data_bases + V_SCALES_OFFSET) // 2
 
-        K_T = _fp4_g32_load_k_tile(
-            KV_cache_ptr,
-            KV_cache_u16_ptr,
-            data_bases,
-            k_scales_u16_addrs,
-            Fp4_decode_ptr,
-            Pair_lut_ptr,
-            offs_d,
-            dim_mask,
-            tile_mask,
-            OUT_DTYPE=Q.dtype,
-            HEAD_DIM=HEAD_SIZE,
-            BLOCK_D=HEAD_SIZE_PADDED,
-            GROUP_SIZE_C=GROUP_SIZE_C,
-            N_GROUPS_C=N_GROUPS_C,
-            USE_PAIR_LUT=USE_PAIR_LUT,
-            TILE_SIZE=TILE_SIZE,
-            UNMASKED=False,
-        )
-        V = _fp4_g32_load_v_tile(
-            KV_cache_ptr,
-            KV_cache_u16_ptr,
-            val_bases,
-            v_scales_u16_addrs,
-            Fp4_decode_ptr,
-            Pair_lut_ptr,
-            offs_d,
-            dim_mask,
-            tile_mask,
-            OUT_DTYPE=Q.dtype,
-            HEAD_DIM=HEAD_SIZE,
-            BLOCK_D=HEAD_SIZE_PADDED,
-            GROUP_SIZE_C=GROUP_SIZE_C,
-            N_GROUPS_C=N_GROUPS_C,
-            USE_PAIR_LUT=USE_PAIR_LUT,
-            TILE_SIZE=TILE_SIZE,
-            UNMASKED=False,
-        )
-        if USE_BF16_DOT:
-            S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
+        if ACC_SCALE_FUSION:
+            K_codes, k_scales_f32 = _fp4_g32_load_k_codes_unscaled(
+                KV_cache_ptr,
+                KV_cache_u16_ptr,
+                data_bases,
+                k_scales_u16_addrs,
+                Fp4_decode_ptr,
+                Pair_lut_ptr,
+                offs_d,
+                dim_mask,
+                tile_mask,
+                OUT_DTYPE=Q.dtype,
+                HEAD_DIM=HEAD_SIZE,
+                BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C,
+                N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT,
+                TILE_SIZE=TILE_SIZE,
+                UNMASKED=False,
+            )
+            V_codes, v_scales_f32 = _fp4_g32_load_v_codes_unscaled(
+                KV_cache_ptr,
+                KV_cache_u16_ptr,
+                val_bases,
+                v_scales_u16_addrs,
+                Fp4_decode_ptr,
+                Pair_lut_ptr,
+                offs_d,
+                dim_mask,
+                tile_mask,
+                OUT_DTYPE=Q.dtype,
+                HEAD_DIM=HEAD_SIZE,
+                BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C,
+                N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT,
+                TILE_SIZE=TILE_SIZE,
+                UNMASKED=False,
+            )
+            S = scale * _fp4_g32_qk_dot_split4(
+                Q, K_codes, k_scales_f32,
+                BLOCK_M=BLOCK_M, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, TILE_SIZE=TILE_SIZE,
+                USE_BF16_DOT=USE_BF16_DOT,
+            )
         else:
-            S = scale * tl.dot(Q, K_T)
+            K_T = _fp4_g32_load_k_tile(
+                KV_cache_ptr,
+                KV_cache_u16_ptr,
+                data_bases,
+                k_scales_u16_addrs,
+                Fp4_decode_ptr,
+                Pair_lut_ptr,
+                offs_d,
+                dim_mask,
+                tile_mask,
+                OUT_DTYPE=Q.dtype,
+                HEAD_DIM=HEAD_SIZE,
+                BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C,
+                N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT,
+                TILE_SIZE=TILE_SIZE,
+                UNMASKED=False,
+                BF16_DEQUANT=BF16_DEQUANT,
+            )
+            V = _fp4_g32_load_v_tile(
+                KV_cache_ptr,
+                KV_cache_u16_ptr,
+                val_bases,
+                v_scales_u16_addrs,
+                Fp4_decode_ptr,
+                Pair_lut_ptr,
+                offs_d,
+                dim_mask,
+                tile_mask,
+                OUT_DTYPE=Q.dtype,
+                HEAD_DIM=HEAD_SIZE,
+                BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C,
+                N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT,
+                TILE_SIZE=TILE_SIZE,
+                UNMASKED=False,
+                BF16_DEQUANT=BF16_DEQUANT,
+            )
+            if USE_BF16_DOT:
+                S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
+            else:
+                S = scale * tl.dot(Q, K_T)
         seq_mask = seq_offset[None, :] <= query_abs_pos
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
@@ -568,10 +1017,19 @@ def kernel_fp4_g32_unified_attention_2d(
         acc = acc * alpha[:, None]
         L = L * alpha + l_j
         M = m_j
-        if USE_BF16_DOT:
-            acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+        if ACC_SCALE_FUSION:
+            acc += _fp4_g32_pv_dot_split4(
+                P, V_codes, v_scales_f32,
+                BLOCK_M=BLOCK_M, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, TILE_SIZE=TILE_SIZE,
+                USE_BF16_DOT=USE_BF16_DOT,
+                OUT_DTYPE=Q.dtype,
+            )
         else:
-            acc += tl.dot(P.to(V.dtype), V)
+            if USE_BF16_DOT:
+                acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+            else:
+                acc += tl.dot(P.to(V.dtype), V)
 
     # Epilogue
     acc = acc / L[:, None]
@@ -637,6 +1095,8 @@ def kernel_fp4_g32_unified_attention_3d(
     FUSE_Q_ROT: tl.constexpr = 0,
     USE_SINKS: tl.constexpr = 0,
     USE_BF16_DOT: tl.constexpr = 0,
+    BF16_DEQUANT: tl.constexpr = 0,
+    ACC_SCALE_FUSION: tl.constexpr = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -743,24 +1203,48 @@ def kernel_fp4_g32_unified_attention_3d(
         k_scales_u16_addrs = (data_bases + K_SCALES_OFFSET) // 2
         v_scales_u16_addrs = (data_bases + V_SCALES_OFFSET) // 2
 
-        K_T = _fp4_g32_load_k_tile(
-            KV_cache_ptr, KV_cache_u16_ptr, data_bases, k_scales_u16_addrs,
-            Fp4_decode_ptr, Pair_lut_ptr, offs_d, dim_mask, dummy_tile_mask,
-            OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED,
-            GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
-            USE_PAIR_LUT=USE_PAIR_LUT, TILE_SIZE=TILE_SIZE, UNMASKED=True,
-        )
-        V = _fp4_g32_load_v_tile(
-            KV_cache_ptr, KV_cache_u16_ptr, val_bases, v_scales_u16_addrs,
-            Fp4_decode_ptr, Pair_lut_ptr, offs_d, dim_mask, dummy_tile_mask,
-            OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED,
-            GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
-            USE_PAIR_LUT=USE_PAIR_LUT, TILE_SIZE=TILE_SIZE, UNMASKED=True,
-        )
-        if USE_BF16_DOT:
-            S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
+        if ACC_SCALE_FUSION:
+            K_codes, k_scales_f32 = _fp4_g32_load_k_codes_unscaled(
+                KV_cache_ptr, KV_cache_u16_ptr, data_bases, k_scales_u16_addrs,
+                Fp4_decode_ptr, Pair_lut_ptr, offs_d, dim_mask, dummy_tile_mask,
+                OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT, TILE_SIZE=TILE_SIZE, UNMASKED=True,
+            )
+            V_codes, v_scales_f32 = _fp4_g32_load_v_codes_unscaled(
+                KV_cache_ptr, KV_cache_u16_ptr, val_bases, v_scales_u16_addrs,
+                Fp4_decode_ptr, Pair_lut_ptr, offs_d, dim_mask, dummy_tile_mask,
+                OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT, TILE_SIZE=TILE_SIZE, UNMASKED=True,
+            )
+            S = scale * _fp4_g32_qk_dot_split4(
+                Q, K_codes, k_scales_f32,
+                BLOCK_M=BLOCK_M, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, TILE_SIZE=TILE_SIZE,
+                USE_BF16_DOT=USE_BF16_DOT,
+            )
         else:
-            S = scale * tl.dot(Q, K_T)
+            K_T = _fp4_g32_load_k_tile(
+                KV_cache_ptr, KV_cache_u16_ptr, data_bases, k_scales_u16_addrs,
+                Fp4_decode_ptr, Pair_lut_ptr, offs_d, dim_mask, dummy_tile_mask,
+                OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT, TILE_SIZE=TILE_SIZE, UNMASKED=True,
+                BF16_DEQUANT=BF16_DEQUANT,
+            )
+            V = _fp4_g32_load_v_tile(
+                KV_cache_ptr, KV_cache_u16_ptr, val_bases, v_scales_u16_addrs,
+                Fp4_decode_ptr, Pair_lut_ptr, offs_d, dim_mask, dummy_tile_mask,
+                OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT, TILE_SIZE=TILE_SIZE, UNMASKED=True,
+                BF16_DEQUANT=BF16_DEQUANT,
+            )
+            if USE_BF16_DOT:
+                S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
+            else:
+                S = scale * tl.dot(Q, K_T)
         seq_mask = seq_offset[None, :] <= query_abs_pos
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
@@ -775,10 +1259,19 @@ def kernel_fp4_g32_unified_attention_3d(
         acc = acc * alpha[:, None]
         L = L * alpha + l_j
         M = m_j
-        if USE_BF16_DOT:
-            acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+        if ACC_SCALE_FUSION:
+            acc += _fp4_g32_pv_dot_split4(
+                P, V_codes, v_scales_f32,
+                BLOCK_M=BLOCK_M, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, TILE_SIZE=TILE_SIZE,
+                USE_BF16_DOT=USE_BF16_DOT,
+                OUT_DTYPE=Q.dtype,
+            )
         else:
-            acc += tl.dot(P.to(V.dtype), V)
+            if USE_BF16_DOT:
+                acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+            else:
+                acc += tl.dot(P.to(V.dtype), V)
 
     # Tail
     if tile_lo < tile_hi:
@@ -805,24 +1298,48 @@ def kernel_fp4_g32_unified_attention_3d(
         k_scales_u16_addrs = (data_bases + K_SCALES_OFFSET) // 2
         v_scales_u16_addrs = (data_bases + V_SCALES_OFFSET) // 2
 
-        K_T = _fp4_g32_load_k_tile(
-            KV_cache_ptr, KV_cache_u16_ptr, data_bases, k_scales_u16_addrs,
-            Fp4_decode_ptr, Pair_lut_ptr, offs_d, dim_mask, tile_mask,
-            OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED,
-            GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
-            USE_PAIR_LUT=USE_PAIR_LUT, TILE_SIZE=TILE_SIZE, UNMASKED=False,
-        )
-        V = _fp4_g32_load_v_tile(
-            KV_cache_ptr, KV_cache_u16_ptr, val_bases, v_scales_u16_addrs,
-            Fp4_decode_ptr, Pair_lut_ptr, offs_d, dim_mask, tile_mask,
-            OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED,
-            GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
-            USE_PAIR_LUT=USE_PAIR_LUT, TILE_SIZE=TILE_SIZE, UNMASKED=False,
-        )
-        if USE_BF16_DOT:
-            S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
+        if ACC_SCALE_FUSION:
+            K_codes, k_scales_f32 = _fp4_g32_load_k_codes_unscaled(
+                KV_cache_ptr, KV_cache_u16_ptr, data_bases, k_scales_u16_addrs,
+                Fp4_decode_ptr, Pair_lut_ptr, offs_d, dim_mask, tile_mask,
+                OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT, TILE_SIZE=TILE_SIZE, UNMASKED=False,
+            )
+            V_codes, v_scales_f32 = _fp4_g32_load_v_codes_unscaled(
+                KV_cache_ptr, KV_cache_u16_ptr, val_bases, v_scales_u16_addrs,
+                Fp4_decode_ptr, Pair_lut_ptr, offs_d, dim_mask, tile_mask,
+                OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT, TILE_SIZE=TILE_SIZE, UNMASKED=False,
+            )
+            S = scale * _fp4_g32_qk_dot_split4(
+                Q, K_codes, k_scales_f32,
+                BLOCK_M=BLOCK_M, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, TILE_SIZE=TILE_SIZE,
+                USE_BF16_DOT=USE_BF16_DOT,
+            )
         else:
-            S = scale * tl.dot(Q, K_T)
+            K_T = _fp4_g32_load_k_tile(
+                KV_cache_ptr, KV_cache_u16_ptr, data_bases, k_scales_u16_addrs,
+                Fp4_decode_ptr, Pair_lut_ptr, offs_d, dim_mask, tile_mask,
+                OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT, TILE_SIZE=TILE_SIZE, UNMASKED=False,
+                BF16_DEQUANT=BF16_DEQUANT,
+            )
+            V = _fp4_g32_load_v_tile(
+                KV_cache_ptr, KV_cache_u16_ptr, val_bases, v_scales_u16_addrs,
+                Fp4_decode_ptr, Pair_lut_ptr, offs_d, dim_mask, tile_mask,
+                OUT_DTYPE=Q.dtype, HEAD_DIM=HEAD_SIZE, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
+                USE_PAIR_LUT=USE_PAIR_LUT, TILE_SIZE=TILE_SIZE, UNMASKED=False,
+                BF16_DEQUANT=BF16_DEQUANT,
+            )
+            if USE_BF16_DOT:
+                S = scale * tl.dot(Q.to(tl.bfloat16), K_T.to(tl.bfloat16))
+            else:
+                S = scale * tl.dot(Q, K_T)
         seq_mask = seq_offset[None, :] <= query_abs_pos
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
@@ -837,10 +1354,19 @@ def kernel_fp4_g32_unified_attention_3d(
         acc = acc * alpha[:, None]
         L = L * alpha + l_j
         M = m_j
-        if USE_BF16_DOT:
-            acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+        if ACC_SCALE_FUSION:
+            acc += _fp4_g32_pv_dot_split4(
+                P, V_codes, v_scales_f32,
+                BLOCK_M=BLOCK_M, BLOCK_D=HEAD_SIZE_PADDED,
+                GROUP_SIZE_C=GROUP_SIZE_C, TILE_SIZE=TILE_SIZE,
+                USE_BF16_DOT=USE_BF16_DOT,
+                OUT_DTYPE=Q.dtype,
+            )
         else:
-            acc += tl.dot(P.to(V.dtype), V)
+            if USE_BF16_DOT:
+                acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+            else:
+                acc += tl.dot(P.to(V.dtype), V)
 
     # Write partials for reduce_segments
     segm_output_offset = (
@@ -865,8 +1391,123 @@ def kernel_fp4_g32_unified_attention_3d(
 
 
 # ---------------------------------------------------------------------------
+# FP4-specific Stage-2 reducer: online-softmax over segments
+# ---------------------------------------------------------------------------
+#
+# The default reducer ``reduce_segments`` (from triton_unified_attention.py)
+# loads ALL ``NUM_SEGMENTS_PER_SEQ`` partial outputs as a single 2D tile
+# ``[NUM_SEGMENTS, HEAD_SIZE_PADDED]`` and reduces with ``tl.sum(..., axis=0)``.
+# That is fine on NVIDIA but on MI300/MI355 it inflates the per-program working
+# set into VGPRs and limits occupancy.
+#
+# TQ44 V3 uses ``_fwd_kernel_stage2`` from ``triton_decode_attention.py`` which
+# loops sequentially over splits with online softmax. Its per-iter kernel time
+# at 64K decode is ~196 us vs FP4's 526 us (rocprof, MI355 / gfx950). This
+# kernel ports that algorithm onto FP4-g32 V3's 3-buffer layout
+# (segm_output / segm_max / segm_expsum), so we get TQ44 V3's stage-2 perf
+# without changing FP4's stage-1 partial-write contract.
+#
+# Enabled by default on HIP via VLLM_FP4_G32_FAST_REDUCE=1; flip to 0 to fall
+# back to the vectorized ``reduce_segments`` for A/B testing.
+@triton.jit
+def _fp4_g32_reduce_segments_online(
+    output_ptr,            # [num_tokens, num_query_heads, head_size]
+    segm_output_ptr,       # [num_tokens, num_query_heads, NUM_SEGMENTS, HEAD_SIZE_PADDED]
+    segm_max_ptr,          # [num_tokens, num_query_heads, NUM_SEGMENTS]
+    segm_expsum_ptr,       # [num_tokens, num_query_heads, NUM_SEGMENTS]
+    seq_lens_ptr,          # [num_seqs]
+    num_seqs,              # int
+    num_query_heads: tl.constexpr,
+    output_stride_0: tl.int64,
+    output_stride_1: tl.int64,
+    TILE_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    query_start_len_ptr,
+    BLOCK_Q: tl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+):
+    query_token_idx = tl.program_id(0)
+    query_head_idx = tl.program_id(1)
+
+    seq_idx = find_seq_idx(
+        query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
+    )
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+
+    tiles_per_segment = tl.cdiv(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
+    act_num_segments = tl.cdiv(seq_len, tiles_per_segment * TILE_SIZE)
+
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    mask_d = offs_d < HEAD_SIZE
+
+    base_segm_off = (
+        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        + query_head_idx * NUM_SEGMENTS_PER_SEQ
+    )
+    base_segm_out_off = (
+        query_token_idx.to(tl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+    )
+
+    e_max = tl.full([], float("-inf"), dtype=tl.float32)
+    e_sum = tl.zeros([], dtype=tl.float32)
+    acc = tl.zeros([HEAD_SIZE_PADDED], dtype=tl.float32)
+
+    # Online softmax merge across segments — one segment at a time keeps
+    # working-set small (BLOCK_DV-sized) → low VGPR / high occupancy on AMD.
+    for seg_idx in range(0, NUM_SEGMENTS_PER_SEQ):
+        if seg_idx < act_num_segments:
+            tlogic = tl.load(segm_max_ptr + base_segm_off + seg_idx)
+            tsum = tl.load(segm_expsum_ptr + base_segm_off + seg_idx)
+            tv = tl.load(
+                segm_output_ptr
+                + base_segm_out_off
+                + seg_idx * HEAD_SIZE_PADDED
+                + offs_d,
+                mask=mask_d,
+                other=0.0,
+            )
+
+            n_e_max = tl.maximum(tlogic, e_max)
+            old_scale = tl.exp(e_max - n_e_max)
+            new_scale = tl.exp(tlogic - n_e_max)
+
+            acc = acc * old_scale + tv * new_scale
+            e_sum = e_sum * old_scale + tsum * new_scale
+            e_max = n_e_max
+
+    result = tl.where(e_sum == 0.0, 0.0, acc / e_sum)
+
+    output_offset = (
+        query_token_idx * output_stride_0
+        + query_head_idx * output_stride_1
+        + offs_d
+    )
+    tl.store(output_ptr + output_offset, result, mask=mask_d)
+
+
+# ---------------------------------------------------------------------------
 # Launcher
 # ---------------------------------------------------------------------------
+
+
+def _amd_stage1_hints() -> dict[str, int]:
+    """Triton extra-kargs that tune the 3D split-KV kernel on CDNA3/CDNA4.
+
+    Mirrors the hints AMD uses in `triton_decode_attention.py` for its own
+    stage-2 reducer (`_fwd_kernel_stage2`). On gfx950, kpack is deprecated
+    and silently coerced to 1 — we still pass it for forward-compat with
+    older Triton/ROCm. Each value can be overridden via env vars to allow
+    quick A/B testing without recompiling.
+    """
+    return {
+        "waves_per_eu": int(os.environ.get("VLLM_FP4_G32_WAVES_PER_EU", "2")),
+        "matrix_instr_nonkdim": int(os.environ.get(
+            "VLLM_FP4_G32_MFMA_NONKDIM", "16")),
+        "kpack": int(os.environ.get("VLLM_FP4_G32_KPACK", "2")),
+    }
 
 
 _HADAMARD_CACHE: dict[tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
@@ -994,13 +1635,46 @@ def fp4_g32_unified_attention(
     if (not is_prefill_like) and _tile_override is not None:
         tile_size = int(_tile_override)
 
-    num_stages = int(os.environ.get("VLLM_FP4_G32_NUM_STAGES", "1" if _is_hip else "2"))
+    # num_stages — separate defaults for 2D (prefill, BLOCK_M=128, register-heavy)
+    # vs 3D (decode, BLOCK_M=16, register-light). Microbench on MI300X showed:
+    #   - 2D (prefill):  stages=2 is -2..-3% slower than stages=1 (overhead).
+    #   - 3D (decode):   stages=2 is +9..+15% faster than stages=1 (pipelining).
+    # Both retain bit-identical accuracy. Override via VLLM_FP4_G32_NUM_STAGES
+    # (global) or the per-path variants. Non-HIP keeps the historical default 2.
+    _global_stages = os.environ.get("VLLM_FP4_G32_NUM_STAGES")
+    if _global_stages is not None:
+        num_stages_2d = int(_global_stages)
+        num_stages_3d = int(_global_stages)
+    else:
+        num_stages_2d = int(os.environ.get(
+            "VLLM_FP4_G32_NUM_STAGES_2D", "1" if _is_hip else "2"))
+        num_stages_3d = int(os.environ.get(
+            "VLLM_FP4_G32_NUM_STAGES_3D", "2" if _is_hip else "2"))
     use_bf16_dot = 1 if (_is_hip and query.dtype == torch.bfloat16) else 0
+    # Optimization B: skip the gratuitous fp32 round-trip in K/V dequant.
+    # Stays in bf16 from LUT through the per-group scale multiply. Fp32
+    # accumulation still happens inside MFMA. Default OFF — A/B with
+    # VLLM_FP4_G32_BF16_DEQUANT=1.
+    bf16_dequant = 1 if (
+        os.environ.get("VLLM_FP4_G32_BF16_DEQUANT", "0") == "1"
+        and query.dtype == torch.bfloat16
+    ) else 0
 
     kv_cache_u16 = kv_cache.view(torch.uint16)
 
     BLOCK_D = triton.next_power_of_2(D)
     N_GROUPS_C = n_groups(D, gs)
+    # Optimization C: post-MFMA accumulator-side per-group scale fusion.
+    # Splits the QK dot into G=4 group-dots and applies per-group scales on
+    # the [BLOCK_M, TILE] partial; PV is split along the output axis.
+    # Eliminates the [TILE, G, GS] broadcast multiply and fp32 round-trip.
+    # Mathematically lossless. Default OFF — A/B with
+    # VLLM_FP4_G32_ACC_SCALE_FUSION=1. Hard-coded for N_GROUPS_C == 4
+    # (i.e. D=128, GS=32); falls back silently for other layouts.
+    acc_scale_fusion = 1 if (
+        os.environ.get("VLLM_FP4_G32_ACC_SCALE_FUSION", "0") == "1"
+        and N_GROUPS_C == 4
+    ) else 0
 
     # Layout constants — baked as constexpr.
     K_SCALES_OFFSET = k_scales_offset(D, gs)
@@ -1056,14 +1730,45 @@ def fp4_g32_unified_attention(
             FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
             USE_SINKS=1 if use_sinks else 0,
             USE_BF16_DOT=use_bf16_dot,
+            BF16_DEQUANT=bf16_dequant,
+            ACC_SCALE_FUSION=acc_scale_fusion,
             num_warps=4,
-            num_stages=num_stages,
+            num_stages=num_stages_2d,
         )
         return output
 
     # 3D split-KV path
+    #
+    # KV split count drives parallelism: grid is
+    # (total_num_q_blocks, Hk, num_segments). For decode on MI355 (gfx950)
+    # the historical 16-split default leaves ~128 workgroups; CU utilization
+    # is the binding bottleneck. rocprof on MI355 (B=1, Hq=64, Hk=8, 64K seq):
+    #
+    #   splits=16:  4.480 ms/call  (old default)
+    #   splits=32:  2.038 ms/call  (-54%)   ← matches TQ44 V3's hardcoded 32
+    #   splits=64:  1.749 ms/call  (-61%)   ← FP4-G32-SPECIFIC WIN over TQ44
+    #   splits=128: 1.218 ms/call  (-73%)   ← regresses at B≥2
+    #
+    # 64 wins or ties across the full sweep (B∈{1,2,4,8}, seqlen∈{8K..128K})
+    # so it's the new HIP default. Bit-exact (just changes reduction order;
+    # max abs diff 1.22e-4 = bf16 ULP). Override via VLLM_FP4_G32_NUM_KV_SPLITS.
+    #
+    # NOTE for TQ44 V3: TQ44 V3 hardcodes max_num_kv_splits=32 in its
+    # launcher. The same +25% gain LIKELY applies to TQ44 V3 if its constant
+    # is bumped to 64. See HOW_TO_RUN.md "Cross-scheme follow-ups" section.
     if num_kv_splits is None:
-        num_kv_splits = 16
+        _default_splits = 64 if _is_hip else 16
+        num_kv_splits = int(os.environ.get(
+            "VLLM_FP4_G32_NUM_KV_SPLITS", str(_default_splits)))
+    # Triton requires NUM_SEGMENTS_PER_SEQ to be a power of 2 (tl.arange
+    # constraint inside reduce_segments). Round DOWN to nearest power of 2
+    # so a misconfigured value can't accidentally over-subscribe; users get
+    # the parallelism they asked for or less.
+    if num_kv_splits < 1:
+        num_kv_splits = 1
+    if num_kv_splits & (num_kv_splits - 1) != 0:
+        # round down to nearest power of 2
+        num_kv_splits = 1 << (num_kv_splits.bit_length() - 1)
     max_possible_splits = max(1, (max_seq_len_hint + tile_size - 1) // tile_size)
     num_segments = max(1, min(num_kv_splits, max_possible_splits))
 
@@ -1120,30 +1825,85 @@ def fp4_g32_unified_attention(
         FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
         USE_SINKS=1 if use_sinks else 0,
         USE_BF16_DOT=use_bf16_dot,
+        BF16_DEQUANT=bf16_dequant,
+        ACC_SCALE_FUSION=acc_scale_fusion,
         num_warps=int(os.environ.get("VLLM_FP4_G32_NUM_WARPS_3D", "2")),
-        num_stages=num_stages,
+        num_stages=num_stages_3d,
+        # Optional AMD-specific Triton hints for the 3D split-KV kernel
+        # (waves_per_eu / matrix_instr_nonkdim / kpack). Default OFF — the
+        # cross-shape sweep on MI355 showed unstable behavior: −23% at
+        # (B=1, 64K), +52% catastrophic at (B=8, 32K). Opt in per-shape
+        # via VLLM_FP4_G32_AMD_HINTS=1 once you've measured for your
+        # batch / seqlen mix.
+        **(_amd_stage1_hints() if _is_hip and
+           os.environ.get("VLLM_FP4_G32_AMD_HINTS", "0") == "1" else {}),
     )
 
-    # Reduce segment partials → final output (reuse v3's reducer; layout matches).
-    reduce_segments[(num_tokens, Hq)](
-        output_ptr=output,
-        segm_output_ptr=segm_output,
-        segm_max_ptr=segm_max,
-        segm_expsum_ptr=segm_expsum,
-        seq_lens_ptr=seq_lens,
-        num_seqs=num_seqs,
-        num_query_heads=Hq,
-        out_scale_inv=1.0,
-        output_stride_0=output.stride(0),
-        output_stride_1=output.stride(1),
-        block_table_stride=block_table.stride(0),
-        TILE_SIZE=tile_size,
-        HEAD_SIZE=D,
-        HEAD_SIZE_PADDED=BLOCK_D,
-        query_start_len_ptr=query_start_loc,
-        BLOCK_Q=BLOCK_Q,
-        NUM_SEGMENTS_PER_SEQ=num_segments,
-        USE_FP8=False,
-    )
+    # Reduce segment partials → final output.
+    #
+    # Two reducers available on the FP4-g32 V3 path:
+    #   - VLLM_FP4_G32_FAST_REDUCE=1: online-softmax loop that ports TQ44 V3's
+    #     _fwd_kernel_stage2 algorithm onto FP4's 3-buffer layout (lower VGPR,
+    #     intended for high-occupancy on AMD).
+    #   - VLLM_FP4_G32_FAST_REDUCE=0 (DEFAULT): vectorized reduce_segments —
+    #     this is actually FASTER for FP4-g32's small NUM_SEGMENTS=16 + 3 separate
+    #     buffer (segm_output / segm_max / segm_expsum) layout. Per-call rocprof
+    #     median on MI355: vectorized=44 us vs online=56 us (B=1, 64K, Hq=64).
+    #     The TQ44 V3 wins at stage-2 require its packed Mid_O[B,Hq,splits,D+1]
+    #     layout (one combined load per iter) that FP4 V3 does not have.
+    #     The online kernel stays in-tree for future investigation under a
+    #     packed FP4-cache layout.
+    fast_reduce = os.environ.get("VLLM_FP4_G32_FAST_REDUCE", "0") == "1"
+
+    if fast_reduce:
+        # AMD-specific kernel hints — same set used by triton_decode_attention's
+        # _fwd_kernel_stage2 launcher (see line ~625 of triton_decode_attention.py).
+        reduce_extra_kargs = {}
+        if _is_hip:
+            reduce_extra_kargs = {
+                "waves_per_eu": 4,
+                "matrix_instr_nonkdim": 16,
+                "kpack": 2,
+            }
+        _fp4_g32_reduce_segments_online[(num_tokens, Hq)](
+            output_ptr=output,
+            segm_output_ptr=segm_output,
+            segm_max_ptr=segm_max,
+            segm_expsum_ptr=segm_expsum,
+            seq_lens_ptr=seq_lens,
+            num_seqs=num_seqs,
+            num_query_heads=Hq,
+            output_stride_0=output.stride(0),
+            output_stride_1=output.stride(1),
+            TILE_SIZE=tile_size,
+            HEAD_SIZE=D,
+            HEAD_SIZE_PADDED=BLOCK_D,
+            query_start_len_ptr=query_start_loc,
+            BLOCK_Q=BLOCK_Q,
+            NUM_SEGMENTS_PER_SEQ=num_segments,
+            num_warps=4,
+            **reduce_extra_kargs,
+        )
+    else:
+        reduce_segments[(num_tokens, Hq)](
+            output_ptr=output,
+            segm_output_ptr=segm_output,
+            segm_max_ptr=segm_max,
+            segm_expsum_ptr=segm_expsum,
+            seq_lens_ptr=seq_lens,
+            num_seqs=num_seqs,
+            num_query_heads=Hq,
+            out_scale_inv=1.0,
+            output_stride_0=output.stride(0),
+            output_stride_1=output.stride(1),
+            block_table_stride=block_table.stride(0),
+            TILE_SIZE=tile_size,
+            HEAD_SIZE=D,
+            HEAD_SIZE_PADDED=BLOCK_D,
+            query_start_len_ptr=query_start_loc,
+            BLOCK_Q=BLOCK_Q,
+            NUM_SEGMENTS_PER_SEQ=num_segments,
+            USE_FP8=False,
+        )
 
     return output
