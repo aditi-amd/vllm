@@ -58,6 +58,50 @@ from vllm.v1.attention.ops.triton_turboquant_decode_v2 import (
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
 
 
+def _lazy_fp4_g32_imports():
+    """Lazy imports for FP4-g32 kernels — avoids Triton import cost on paths
+    that don't use fp4_kv_g32. Returns (fp4_g32_store, fp4_g32_decode_attention)."""
+    from vllm.v1.attention.ops.fp4_g32.triton_store import fp4_g32_store
+    from vllm.v1.attention.ops.fp4_g32.triton_decode import (
+        fp4_g32_decode_attention,
+        fp4_g32_dequant_cached_kv,
+    )
+    return fp4_g32_store, fp4_g32_decode_attention, fp4_g32_dequant_cached_kv
+
+
+def _lazy_fp4_g32_v3_import():
+    """Lazy import for the v3-based FP4-g32 unified attention kernel."""
+    from vllm.v1.attention.ops.fp4_g32.triton_unified_attention import (
+        fp4_g32_unified_attention,
+    )
+    return fp4_g32_unified_attention
+
+
+def _fp4_get_layer_dequant_bufs(
+    layer: Any,
+    Hk: int,
+    max_seq: int,
+    D: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fallback layer-cached dequant target buffers for FP4-g32 continuation
+    prefill — used when WorkspaceManager is unavailable or too small.
+
+    Mirrors v1's `_tq_k_dequant_buf` / `_tq_v_dequant_buf` pattern. Allocated
+    once at worst-case size; never via bare `torch.empty` during graph capture.
+    """
+    _kbuf = getattr(layer, "_fp4_k_dequant_buf", None)
+    if _kbuf is None or _kbuf.shape[2] < max_seq or _kbuf.dtype != dtype:
+        _kbuf = torch.empty(1, Hk, max_seq, D, dtype=dtype, device=device)
+        layer._fp4_k_dequant_buf = _kbuf
+    _vbuf = getattr(layer, "_fp4_v_dequant_buf", None)
+    if _vbuf is None or _vbuf.shape[2] < max_seq or _vbuf.dtype != dtype:
+        _vbuf = torch.empty(1, Hk, max_seq, D, dtype=dtype, device=device)
+        layer._fp4_v_dequant_buf = _vbuf
+    return _kbuf, _vbuf
+
+
 def _lazy_soa_store_imports():
     """Lazy imports to avoid circular import: turboquant_soa_fusion.__init__
     imports from turboquant_attn, so we cannot import it at module level."""
@@ -103,6 +147,13 @@ _USE_TQ_V2 = os.environ.get("VLLM_TQ_DECODE_V2", "0") == "1"
 _USE_TQ_V3 = os.environ.get("VLLM_TQ_DECODE_V3", "0") == "1"
 _USE_TQ_V4 = os.environ.get("VLLM_TQ_DECODE_V4", "0") == "1"
 _USE_TQ_SOA_FUSION = os.environ.get("VLLM_TQ_SOA_FUSION", "0") == "1"
+# Opt-in flag for the v3-based FP4-g32 unified attention kernel. When set,
+# the FP4 path routes both decode and continuation-prefill through the new
+# `fp4_g32_unified_attention` (`triton_unified_attention.py`), which mirrors
+# v3's `tl.dot`-based MFMA structure (GQA stacking into BLOCK_M, 2D/3D
+# split-KV dispatch, fused Q rotation, main/tail split). When unset, the
+# FP4 path keeps the legacy v1-based decode + dequant-and-flash_attn path.
+_USE_FP4_G32_V3 = os.environ.get("VLLM_FP4_G32_V3", "0") == "1"
 if _USE_TQ_V4 and not _flydsl_v4_available():
     logger.warning(
         "VLLM_TQ_DECODE_V4 requested but FlyDSL is unavailable; "
@@ -115,9 +166,10 @@ if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
 logger.info_once(
-    "TurboQuant has flash attn: %s, decode kernel: %s",
+    "TurboQuant has flash attn: %s, decode kernel: %s, fp4_g32_v3: %s",
     _HAS_FLASH_ATTN,
     "v4(flydsl)" if _USE_TQ_V4 else "v3" if _USE_TQ_V3 else "v2" if _USE_TQ_V2 else "v1",
+    _USE_FP4_G32_V3,
 )
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
@@ -160,6 +212,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
         "turboquant_3bit_nc",
+        "fp4_kv_g32",
     ]
 
     @staticmethod
@@ -220,6 +273,14 @@ class TurboQuantAttentionBackend(AttentionBackend):
             TurboQuantConfig,
         )
 
+        if cache_dtype_str == "fp4_kv_g32":
+            from vllm.v1.attention.ops.fp4_g32.fp4_levels import (
+                get_group_size,
+                get_token_norm,
+                slot_size as _fp4_slot_size,
+            )
+            return (num_blocks, block_size, num_kv_heads,
+                    _fp4_slot_size(head_size, get_group_size(), get_token_norm()))
         tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype_str, head_size)
         return (num_blocks, block_size, num_kv_heads, tq_config.slot_size_aligned)
 
@@ -227,7 +288,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return False
-        return kv_cache_dtype.startswith("turboquant_")
+        return kv_cache_dtype.startswith("turboquant_") or kv_cache_dtype == "fp4_kv_g32"
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
@@ -341,22 +402,28 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self._is_fp4_g32 = (kv_cache_dtype == "fp4_kv_g32")
 
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TurboQuantConfig,
         )
 
-        self.tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
-
-        # Pre-compute kernel constants from config (avoid repeated arithmetic)
-        cfg = self.tq_config
-        self._mse_bytes = (
-            math.ceil(head_size * cfg.key_mse_bits / 8)
-            if not cfg.key_fp8
-            else head_size
-        )
-        self._val_data_bytes = math.ceil(head_size * cfg.effective_value_quant_bits / 8)
-        self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
+        if not self._is_fp4_g32:
+            self.tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
+            # Pre-compute kernel constants from config (avoid repeated arithmetic)
+            cfg = self.tq_config
+            self._mse_bytes = (
+                math.ceil(head_size * cfg.key_mse_bits / 8)
+                if not cfg.key_fp8
+                else head_size
+            )
+            self._val_data_bytes = math.ceil(head_size * cfg.effective_value_quant_bits / 8)
+            self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
+        else:
+            self.tq_config = None
+            self._mse_bytes = 0
+            self._val_data_bytes = 0
+            self._n_centroids = 0
 
         # Fixed NUM_KV_SPLITS (grid dims must be constant for cudagraph,
         # and benchmarks show no regression vs dynamic in eager mode).
@@ -452,13 +519,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # fp16 copy for rotation in continuation prefill path
             layer._tq_Pi_half = H.to(torch.float16)
 
-            # Centroids for Lloyd-Max quantization.
-            layer._tq_centroids = get_centroids(D, self.tq_config.centroid_bits).to(
-                device=device, dtype=torch.float32
-            )
-
-            c_sorted, _ = layer._tq_centroids.sort()
-            layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
+            if not self._is_fp4_g32:
+                # Centroids for Lloyd-Max quantization (TQ formats only).
+                layer._tq_centroids = get_centroids(D, self.tq_config.centroid_bits).to(
+                    device=device, dtype=torch.float32
+                )
+                c_sorted, _ = layer._tq_centroids.sort()
+                layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
             layer._tq_cached = True
 
     def _max_capture_batch_size(self) -> int:
@@ -542,7 +609,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self._ensure_on_device(tq_layer, device)
         Pi = tq_layer._tq_Pi
         PiT = tq_layer._tq_PiT
-        centroids = tq_layer._tq_centroids
+        centroids = getattr(tq_layer, "_tq_centroids", None)
 
         # Compute attention (KV cache was already updated by do_kv_cache_update)
         # With reorder_batch_threshold=1, decodes come first in the batch.
@@ -666,6 +733,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         layer: Any,
     ):
         """Quantize + store via fused Triton kernel."""
+        if self._is_fp4_g32:
+            from vllm.v1.attention.ops.fp4_g32.triton_store import fp4_g32_store
+            fp4_g32_store(
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+                PiT=getattr(layer, "_tq_PiT", None),
+            )
+            return
         if self._soa_store:
             # SOA layout: data region + metadata region separated per block.
             # Required by FlyDSL v4 decode kernel (DATA_BYTES_PER_SLOT=128).
@@ -850,17 +927,73 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     ).transpose(0, 1)
                 output[q_start:q_end] = out.to(query.dtype)
             else:
-                # Continuation chunk: tokens already stored to TQ cache
-                # by do_kv_cache_update. Use decode kernel directly to
-                # avoid O(cached_len) full-dequant per continuation.
-                # For large continuations, fall back to _continuation_prefill.
+                # Continuation chunk: tokens already stored to cache
+                # by do_kv_cache_update. Use decode kernel directly.
                 cached_len = seq_len - q_len
-                if q_len <= _CONTINUATION_DECODE_THRESHOLD:
+                synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]
+                synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
+                if self._is_fp4_g32:
+                    if _USE_FP4_G32_V3:
+                        # v3-based unified path. Mirrors how TQ V3 handles
+                        # continuation prefill: treat each query token as its
+                        # own synthetic single-query sequence with
+                        # seq_len = absolute_token_position + 1. This avoids
+                        # the BLOCK_Q>1 path entirely, which has a write-aliasing
+                        # bug for non-pow2 kv_group_size (MiniMax: kv_group=6,
+                        # BLOCK_M=16, 16%6 != 0 -> padding lanes alias real
+                        # output positions across adjacent q-blocks).
+                        _fp4_g32_unified = _lazy_fp4_g32_v3_import()
+                        # synth_seq_lens already pre-computed above as
+                        # `_arange_cache[cached_len+1 : seq_len+1]` (shape q_len)
+                        # synth_bt is the same block_table expanded q_len-wide.
+                        # query_start_loc = [0, 1, 2, .., q_len] (each token = 1 seq).
+                        cu_q = _arange_cache[: q_len + 1].to(torch.int32)
+                        out = _fp4_g32_unified(
+                            query=q_seq,
+                            kv_cache=kv_cache,
+                            block_table=synth_bt,
+                            seq_lens=synth_seq_lens,
+                            query_start_loc=cu_q,
+                            scale=self.scale,
+                            PiT=PiT,
+                            max_query_len=1,
+                            max_seq_len=int(seq_len),
+                            sinks=self.sinks,
+                        )
+                    else:
+                        _, _fp4_g32_decode, _ = _lazy_fp4_g32_imports()
+                        if q_len <= _CONTINUATION_DECODE_THRESHOLD:
+                            # Small continuation (≤128 tokens): decode kernel per query.
+                            # Each query gets its own seq_len for causal masking.
+                            out = _fp4_g32_decode(
+                                query=q_seq,
+                                kv_cache=kv_cache,
+                                block_table=synth_bt,
+                                seq_lens=synth_seq_lens,
+                                scale=self.scale,
+                                max_num_kv_splits=self.max_num_kv_splits,
+                                PiT=PiT,
+                                sinks=self.sinks,
+                            )
+                        else:
+                            # Large continuation (>128 tokens): dequant cached KV once,
+                            # then run flash_attn — mirrors v1's _continuation_prefill.
+                            # This avoids q_len independent KV scans (O(q_len × ctx) work)
+                            # and instead does O(ctx) dequant + O(q_len × ctx) flash_attn.
+                            out = self._fp4_g32_continuation_prefill(
+                                layer=layer,
+                                query=q_seq,
+                                key_chunk=k_seq,
+                                val_chunk=v_seq,
+                                kv_cache=kv_cache,
+                                block_table=attn_metadata.block_table[i : i + 1],
+                                cached_len=cached_len,
+                                seq_len=seq_len,
+                                PiT=PiT,
+                            )
+                elif q_len <= _CONTINUATION_DECODE_THRESHOLD:
                     # Fast path: treat each query as a decode request
                     # with incremental seq_lens for causal masking.
-                    # Slice from pre-built arange (no kernel launch)
-                    synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]
-                    synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
                     if _USE_TQ_V3 or _USE_TQ_V4:
                         # Continuation prefill stays on v3 even when v4 is the
                         # main decode kernel (v4 is decode-batch only, q_len=1
@@ -1209,6 +1342,152 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             return out[0].transpose(0, 1)  # (q_len, Hq, D)
 
     # ------------------------------------------------------------------ #
+    #  FP4 large-continuation prefill: dequant cache + flash_attn        #
+    # ------------------------------------------------------------------ #
+    def _fp4_g32_continuation_prefill(
+        self,
+        layer: Any,
+        query: torch.Tensor,       # [q_len, Hq, D] raw (not yet rotated)
+        key_chunk: torch.Tensor,   # [q_len, Hk, D] raw
+        val_chunk: torch.Tensor,   # [q_len, Hk, D] raw
+        kv_cache: torch.Tensor,    # paged fp4 cache uint8
+        block_table: torch.Tensor, # [1, max_num_blocks] int32
+        cached_len: int,
+        seq_len: int,
+        PiT: torch.Tensor,         # [D, D] fp32 Hadamard
+    ) -> torch.Tensor:
+        """FP4-g32 continuation prefill — mirrors v1's `_continuation_prefill`.
+
+        Pipeline (same as v1, only the dequant kernel differs):
+          1. Acquire workspace buffers for dequant target [1, Hk, alloc_len, D]
+          2. Triton dequant kernel writes K (rotated) and V (raw) into buffers
+          3. Layer-cached `k_full`/`v_full` [max_seq, Hk, D] are filled:
+             - [:cached_len] ← dequant buffer (transpose copy)
+             - [cached_len:] ← rotated current chunk K / raw V
+          4. flash_attn_varlen_func with causal mask
+
+        FP4 advantage over v1: K is stored in Hadamard-rotated space, so we
+        skip v1's `k_flat @ Pi_half` inverse-rotation fp16 matmul step. The
+        rotation happens once on the small current chunk (q_len ≤ 8K) and on
+        the q_len queries (Q @ PiT), not on the full cached_len.
+        """
+        from vllm.v1.attention.ops.fp4_g32.triton_decode import (
+            fp4_g32_full_dequant_kv,
+        )
+
+        q_len, Hq, D = query.shape
+        Hk = key_chunk.shape[1]
+        device = query.device
+        qdtype = query.dtype
+        block_size = kv_cache.shape[1]
+        alloc_len = math.ceil(cached_len / block_size) * block_size
+
+        # 1. Acquire dequant target buffers [1, Hk, alloc_len, D].
+        # Workspace-shared across layers — required for CUDA Graph safety and
+        # massive memory savings at long context (saves Nlayer× allocations).
+        buf_shape = (1, Hk, alloc_len, D)
+        if is_workspace_manager_initialized():
+            try:
+                k_buf, v_buf = current_workspace_manager().get_simultaneous(
+                    (buf_shape, qdtype),
+                    (buf_shape, qdtype),
+                )
+            except AssertionError:
+                # WorkspaceManager too small (CG profile undershot max_model_len)
+                # → fall back to layer-cached grow-only buffers. Never use bare
+                # torch.empty here: address could land in captured HIP graph pool.
+                k_buf, v_buf = _fp4_get_layer_dequant_bufs(
+                    layer, Hk, block_table.shape[1] * block_size, D, qdtype, device
+                )
+        else:
+            k_buf, v_buf = _fp4_get_layer_dequant_bufs(
+                layer, Hk, block_table.shape[1] * block_size, D, qdtype, device
+            )
+
+        # 2. Triton dequant kernel writes K (rotated) and V (raw) into bufs.
+        fp4_g32_full_dequant_kv(
+            kv_cache=kv_cache,
+            block_table=block_table,
+            k_out=k_buf,
+            v_out=v_buf,
+            alloc_len=alloc_len,
+        )
+
+        # 3. Acquire layer-cached k_full/v_full [max_possible_seq, Hk, D] in qdtype.
+        # Same lifecycle as v1: allocated once at worst-case size during the
+        # first call, reused on every subsequent call (including CG replay).
+        _kfull_cap = block_table.shape[1] * block_size
+        _kfull_buf = getattr(layer, "_fp4_kfull_buf", None)
+        if (
+            _kfull_buf is None
+            or _kfull_buf.shape[0] < _kfull_cap
+            or _kfull_buf.dtype != qdtype
+        ):
+            _kfull_buf = torch.empty(_kfull_cap, Hk, D, dtype=qdtype, device=device)
+            layer._fp4_kfull_buf = _kfull_buf
+        _vfull_buf = getattr(layer, "_fp4_vfull_buf", None)
+        if (
+            _vfull_buf is None
+            or _vfull_buf.shape[0] < _kfull_cap
+            or _vfull_buf.dtype != qdtype
+        ):
+            _vfull_buf = torch.empty(_kfull_cap, Hk, D, dtype=qdtype, device=device)
+            layer._fp4_vfull_buf = _vfull_buf
+        k_full = _kfull_buf[:seq_len]
+        v_full = _vfull_buf[:seq_len]
+
+        # 4. Copy dequanted cache into k_full/v_full prefix.
+        # `k_buf[0, :, :cached_len, :].transpose(0, 1)` is a strided view
+        # [cached_len, Hk, D]; the assignment dispatches a contiguous copy.
+        k_full[:cached_len] = k_buf[0, :, :cached_len, :].transpose(0, 1)
+        v_full[:cached_len] = v_buf[0, :, :cached_len, :].transpose(0, 1)
+
+        # 5. Rotate current chunk K and Q (small matmul, q_len ≤ 8K).
+        # K_chunk_rot = K_chunk @ PiT → store in k_full[cached_len:].
+        # Q_rot     = Q       @ PiT → input to flash_attn.
+        # Hadamard is symmetric orthogonal so Q_rot · K_rot.T == Q · K.T (math
+        # is identity-preserving for the attention scores).
+        k_full[cached_len:] = (
+            key_chunk.to(torch.float32) @ PiT
+        ).to(qdtype)
+        v_full[cached_len:] = val_chunk
+        q_rot = (query.to(torch.float32) @ PiT).to(qdtype)  # [q_len, Hq, D]
+
+        # 6. Flash attention with lower-right causal mask.
+        # flash_attn_varlen_func with unequal Q/K lengths applies the correct
+        # mask: Q[i] (absolute position cached_len+i) attends K[0..cached_len+i].
+        if _HAS_FLASH_ATTN:
+            cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+            cu_k = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+            out = flash_attn_varlen_func(
+                q=q_rot,
+                k=k_full,
+                v=v_full,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=q_len,
+                max_seqlen_k=seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+        else:
+            kv_group = Hq // Hk
+            q_t = q_rot.transpose(0, 1).unsqueeze(0)
+            k_t = k_full.transpose(0, 1).unsqueeze(0)
+            v_t = v_full.transpose(0, 1).unsqueeze(0)
+            if kv_group > 1:
+                k_t = k_t.expand(1, Hq, -1, -1)
+                v_t = v_t.expand(1, Hq, -1, -1)
+            import torch.nn.functional as _F
+            out = _F.scaled_dot_product_attention(
+                q_t, k_t, v_t,
+                is_causal=True,
+                scale=self.scale,
+            ).squeeze(0).transpose(0, 1)
+
+        return out.to(qdtype)
+
+    # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
     # ------------------------------------------------------------------ #
     def _decode_attention(
@@ -1237,6 +1516,49 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     ((B, Hq, D), query.dtype),
                     ((B, Hq), torch.float32),
                 )
+            )
+
+        if self._is_fp4_g32:
+            if _USE_FP4_G32_V3:
+                # v3-based unified decode: real MFMA QK/PV via tl.dot, GQA
+                # stacking, 2D/3D split-KV dispatch. ~2.7-2.9x faster than
+                # v1-based decode on MI300X at long context (verified
+                # bit-similar bf16 output vs v1 in ops tests).
+                # Mirrors TQ V3's pattern: fresh `torch.arange` per call (CUDA
+                # graph capture pool handles per-B-size variants correctly).
+                _fp4_g32_unified = _lazy_fp4_g32_v3_import()
+                cu_q = torch.arange(
+                    B + 1,
+                    dtype=attn_metadata.seq_lens.dtype,
+                    device=query.device,
+                )
+                return _fp4_g32_unified(
+                    query=query,
+                    kv_cache=kv_cache,
+                    block_table=attn_metadata.block_table,
+                    seq_lens=attn_metadata.seq_lens,
+                    query_start_loc=cu_q,
+                    scale=self.scale,
+                    PiT=PiT,
+                    max_query_len=1,
+                    max_seq_len=int(attn_metadata.max_seq_len),
+                    sinks=self.sinks,
+                    output=output_buf[:B] if output_buf is not None else None,
+                )
+
+            _, _fp4_g32_decode, _ = _lazy_fp4_g32_imports()
+            return _fp4_g32_decode(
+                query=query,
+                kv_cache=kv_cache,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                scale=self.scale,
+                max_num_kv_splits=self.max_num_kv_splits,
+                PiT=PiT,
+                sinks=self.sinks,
+                mid_o_buf=mid_o_buf,
+                output_buf=output_buf,
+                lse_buf=lse_buf,
             )
 
         if _USE_TQ_V4:

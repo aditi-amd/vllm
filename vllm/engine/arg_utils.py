@@ -1975,9 +1975,11 @@ class EngineArgs:
                 self.attention_backend
             )
 
-        # TurboQuant requires FlashAttention 2 — FA3 boundary layers assert
-        # FlashAttentionImpl which fails with TurboQuantAttentionImpl.
-        if resolved_cache_dtype.startswith("turboquant_") and (
+        # TurboQuant and fp4_kv_g32 require FlashAttention 2 — FA3 boundary
+        # layers assert FlashAttentionImpl which fails with
+        # TurboQuantAttentionImpl.
+        if (resolved_cache_dtype.startswith("turboquant_")
+                or resolved_cache_dtype == "fp4_kv_g32") and (
             attention_config.flash_attn_version is None
             or attention_config.flash_attn_version >= 3
         ):

@@ -609,6 +609,27 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 tq_slot_size=tq_config.slot_size_aligned,
             )
+        elif self.kv_cache_dtype == "fp4_kv_g32":
+            # fp4_kv_g32 packs both K and V (codes + per-group fp16 scales) into
+            # a single ``slot_size(head_size)``-byte slot per (token, head) — see
+            # ``vllm/v1/attention/ops/fp4_g32/fp4_levels.py``. The generic
+            # ``FullAttentionSpec`` formula ``2 * block * heads * head_size *
+            # dtype_size`` overshoots this by 16/9 (32768 vs 18432 for D=128),
+            # which trips the raw-buffer vs ``get_kv_cache_shape`` reshape
+            # check in ``_reshape_kv_cache_tensors``. Use the TQ-style slot-
+            # accounted spec, mirroring the unification budgeter in
+            # ``platforms/interface.py``.
+            from vllm.v1.attention.ops.fp4_g32.fp4_levels import slot_size
+            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
+
+            return TQFullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                tq_slot_size=slot_size(self.head_size),
+            )
         else:
             return FullAttentionSpec(
                 block_size=block_size,

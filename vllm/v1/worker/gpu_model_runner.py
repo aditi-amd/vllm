@@ -6717,6 +6717,28 @@ class GPUModelRunner(
                                 for i in range(5)
                             ]
 
+                        elif len(kv_cache_shape) == 4:
+                            # TurboQuant / fp4_kv_g32: (num_blocks, block_size, heads, slot)
+                            original_shape = [
+                                kv_cache_shape[inv_order[i]] for i in range(4)
+                            ]
+                            original_strides = [
+                                elements_per_page,  # num_blocks: skip page padding
+                                original_shape[2] * original_shape[3],  # block_size
+                                original_shape[3],  # heads
+                                1,  # slot
+                            ]
+                            permuted_strides = [
+                                original_strides[kv_cache_stride_order[i]]
+                                for i in range(4)
+                            ]
+
+                        else:
+                            raise RuntimeError(
+                                f"Unsupported padded KV cache rank "
+                                f"{len(kv_cache_shape)} for layer {layer_name}"
+                            )
+
                         logger.info(
                             "[DEBUG KV RESHAPE PADDED] layer=%s: "
                             "real_page=%d, padded_page=%d, "
