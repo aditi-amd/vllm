@@ -1650,7 +1650,7 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
-        if resolved_cache_dtype.startswith("turboquant_"):
+        if resolved_cache_dtype.startswith("turboquant_") or resolved_cache_dtype == "fp4_kv_g32":
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )

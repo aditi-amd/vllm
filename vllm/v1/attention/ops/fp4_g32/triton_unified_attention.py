@@ -1578,10 +1578,15 @@ def fp4_g32_unified_attention(
     elif PiT.dtype != torch.float32 or not PiT.is_contiguous():
         PiT = PiT.to(torch.float32).contiguous()
 
-    # Default: fp32 launcher-side rotation (matches the v1 fp4_g32 path's
-    # precision; the kernel's fused rotation uses bf16 PiT, which empirically
-    # caused 3/11 borderline answer flips at 128K context in lcb_128k smoke).
-    # Override via VLLM_FP4_G32_FUSE_Q_ROT=1 if you want to A/B for perf.
+    # Default: launcher-side fp32 Q @ PiT GEMM. The kernel-fused alternative
+    # (`_tq_fuse_q_rotation` with PiT loaded as fp32 and cast to bf16 for an
+    # MFMA dot) saves one launcher GEMM + 2 casts but introduces 1 bf16 ULP
+    # of rounding on PiT, which costs accuracy: 3/11 borderline answer flips
+    # at 128K in lcb_128k smoke (true for both Qwen and MiniMax), and the
+    # full LCB sweep at native 32K showed FP4-g32 strict drop ~1.8 pts on
+    # Qwen3-32B and ~1.8 pts on MiniMax-M2.5 with fusion ON. Long-context
+    # YaRN runs are within noise (Qwen2.5-72B / 128K: +1.1 pts ON, no signal),
+    # so the safe default is OFF. Opt in for A/B via VLLM_FP4_G32_FUSE_Q_ROT=1.
     if fuse_q_rot is None:
         fuse_q_rot = os.environ.get("VLLM_FP4_G32_FUSE_Q_ROT", "0") == "1"
     apply_fuse_q_rot = bool(fuse_q_rot)

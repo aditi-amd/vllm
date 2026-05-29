@@ -934,32 +934,42 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
                 if self._is_fp4_g32:
                     if _USE_FP4_G32_V3:
-                        # v3-based unified path. Mirrors how TQ V3 handles
-                        # continuation prefill: treat each query token as its
-                        # own synthetic single-query sequence with
-                        # seq_len = absolute_token_position + 1. This avoids
-                        # the BLOCK_Q>1 path entirely, which has a write-aliasing
-                        # bug for non-pow2 kv_group_size (MiniMax: kv_group=6,
-                        # BLOCK_M=16, 16%6 != 0 -> padding lanes alias real
-                        # output positions across adjacent q-blocks).
+                        # v3 dispatch mirrors TQ44 V3 (and v1/v2): the V3
+                        # unified attention kernel is decode-optimized. For
+                        # LARGE continuation chunks (q_len > 128) the standard
+                        # TurboQuant pattern is "dequant cache once → bf16
+                        # scratch → flash_attn", which beats running the
+                        # unified kernel at large q. Small continuations
+                        # (q_len ≤ 128) stay on the V3 synth-decode path
+                        # because each query token gets its own seq and
+                        # BLOCK_M=16 amortizes well.
                         _fp4_g32_unified = _lazy_fp4_g32_v3_import()
-                        # synth_seq_lens already pre-computed above as
-                        # `_arange_cache[cached_len+1 : seq_len+1]` (shape q_len)
-                        # synth_bt is the same block_table expanded q_len-wide.
-                        # query_start_loc = [0, 1, 2, .., q_len] (each token = 1 seq).
-                        cu_q = _arange_cache[: q_len + 1].to(torch.int32)
-                        out = _fp4_g32_unified(
-                            query=q_seq,
-                            kv_cache=kv_cache,
-                            block_table=synth_bt,
-                            seq_lens=synth_seq_lens,
-                            query_start_loc=cu_q,
-                            scale=self.scale,
-                            PiT=PiT,
-                            max_query_len=1,
-                            max_seq_len=int(seq_len),
-                            sinks=self.sinks,
-                        )
+                        if q_len <= _CONTINUATION_DECODE_THRESHOLD:
+                            cu_q = _arange_cache[: q_len + 1].to(torch.int32)
+                            out = _fp4_g32_unified(
+                                query=q_seq,
+                                kv_cache=kv_cache,
+                                block_table=synth_bt,
+                                seq_lens=synth_seq_lens,
+                                query_start_loc=cu_q,
+                                scale=self.scale,
+                                PiT=PiT,
+                                max_query_len=1,
+                                max_seq_len=int(seq_len),
+                                sinks=self.sinks,
+                            )
+                        else:
+                            out = self._fp4_g32_continuation_prefill(
+                                layer=layer,
+                                query=q_seq,
+                                key_chunk=k_seq,
+                                val_chunk=v_seq,
+                                kv_cache=kv_cache,
+                                block_table=attn_metadata.block_table[i : i + 1],
+                                cached_len=cached_len,
+                                seq_len=seq_len,
+                                PiT=PiT,
+                            )
                     else:
                         _, _fp4_g32_decode, _ = _lazy_fp4_g32_imports()
                         if q_len <= _CONTINUATION_DECODE_THRESHOLD:
