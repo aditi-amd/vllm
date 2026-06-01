@@ -1650,7 +1650,9 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
-        if resolved_cache_dtype.startswith("turboquant_") or resolved_cache_dtype == "fp4_kv_g32":
+        if (resolved_cache_dtype.startswith("turboquant_")
+                or resolved_cache_dtype == "fp4_kv_g32"
+                or resolved_cache_dtype == "fp8_kv_g32"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )
@@ -1975,11 +1977,12 @@ class EngineArgs:
                 self.attention_backend
             )
 
-        # TurboQuant and fp4_kv_g32 require FlashAttention 2 — FA3 boundary
-        # layers assert FlashAttentionImpl which fails with
+        # TurboQuant, fp4_kv_g32, and fp8_kv_g32 require FlashAttention 2 —
+        # FA3 boundary layers assert FlashAttentionImpl which fails with
         # TurboQuantAttentionImpl.
         if (resolved_cache_dtype.startswith("turboquant_")
-                or resolved_cache_dtype == "fp4_kv_g32") and (
+                or resolved_cache_dtype == "fp4_kv_g32"
+                or resolved_cache_dtype == "fp8_kv_g32") and (
             attention_config.flash_attn_version is None
             or attention_config.flash_attn_version >= 3
         ):

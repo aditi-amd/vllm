@@ -29,6 +29,7 @@ CacheDType = Literal[
     "turboquant_k3v4_nc",
     "turboquant_3bit_nc",
     "fp4_kv_g32",
+    "fp8_kv_g32",
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",

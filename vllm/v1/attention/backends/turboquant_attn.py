@@ -77,6 +77,18 @@ def _lazy_fp4_g32_v3_import():
     return fp4_g32_unified_attention
 
 
+def _lazy_fp8_g32_imports():
+    """Lazy imports for FP8-g32 kernels — avoids Triton import cost on paths
+    that don't use fp8_kv_g32. Returns
+    (fp8_g32_store, fp8_g32_decode_attention, fp8_g32_full_dequant_kv)."""
+    from vllm.v1.attention.ops.fp8_g32.triton_store import fp8_g32_store
+    from vllm.v1.attention.ops.fp8_g32.triton_decode import (
+        fp8_g32_decode_attention,
+        fp8_g32_full_dequant_kv,
+    )
+    return fp8_g32_store, fp8_g32_decode_attention, fp8_g32_full_dequant_kv
+
+
 def _fp4_get_layer_dequant_bufs(
     layer: Any,
     Hk: int,
@@ -213,6 +225,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
         "turboquant_k3v4_nc",
         "turboquant_3bit_nc",
         "fp4_kv_g32",
+        "fp8_kv_g32",
     ]
 
     @staticmethod
@@ -281,6 +294,14 @@ class TurboQuantAttentionBackend(AttentionBackend):
             )
             return (num_blocks, block_size, num_kv_heads,
                     _fp4_slot_size(head_size, get_group_size(), get_token_norm()))
+        if cache_dtype_str == "fp8_kv_g32":
+            from vllm.v1.attention.ops.fp8_g32.fp8_levels import (
+                get_group_size as _fp8_g,
+                get_token_norm as _fp8_tn,
+                slot_size as _fp8_slot_size,
+            )
+            return (num_blocks, block_size, num_kv_heads,
+                    _fp8_slot_size(head_size, _fp8_g(), _fp8_tn()))
         tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype_str, head_size)
         return (num_blocks, block_size, num_kv_heads, tq_config.slot_size_aligned)
 
@@ -288,7 +309,11 @@ class TurboQuantAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return False
-        return kv_cache_dtype.startswith("turboquant_") or kv_cache_dtype == "fp4_kv_g32"
+        return (
+            kv_cache_dtype.startswith("turboquant_")
+            or kv_cache_dtype == "fp4_kv_g32"
+            or kv_cache_dtype == "fp8_kv_g32"
+        )
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
@@ -403,6 +428,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
         self._is_fp4_g32 = (kv_cache_dtype == "fp4_kv_g32")
+        self._is_fp8_g32 = (kv_cache_dtype == "fp8_kv_g32")
+        # fp8_g32 reuses the fp4_g32 control flow (no Lloyd-Max centroids,
+        # Hadamard-rotated K, decode kernel + dequant-for-large-continuation).
+        # Decode/continuation routing branches on _is_fp4_g32 OR _is_fp8_g32.
+        self._is_g32 = self._is_fp4_g32 or self._is_fp8_g32
         # Sliding window (per-layer): wired to the V3 unified kernels for
         # SWA tile-pruning + per-tile masking. None or 0 disables SWA.
         #
@@ -444,7 +474,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             TurboQuantConfig,
         )
 
-        if not self._is_fp4_g32:
+        if not self._is_g32:
             self.tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
             # Pre-compute kernel constants from config (avoid repeated arithmetic)
             cfg = self.tq_config
@@ -555,7 +585,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # fp16 copy for rotation in continuation prefill path
             layer._tq_Pi_half = H.to(torch.float16)
 
-            if not self._is_fp4_g32:
+            if not self._is_g32:
                 # Centroids for Lloyd-Max quantization (TQ formats only).
                 layer._tq_centroids = get_centroids(D, self.tq_config.centroid_bits).to(
                     device=device, dtype=torch.float32
@@ -780,6 +810,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 PiT=getattr(layer, "_tq_PiT", None),
             )
             return
+        if self._is_fp8_g32:
+            fp8_store, _, _ = _lazy_fp8_g32_imports()
+            fp8_store(
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+                PiT=getattr(layer, "_tq_PiT", None),
+            )
+            return
         if self._soa_store:
             # SOA layout: data region + metadata region separated per block.
             # Required by FlyDSL v4 decode kernel (DATA_BYTES_PER_SLOT=128).
@@ -984,7 +1024,36 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 cached_len = seq_len - q_len
                 synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]
                 synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
-                if self._is_fp4_g32:
+                if self._is_fp8_g32:
+                    # fp8_g32: small continuation routes to the new decode
+                    # kernel; large continuation routes to the shared
+                    # `_fp4_g32_continuation_prefill` helper which auto-
+                    # dispatches the fp8 dequant kernel via `_is_fp8_g32`.
+                    _, _fp8_decode, _ = _lazy_fp8_g32_imports()
+                    if q_len <= _CONTINUATION_DECODE_THRESHOLD:
+                        out = _fp8_decode(
+                            query=q_seq,
+                            kv_cache=kv_cache,
+                            block_table=synth_bt,
+                            seq_lens=synth_seq_lens,
+                            scale=self.scale,
+                            max_num_kv_splits=self.max_num_kv_splits,
+                            PiT=PiT,
+                            sinks=self.sinks,
+                        )
+                    else:
+                        out = self._fp4_g32_continuation_prefill(
+                            layer=layer,
+                            query=q_seq,
+                            key_chunk=k_seq,
+                            val_chunk=v_seq,
+                            kv_cache=kv_cache,
+                            block_table=attn_metadata.block_table[i : i + 1],
+                            cached_len=cached_len,
+                            seq_len=seq_len,
+                            PiT=PiT,
+                        )
+                elif self._is_fp4_g32:
                     if _USE_FP4_G32_V3:
                         # v3 dispatch mirrors TQ44 V3 (and v1/v2): the V3
                         # unified attention kernel is decode-optimized. For
@@ -1489,9 +1558,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         rotation happens once on the small current chunk (q_len ≤ 8K) and on
         the q_len queries (Q @ PiT), not on the full cached_len.
         """
-        from vllm.v1.attention.ops.fp4_g32.triton_decode import (
-            fp4_g32_full_dequant_kv,
-        )
+        if self._is_fp8_g32:
+            _, _, fp_full_dequant = _lazy_fp8_g32_imports()
+        else:
+            from vllm.v1.attention.ops.fp4_g32.triton_decode import (
+                fp4_g32_full_dequant_kv as fp_full_dequant,
+            )
 
         q_len, Hq, D = query.shape
         Hk = key_chunk.shape[1]
@@ -1523,7 +1595,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
 
         # 2. Triton dequant kernel writes K (rotated) and V (raw) into bufs.
-        fp4_g32_full_dequant_kv(
+        fp_full_dequant(
             kv_cache=kv_cache,
             block_table=block_table,
             k_out=k_buf,
@@ -1714,6 +1786,26 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
             _, _fp4_g32_decode, _ = _lazy_fp4_g32_imports()
             return _fp4_g32_decode(
+                query=query,
+                kv_cache=kv_cache,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                scale=self.scale,
+                max_num_kv_splits=self.max_num_kv_splits,
+                PiT=PiT,
+                sinks=self.sinks,
+                mid_o_buf=mid_o_buf,
+                output_buf=output_buf,
+                lse_buf=lse_buf,
+            )
+
+        if self._is_fp8_g32:
+            # fp8_g32 mirrors fp4_g32 V1 control flow: stage-1 split-KV
+            # decode kernel + stage-2 reduce (reused fp4_g32 stage-2).
+            # No V3 unified kernel yet — tl.dot_scaled E8M0 dispatch will
+            # land in a follow-up commit.
+            _, _fp8_decode, _ = _lazy_fp8_g32_imports()
+            return _fp8_decode(
                 query=query,
                 kv_cache=kv_cache,
                 block_table=attn_metadata.block_table,

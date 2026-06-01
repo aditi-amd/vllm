@@ -543,9 +543,10 @@ class Platform:
                 kv_quant_mode=kv_quant_mode,
             ).page_size_bytes
         elif (cache_config.cache_dtype.startswith("turboquant_")
-              or cache_config.cache_dtype == "fp4_kv_g32"):
-            # TQ and fp4_kv_g32 have a packed K|V layout; the standard
-            # FullAttentionSpec formula over-sizes it and trips
+              or cache_config.cache_dtype == "fp4_kv_g32"
+              or cache_config.cache_dtype == "fp8_kv_g32"):
+            # TQ / fp4_kv_g32 / fp8_kv_g32 have a packed K|V layout; the
+            # standard FullAttentionSpec formula over-sizes it and trips
             # unify_kv_cache_spec_page_size when all layers use this dtype.
             # With mixed skip+TQ the skip layers still use the standard layout
             # — take max so mamba padding covers the largest actual page.
@@ -562,6 +563,18 @@ class Platform:
                     model_config.get_head_size(),
                     group_size=get_group_size(),
                     token_norm=get_token_norm(),
+                )
+            elif cache_config.cache_dtype == "fp8_kv_g32":
+                from vllm.v1.attention.ops.fp8_g32.fp8_levels import (
+                    get_group_size as _fp8_g,
+                    get_token_norm as _fp8_tn,
+                    slot_size as fp8_slot_size,
+                )
+
+                slot_size = fp8_slot_size(
+                    model_config.get_head_size(),
+                    group_size=_fp8_g(),
+                    token_norm=_fp8_tn(),
                 )
             else:
                 from vllm.model_executor.layers.quantization.turboquant.config import (

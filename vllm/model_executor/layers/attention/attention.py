@@ -597,6 +597,12 @@ class Attention(nn.Module, AttentionLayerBase):
         elif self.kv_cache_dtype == "fp4_kv_g32":
             from vllm.v1.attention.ops.fp4_g32.fp4_levels import slot_size as _fp4_slot
             tq_slot_size = _fp4_slot(self.head_size)
+        elif self.kv_cache_dtype == "fp8_kv_g32":
+            # fp8_kv_g32 has the same packed K|V slot model as fp4_kv_g32 but
+            # uses 1-byte E8M0 scales (vs 2-byte fp16) — same code path, just
+            # a slightly smaller slot. See vllm/v1/attention/ops/fp8_g32/fp8_levels.
+            from vllm.v1.attention.ops.fp8_g32.fp8_levels import slot_size as _fp8_slot
+            tq_slot_size = _fp8_slot(self.head_size)
 
         # Cache-spec gate: trigger full-attention spec for SWA layers when
         # EITHER env var is set:
@@ -649,14 +655,14 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 tq_slot_size=tq_slot_size,
             )
-        elif self.kv_cache_dtype == "fp4_kv_g32":
-            # fp4_kv_g32 packs both K and V (codes + per-group fp16 scales) into
-            # a single ``slot_size(head_size)``-byte slot per (token, head) — see
-            # ``vllm/v1/attention/ops/fp4_g32/fp4_levels.py``. The generic
-            # ``FullAttentionSpec`` formula ``2 * block * heads * head_size *
-            # dtype_size`` overshoots this by 16/9 (32768 vs 18432 for D=128),
-            # which trips the raw-buffer vs ``get_kv_cache_shape`` reshape
-            # check in ``_reshape_kv_cache_tensors``. Use the TQ-style slot-
+        elif self.kv_cache_dtype in ("fp4_kv_g32", "fp8_kv_g32"):
+            # fp4_kv_g32 / fp8_kv_g32 pack both K and V (codes + per-group
+            # scales) into a single ``slot_size(head_size)``-byte slot per
+            # (token, head). The generic ``FullAttentionSpec`` formula
+            # ``2 * block * heads * head_size * dtype_size`` overshoots this
+            # (e.g. 32768 vs 18432 for D=128 on fp4, 17408 on fp8), which
+            # trips the raw-buffer vs ``get_kv_cache_shape`` reshape check
+            # in ``_reshape_kv_cache_tensors``. Use the TQ-style slot-
             # accounted spec, mirroring the unification budgeter in
             # ``platforms/interface.py``.
             from vllm.v1.kv_cache_interface import TQFullAttentionSpec
