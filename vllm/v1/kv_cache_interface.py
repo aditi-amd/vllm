@@ -379,6 +379,43 @@ class SlidingWindowSpec(AttentionSpec):
         return (cdiv(num_tokens, self.block_size) + 1) * self.page_size_bytes
 
 
+@dataclass(frozen=True, kw_only=True)
+class TQSlidingWindowSpec(SlidingWindowSpec):
+    """SlidingWindowSpec with TQ-aware page size.
+
+    Counterpart of :class:`TQFullAttentionSpec` for sliding-window layers.
+    TurboQuant / fp4_kv_g32 pack K+V into a single per-token-head slot of
+    ``tq_slot_size`` bytes (no leading-2 K/V split), so the standard
+    ``2 * block * heads * head_size * dtype_size`` formula in
+    :class:`AttentionSpec` over-sizes the page and breaks the
+    ``_reshape_kv_cache_tensors`` view check against the TQ backend's
+    ``get_kv_cache_shape`` (which uses the real TQ slot size).
+
+    Without this subclass, gpt-oss-style models — which have alternating
+    sliding-window and full-attention layers — boot-fail under TurboQuant
+    and fp4_kv_g32 KV cache, because :meth:`Attention.get_kv_cache_spec`
+    falls into the ``sliding_window is not None`` branch *before* the TQ
+    branches and silently returns a plain ``SlidingWindowSpec`` whose
+    ``page_size_bytes`` is computed from the bf16 head_size formula.
+    """
+
+    tq_slot_size: int = 0
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.tq_slot_size > 0:
+            return self.block_size * self.num_kv_heads * self.tq_slot_size
+        return super().real_page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = super().merge(specs)
+        assert all(s.tq_slot_size == specs[0].tq_slot_size for s in specs), (
+            "All TQ layers in the same KV cache group must use the same tq_slot_size."
+        )
+        return replace(merged, tq_slot_size=specs[0].tq_slot_size)
+
+
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
     shapes: tuple[tuple[int, ...], ...]

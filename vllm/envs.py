@@ -122,6 +122,13 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
+    VLLM_TQ_DECODE_V2: bool = False
+    VLLM_TQ_DECODE_V3: bool = False
+    VLLM_TQ_DECODE_V4: bool = False
+    VLLM_TQ_SOA_FUSION: bool = False
+    VLLM_FP4_G32_V3: bool = False
+    VLLM_TQ_DISABLE_SWA: bool = False
+    VLLM_TQ_FORCE_FULL_ATTN: bool = False
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -1040,6 +1047,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_TRITON_GEMM", "True").lower() in ("true", "1")
+    ),
+    # TurboQuant V3 unified decode kernel selector
+    "VLLM_TQ_DECODE_V3": lambda: (
+        os.getenv("VLLM_TQ_DECODE_V3", "0").lower() in ("true", "1")
+    ),
+    # TurboQuant V2 unified decode kernel selector (legacy)
+    "VLLM_TQ_DECODE_V2": lambda: (
+        os.getenv("VLLM_TQ_DECODE_V2", "0").lower() in ("true", "1")
+    ),
+    # TurboQuant V4 (FlyDSL) decode kernel selector
+    "VLLM_TQ_DECODE_V4": lambda: (
+        os.getenv("VLLM_TQ_DECODE_V4", "0").lower() in ("true", "1")
+    ),
+    # TurboQuant SoA fusion path selector
+    "VLLM_TQ_SOA_FUSION": lambda: (
+        os.getenv("VLLM_TQ_SOA_FUSION", "0").lower() in ("true", "1")
+    ),
+    # FP4-g32 V3 unified decode kernel selector
+    "VLLM_FP4_G32_V3": lambda: (
+        os.getenv("VLLM_FP4_G32_V3", "0").lower() in ("true", "1")
+    ),
+    # When set, TQ/FP4 backends use TQFullAttentionSpec for the cache layout
+    # (no SWA cache rotation). The kernel mask still receives the model's
+    # native sliding_window so output stays coherent on SWA-trained models.
+    # Opt-in only; default keeps the natural SWA cache layout.
+    "VLLM_TQ_DISABLE_SWA": lambda: (
+        os.getenv("VLLM_TQ_DISABLE_SWA", "0").lower() in ("true", "1")
+    ),
+    # When set, TQ/FP4 backends additionally drop the sliding_window mask in
+    # the kernel itself (math becomes full-attention). Will produce
+    # incoherent output on SWA-trained models past the SWA window — debug
+    # flag only.
+    "VLLM_TQ_FORCE_FULL_ATTN": lambda: (
+        os.getenv("VLLM_TQ_FORCE_FULL_ATTN", "0").lower() in ("true", "1")
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (

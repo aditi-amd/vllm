@@ -59,8 +59,8 @@ def _tq_decode_stage1(
     # Strides
     stride_qb,
     stride_qh,  # Q strides: [B, Hq, D]
-    stride_cache_block,  # bytes per block (bs*H*slot_aligned)
-    stride_bt_b,  # block_table stride per batch
+    stride_cache_block: tl.int64,  # bytes per block (bs*H*slot_aligned)
+    stride_bt_b: tl.int64,  # block_table stride per batch
     stride_mid_b,
     stride_mid_h,
     stride_mid_s,  # mid_o strides
@@ -327,14 +327,14 @@ def _tq_full_dequant_kv(
     Centroids_ptr,
     K_out_ptr,  # [B, Hk, max_seq, D] float16
     V_out_ptr,  # [B, Hk, max_seq, D] float16
-    stride_ko_b,
-    stride_ko_h,
-    stride_ko_s,
-    stride_vo_b,
-    stride_vo_h,
-    stride_vo_s,
-    stride_cache_block,
-    stride_bt_b,
+    stride_ko_b: tl.int64,
+    stride_ko_h: tl.int64,
+    stride_ko_s: tl.int64,
+    stride_vo_b: tl.int64,
+    stride_vo_h: tl.int64,
+    stride_vo_s: tl.int64,
+    stride_cache_block: tl.int64,
+    stride_bt_b: tl.int64,
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,

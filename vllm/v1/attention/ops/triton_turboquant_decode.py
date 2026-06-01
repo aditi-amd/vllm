@@ -317,16 +317,16 @@ def _tq_full_dequant_kv(
     Centroids_ptr,
     K_out_ptr,  # [B, Hk, max_seq, D] fp16 or bf16
     V_out_ptr,  # [B, Hk, max_seq, D] fp16 or bf16
-    stride_ko_b,
-    stride_ko_h,
-    stride_ko_s,
-    stride_vo_b,
-    stride_vo_h,
-    stride_vo_s,
-    stride_cache_block,
-    stride_cache_pos,
-    stride_cache_head,
-    stride_bt_b,
+    stride_ko_b: tl.int64,
+    stride_ko_h: tl.int64,
+    stride_ko_s: tl.int64,
+    stride_vo_b: tl.int64,
+    stride_vo_h: tl.int64,
+    stride_vo_s: tl.int64,
+    stride_cache_block: tl.int64,
+    stride_cache_pos: tl.int64,
+    stride_cache_head: tl.int64,
+    stride_bt_b: tl.int64,
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
@@ -354,7 +354,14 @@ def _tq_full_dequant_kv(
 
     page_idx = pos // BLOCK_SIZE
     page_off = pos % BLOCK_SIZE
-    block_num = tl.load(Block_table_ptr + bid * stride_bt_b + page_idx)
+    # Cast block_num to int64 BEFORE multiplying by stride_cache_block:
+    # at long context the assigned physical block IDs can exceed
+    # ~59,932 (where block_num * stride_cache_block overflows int32 for
+    # block_size=128, num_kv_heads=4, slot_size=70 → stride=35840). The
+    # int32 overflow produces a wrap-around address and triggers a HIP
+    # fault. Mirrors the int64 stride convention used in
+    # triton_unified_attention.py.
+    block_num = tl.load(Block_table_ptr + bid * stride_bt_b + page_idx).to(tl.int64)
     slot_base = (
         block_num * stride_cache_block
         + page_off * stride_cache_pos

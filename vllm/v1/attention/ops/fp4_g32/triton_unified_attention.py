@@ -672,6 +672,7 @@ def kernel_fp4_g32_unified_attention_2d(
     USE_BF16_DOT: tl.constexpr = 0,
     BF16_DEQUANT: tl.constexpr = 0,
     ACC_SCALE_FUSION: tl.constexpr = 0,
+    SLIDING_WINDOW: tl.constexpr = 0,  # >0 enables SWA tile-pruning + per-tile masking (gpt-oss)
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -745,10 +746,29 @@ def kernel_fp4_g32_unified_attention_2d(
     max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
     num_tiles = tl.cdiv(max_seq_prefix_len, TILE_SIZE)
 
+    # ---- Sliding-window tile pruning (causal SWA, gpt-oss-style) ----
+    # Mirrors the upstream Triton unified attention pattern. For each query
+    # row q the allowed key range is [q - SLIDING_WINDOW + 1, q] (clamped).
+    # The union over all rows in this q-block is
+    # [first_allowed_key, last_allowed_key]; convert to tile indices and
+    # clamp to [0, num_tiles].
+    tile_start = 0
+    tile_end = num_tiles
+    if SLIDING_WINDOW > 0:
+        qpos_lo = q_block_local_idx * BLOCK_Q
+        qpos_hi = tl.minimum(
+            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
+            cur_batch_query_len - 1,
+        )
+        first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
+        last_allowed_key = context_len + qpos_hi
+        tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
+        tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
+
     query_abs_pos = context_len + query_pos[:, None]
     dummy_tile_mask = tl.full([TILE_SIZE], 1, tl.int1)
 
-    for j in range(0, num_tiles - 1):
+    for j in range(tile_start, tile_end - 1):
         seq_offset = j * TILE_SIZE + offs_t
         if TILE_SIZE == BLOCK_SIZE:
             physical_block_idx = tl.load(
@@ -861,6 +881,8 @@ def kernel_fp4_g32_unified_attention_2d(
             else:
                 S = scale * tl.dot(Q, K_T)
         seq_mask = seq_offset[None, :] <= query_abs_pos
+        if SLIDING_WINDOW > 0:
+            seq_mask = seq_mask & ((query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW)
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
             S,
@@ -889,8 +911,8 @@ def kernel_fp4_g32_unified_attention_2d(
                 acc += tl.dot(P.to(V.dtype), V)
 
     # Tail tile
-    if num_tiles > 0:
-        j = num_tiles - 1
+    if tile_end > tile_start:
+        j = tile_end - 1
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
         if TILE_SIZE == BLOCK_SIZE:
@@ -1004,6 +1026,8 @@ def kernel_fp4_g32_unified_attention_2d(
             else:
                 S = scale * tl.dot(Q, K_T)
         seq_mask = seq_offset[None, :] <= query_abs_pos
+        if SLIDING_WINDOW > 0:
+            seq_mask = seq_mask & ((query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW)
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
             S,
@@ -1097,6 +1121,7 @@ def kernel_fp4_g32_unified_attention_3d(
     USE_BF16_DOT: tl.constexpr = 0,
     BF16_DEQUANT: tl.constexpr = 0,
     ACC_SCALE_FUSION: tl.constexpr = 0,
+    SLIDING_WINDOW: tl.constexpr = 0,  # >0 enables SWA tile-pruning + per-tile masking (gpt-oss)
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -1177,6 +1202,23 @@ def kernel_fp4_g32_unified_attention_3d(
     tile_lo = segm_idx * tiles_per_segment
     tile_hi = tl.minimum((segm_idx + 1) * tiles_per_segment, num_tiles)
 
+    # ---- Sliding-window tile pruning (causal SWA, gpt-oss-style) ----
+    # See 2D kernel for derivation. Intersect this segment's tile range
+    # with the SWA-allowed range. If the result is empty the segment
+    # contributes nothing; we still emit valid (M=-inf, L=1) partials.
+    if SLIDING_WINDOW > 0:
+        qpos_lo = q_block_local_idx * BLOCK_Q
+        qpos_hi = tl.minimum(
+            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
+            cur_batch_query_len - 1,
+        )
+        first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
+        last_allowed_key = context_len + qpos_hi
+        swa_tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
+        swa_tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
+        tile_lo = tl.maximum(tile_lo, swa_tile_start)
+        tile_hi = tl.minimum(tile_hi, swa_tile_end)
+
     query_abs_pos = context_len + query_pos[:, None]
     dummy_tile_mask = tl.full([TILE_SIZE], 1, tl.int1)
     tail = tile_hi - 1
@@ -1246,6 +1288,8 @@ def kernel_fp4_g32_unified_attention_3d(
             else:
                 S = scale * tl.dot(Q, K_T)
         seq_mask = seq_offset[None, :] <= query_abs_pos
+        if SLIDING_WINDOW > 0:
+            seq_mask = seq_mask & ((query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW)
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
             S,
@@ -1341,6 +1385,8 @@ def kernel_fp4_g32_unified_attention_3d(
             else:
                 S = scale * tl.dot(Q, K_T)
         seq_mask = seq_offset[None, :] <= query_abs_pos
+        if SLIDING_WINDOW > 0:
+            seq_mask = seq_mask & ((query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW)
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
             S,
@@ -1545,6 +1591,7 @@ def fp4_g32_unified_attention(
     force_2d: bool = False,
     fuse_q_rot: bool | None = None,
     sinks: torch.Tensor | None = None,
+    sliding_window: int | None = None,  # >0 enables SWA tile-pruning + per-tile masking
 ) -> torch.Tensor:
     """Launch unified FP4-g32 attention (v3-style).
 
@@ -1737,6 +1784,7 @@ def fp4_g32_unified_attention(
             USE_BF16_DOT=use_bf16_dot,
             BF16_DEQUANT=bf16_dequant,
             ACC_SCALE_FUSION=acc_scale_fusion,
+            SLIDING_WINDOW=int(sliding_window) if sliding_window and sliding_window > 0 else 0,
             num_warps=4,
             num_stages=num_stages_2d,
         )
@@ -1832,6 +1880,7 @@ def fp4_g32_unified_attention(
         USE_BF16_DOT=use_bf16_dot,
         BF16_DEQUANT=bf16_dequant,
         ACC_SCALE_FUSION=acc_scale_fusion,
+        SLIDING_WINDOW=int(sliding_window) if sliding_window and sliding_window > 0 else 0,
         num_warps=int(os.environ.get("VLLM_FP4_G32_NUM_WARPS_3D", "2")),
         num_stages=num_stages_3d,
         # Optional AMD-specific Triton hints for the 3D split-KV kernel

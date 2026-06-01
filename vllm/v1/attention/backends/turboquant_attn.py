@@ -403,6 +403,42 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
         self._is_fp4_g32 = (kv_cache_dtype == "fp4_kv_g32")
+        # Sliding window (per-layer): wired to the V3 unified kernels for
+        # SWA tile-pruning + per-tile masking. None or 0 disables SWA.
+        #
+        # ``VLLM_TQ_DISABLE_SWA=1`` is a debug knob for A/B testing the V3
+        # kernel against full-attention. On SWA-trained models (e.g.
+        # gpt-oss with sliding_window=128 every-other layer), forcing the
+        # attention math to drop the SWA mask makes the SWA layers
+        # extrapolate beyond their training window and produces incoherent
+        # output as soon as context exceeds sliding_window tokens — this is
+        # an architectural limitation, not a kernel bug.
+        #
+        # Therefore ``VLLM_TQ_DISABLE_SWA=1`` only flips the SWA *cache*
+        # spec to full-attention (cache holds all positions, no rotation)
+        # while keeping ``self.sliding_window`` plumbed through to the V3
+        # kernel mask. Net effect:
+        #   * Math identical to natural mode -> coherent output at any ctx.
+        #   * Cache layout differs (full vs rotated) — useful for memory-
+        #     utilization A/B against the SWA-rotated TQSlidingWindowSpec.
+        #
+        # ``VLLM_TQ_FORCE_FULL_ATTN=1`` is an opt-in escape hatch that
+        # additionally zeroes the kernel mask — intended for non-SWA
+        # sinks-only models. On SWA-trained models it produces incoherent
+        # output past sliding_window tokens (documented).
+        self.sliding_window = sliding_window
+        if os.environ.get("VLLM_TQ_FORCE_FULL_ATTN", "0") == "1":
+            if sliding_window is not None and sliding_window > 0:
+                logger.warning_once(
+                    "VLLM_TQ_FORCE_FULL_ATTN=1: zeroing sliding_window=%s "
+                    "for V3 kernel mask (SWA tile pruning + per-tile mask "
+                    "off). On SWA-trained models (gpt-oss) this produces "
+                    "incoherent outputs beyond sliding_window tokens; this "
+                    "is math-correct but architecturally out-of-"
+                    "distribution.",
+                    sliding_window,
+                )
+            self.sliding_window = None
 
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TurboQuantConfig,
@@ -599,6 +635,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         N = attn_metadata.num_actual_tokens
         if N <= 0:
             return output.fill_(0)
+
 
         q = query[:N].view(N, self.num_heads, self.head_size)
 
@@ -864,6 +901,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             k_seq = key[q_start:q_end]  # (q_len, Hk, D)
             v_seq = value[q_start:q_end]  # (q_len, Hk, D)
 
+
             if q_len == seq_len:
                 # First-chunk prefill: all K/V are in the current batch.
                 if self.sinks is not None:
@@ -880,6 +918,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     block_table_single = torch.zeros(
                         (1, 1), dtype=torch.int32, device=query.device
                     )
+                    # SWA: pass (window-1, 0) for left-only causal sliding
+                    # window when set (gpt-oss every-other layer); else
+                    # (-1, -1) for full causal attention.
+                    _win = (
+                        (self.sliding_window - 1, 0)
+                        if self.sliding_window and self.sliding_window > 0
+                        else (-1, -1)
+                    )
                     unified_attention(
                         q=q_seq,
                         k=k_cache,
@@ -891,7 +937,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         max_seqlen_k=q_len,
                         softmax_scale=self.scale,
                         causal=True,
-                        window_size=(-1, -1),
+                        window_size=_win,
                         block_table=block_table_single,
                         softcap=0.0,
                         q_descale=None,
@@ -902,6 +948,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 elif _HAS_FLASH_ATTN:
                     self._cu_2[1] = q_len
                     cu = self._cu_2
+                    _fa_window = (
+                        (self.sliding_window - 1, 0)
+                        if self.sliding_window and self.sliding_window > 0
+                        else None
+                    )
                     out = flash_attn_varlen_func(
                         q=q_seq,
                         k=k_seq,
@@ -912,6 +963,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         max_seqlen_k=q_len,
                         softmax_scale=self.scale,
                         causal=True,
+                        **({"window_size": _fa_window} if _fa_window is not None else {}),
                     )
                 else:
                     q_t = q_seq.transpose(0, 1).contiguous()
@@ -957,6 +1009,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                                 max_query_len=1,
                                 max_seq_len=int(seq_len),
                                 sinks=self.sinks,
+                                sliding_window=self.sliding_window,
                             )
                         else:
                             out = self._fp4_g32_continuation_prefill(
@@ -1028,6 +1081,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                             norm_correction=self.tq_config.norm_correction,
                             PiT=PiT,
                             sinks=self.sinks,
+                            sliding_window=self.sliding_window,
                         )
                     elif _USE_TQ_V2:
                         # v2 kernel does not support sinks yet; sink plumbing
@@ -1181,6 +1235,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         k_cached = k_buf[:, :, :alloc_len, :]
         v_cached = v_buf[:, :, :alloc_len, :]
 
+
         # Opt#3 SoA layout constants (must match store-side computation).
         key_fp8 = self.tq_config.key_fp8
         key_data_bytes = D if key_fp8 else mse_bytes
@@ -1315,10 +1370,62 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         v_full[:cached_len] = v_cached_trim.to(qdtype)
         v_full[cached_len:] = val_chunk
 
+
         # Attention: q_len queries attending to seq_len K/V with causal mask
+        #
+        # Sinks gating: flash_attn on ROCm is locked to FA2 (TurboQuant
+        # incompatibility with FA3) and FA2 has no sinks parameter, so models
+        # like gpt-oss that fold a per-head sink logit into the softmax
+        # denominator can NOT go through flash_attn here — the resulting
+        # softmax overflows at long context and crashes downstream MoE.
+        # When sinks are present, route through the upstream Triton
+        # ``unified_attention`` kernel (same path used for first-chunk
+        # prefill above and by upstream RocmAttentionImpl); it natively
+        # supports sinks and handles cu_seqlens_q != cu_seqlens_k as a
+        # lower-right causal mask (q at absolute position cached_len+i
+        # attends K[0..cached_len+i]).
+        if self.sinks is not None:
+            out = torch.empty_like(query)
+            cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+            seqused_k = torch.tensor([seq_len], dtype=torch.int32, device=device)
+            # Single virtual block of size seq_len: unified_attention reads
+            # block_size dynamically from v.shape[1], so wrapping the
+            # contiguous k_full/v_full as [1, seq_len, Hk, D] with a 1-entry
+            # block_table works without paging logic.
+            block_table_single = torch.zeros((1, 1), dtype=torch.int32, device=device)
+            _win = (
+                (self.sliding_window - 1, 0)
+                if self.sliding_window and self.sliding_window > 0
+                else (-1, -1)
+            )
+            unified_attention(
+                q=query,
+                k=k_full.unsqueeze(0),
+                v=v_full.unsqueeze(0),
+                out=out,
+                cu_seqlens_q=cu_q,
+                max_seqlen_q=q_len,
+                seqused_k=seqused_k,
+                max_seqlen_k=seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=_win,
+                block_table=block_table_single,
+                softcap=0.0,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                sinks=self.sinks,
+            )
+            return out
         if _HAS_FLASH_ATTN:
             cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
             cu_seqlens_k = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
+            _fa_window = (
+                (self.sliding_window - 1, 0)
+                if self.sliding_window and self.sliding_window > 0
+                else None
+            )
             _fa_out = flash_attn_varlen_func(
                 q=query,
                 k=k_full,
@@ -1329,6 +1436,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=seq_len,
                 softmax_scale=self.scale,
                 causal=True,
+                **({"window_size": _fa_window} if _fa_window is not None else {}),
             )
             return _fa_out
         else:
@@ -1466,9 +1574,54 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # 6. Flash attention with lower-right causal mask.
         # flash_attn_varlen_func with unequal Q/K lengths applies the correct
         # mask: Q[i] (absolute position cached_len+i) attends K[0..cached_len+i].
+        #
+        # Sinks gating (mirrors `_continuation_prefill`): FA2 on ROCm has no
+        # sinks parameter, so for gpt-oss-style sinks models we route through
+        # the Triton ``unified_attention`` kernel — same path upstream
+        # RocmAttentionImpl uses on ROCm for sinks. Q/K are already in
+        # Hadamard-rotated space (q_rot, k_full) so the dot products match
+        # the original-space attention scores.
+        if self.sinks is not None:
+            out = torch.empty_like(q_rot)
+            cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+            seqused_k = torch.tensor([seq_len], dtype=torch.int32, device=device)
+            # Wrap contiguous k_full/v_full as a single virtual block of
+            # size seq_len; unified_attention reads block_size dynamically
+            # from v.shape[1].
+            block_table_single = torch.zeros((1, 1), dtype=torch.int32, device=device)
+            _win = (
+                (self.sliding_window - 1, 0)
+                if self.sliding_window and self.sliding_window > 0
+                else (-1, -1)
+            )
+            unified_attention(
+                q=q_rot,
+                k=k_full.unsqueeze(0),
+                v=v_full.unsqueeze(0),
+                out=out,
+                cu_seqlens_q=cu_q,
+                max_seqlen_q=q_len,
+                seqused_k=seqused_k,
+                max_seqlen_k=seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=_win,
+                block_table=block_table_single,
+                softcap=0.0,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                sinks=self.sinks,
+            )
+            return out.to(qdtype)
         if _HAS_FLASH_ATTN:
             cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
             cu_k = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+            _fa_window = (
+                (self.sliding_window - 1, 0)
+                if self.sliding_window and self.sliding_window > 0
+                else None
+            )
             out = flash_attn_varlen_func(
                 q=q_rot,
                 k=k_full,
@@ -1479,6 +1632,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=seq_len,
                 softmax_scale=self.scale,
                 causal=True,
+                **({"window_size": _fa_window} if _fa_window is not None else {}),
             )
         else:
             kv_group = Hq // Hk
@@ -1542,7 +1696,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     dtype=attn_metadata.seq_lens.dtype,
                     device=query.device,
                 )
-                return _fp4_g32_unified(
+                _fp4_result = _fp4_g32_unified(
                     query=query,
                     kv_cache=kv_cache,
                     block_table=attn_metadata.block_table,
@@ -1553,8 +1707,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     max_query_len=1,
                     max_seq_len=int(attn_metadata.max_seq_len),
                     sinks=self.sinks,
+                    sliding_window=self.sliding_window,
                     output=output_buf[:B] if output_buf is not None else None,
                 )
+                return _fp4_result
 
             _, _fp4_g32_decode, _ = _lazy_fp4_g32_imports()
             return _fp4_g32_decode(
@@ -1602,6 +1758,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 and self.head_size == 128
                 and v4_gqa_ok
                 and self.sinks is None
+                # SWA layers must route to V3 unified — V4 has no
+                # tile-pruning / per-tile SWA mask path, so it would
+                # silently produce wrong outputs at long context for
+                # gpt-oss-style hybrid SWA / full-attention models.
+                and not (self.sliding_window and self.sliding_window > 0)
             )
             if v4_eligible:
                 result = flydsl_turboquant_decode_attention_v4(
@@ -1662,6 +1823,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     buf_holder=layer,
                     max_num_kv_splits=self.max_num_kv_splits,
                     sinks=self.sinks,
+                    sliding_window=self.sliding_window,
                 )
         elif _USE_TQ_V3:
             result = triton_turboquant_decode_attention_v3(
@@ -1686,6 +1848,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 buf_holder=layer,
                 max_num_kv_splits=self.max_num_kv_splits,
                 sinks=self.sinks,
+                sliding_window=self.sliding_window,
             )
         elif _USE_TQ_V2:
             # v2 kernel does not support sinks yet; sink plumbing lives on v1

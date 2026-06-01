@@ -74,16 +74,16 @@ def _fp4_g32_full_dequant_kv(
     Fp4_decode_ptr,       # [16] bf16 — FP4 bit-pattern → bf16 value table
     K_out_ptr,            # [B, Hk, max_seq, D] in out_dtype
     V_out_ptr,            # [B, Hk, max_seq, D] in out_dtype
-    stride_ko_b,
-    stride_ko_h,
-    stride_ko_s,
-    stride_vo_b,
-    stride_vo_h,
-    stride_vo_s,
-    stride_cache_block,
-    stride_cache_pos,
-    stride_cache_head,
-    stride_bt_b,
+    stride_ko_b: tl.int64,
+    stride_ko_h: tl.int64,
+    stride_ko_s: tl.int64,
+    stride_vo_b: tl.int64,
+    stride_vo_h: tl.int64,
+    stride_vo_s: tl.int64,
+    stride_cache_block: tl.int64,
+    stride_cache_pos: tl.int64,
+    stride_cache_head: tl.int64,
+    stride_bt_b: tl.int64,
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
@@ -291,17 +291,17 @@ def _fp4_g32_decode_stage1(
     Mid_o_ptr,            # [B, Hq, NUM_KV_SPLITS, HEAD_DIM+1] fp32
     Sink_ptr,             # [Hq] fp32 — sink logits (may be NULL)
     # Q stride
-    stride_qb, stride_qh,
+    stride_qb: tl.int64, stride_qh: tl.int64,
     # Cache strides (in bytes / uint8 elements)
-    stride_cache_block,
-    stride_cache_pos,
-    stride_cache_head,
+    stride_cache_block: tl.int64,
+    stride_cache_pos: tl.int64,
+    stride_cache_head: tl.int64,
     # Block table stride
-    stride_bt_b,
+    stride_bt_b: tl.int64,
     # mid_o strides
-    stride_mid_b,
-    stride_mid_h,
-    stride_mid_s,
+    stride_mid_b: tl.int64,
+    stride_mid_h: tl.int64,
+    stride_mid_s: tl.int64,
     # Constexpr dims
     NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
