@@ -343,6 +343,95 @@ python -m pytest tests/kernels/fp4_g32/test_e2e_parity.py -v
 
 ---
 
+### FP8-g32 (fp8_kv_g32)
+
+**FP4 E2M1 codes + UE8M0 (1-byte E8M0) per-group-of-32 scales.**
+Pure Triton, no FlyDSL or HIP dependency. Native scaled F8F6F4 MFMA on QK via
+`tl.dot_scaled` → `v_mfma_scale_f32_16x16x128_f8f6f4` on CDNA4 (gfx950/MI355X).
+
+Design notes:
+- Same FP4 E2M1 codes as fp4_g32, but scales are stored as **1-byte UE8M0** (power-of-2
+  only) instead of 2-byte fp16. Slot size: **136 bytes** per (token, head) vs 144 B in fp4_g32.
+- K path uses `tl.dot_scaled` directly: raw FP4 codes + raw E8M0 scale bytes consumed by
+  the native scaled MFMA without software dequant.
+- V path uses software FP4 LUT-decode → bf16 multiply by E8M0 scale → bf16 `tl.dot`.
+- K is Hadamard-rotated before quantization (same as TQ44 / fp4_g32).
+- Layout is **AoS** (codes + scales interleaved per slot). A SoA layout migration
+  (Path 4) is planned to match TQ44 V3's coalesced scale loads.
+
+#### Launch (canonical defaults — just set one env var)
+
+```bash
+HIP_VISIBLE_DEVICES=0,1 \
+VLLM_ROCM_USE_AITER=1 \
+HSA_NO_SCRATCH_RECLAIM=1 \
+VLLM_FP8_G32_V3=1 \
+    python -m vllm.entrypoints.openai.api_server \
+        --model /shareddata/Qwen/Qwen2.5-72B-Instruct \
+        --port 9421 \
+        --tensor-parallel-size 2 \
+        --gpu-memory-utilization 0.85 \
+        --max-model-len 9472 \
+        --kv-cache-dtype fp8_kv_g32 \
+        --block-size 32 \
+        --trust-remote-code \
+        --no-enable-prefix-caching \
+        --attention-backend ROCM_AITER_UNIFIED_ATTN \
+        --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+```
+
+`VLLM_FP8_G32_V3=1` is the only required env var. All other knobs default to the
+production-ready values below.
+
+#### Accuracy A/B vs TQ44 V3 (LCB-128K, ~30 min, needs 4 GPUs)
+
+```bash
+bash benchmarks/lcb_qwen72b_128k_tq44_vs_fp8.sh
+```
+
+Runs TQ44 V3 and fp8_g32 V3 in parallel on separate GPU pairs (GPUs 0,1 vs 2,3
+by default). Prints accuracy side by side at the end.
+
+#### Throughput A/B vs TQ44 V3 (ISL=8192, OSL=1024, C=64, ~15 min, needs 4 GPUs)
+
+```bash
+python tmp_perf_qwen72b_8k1k_c64.py
+```
+
+Reports OutTPS / TPOT / TTFT / ITL side by side for TQ44 V3 vs fp8_g32 V3.
+
+#### Tuning knobs
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `VLLM_FP8_G32_V3` | `0` | Enable the V3 unified kernel (set to `1`) |
+| `VLLM_FP8_G32_V3_DOT_KIND` | `dot_scaled` | QK path: `dot_scaled` (native scaled F8F6F4 MFMA, recommended) or `fp8mfma` (software dequant to FP8 + plain dot) |
+| `VLLM_FP8_G32_NUM_KV_SPLITS` | `16` | 3D split-KV parallelism. Matches TQ44 V3 default; ~36 tile iterations per CTA at 8K context |
+| `VLLM_FP8_G32_NUM_STAGES_3D` | `3` (HIP) / `2` (non-HIP) | Software pipeline depth for decode stage-1. 3 is +2.2% OutTPS vs 2 on Qwen-72B 8K C=64 |
+| `VLLM_FP8_G32_FUSE_Q_ROT` | `0` | Fuse Q@PiT rotation into kernel prologue. Wins at low batch; **regresses at C=64** on Qwen-72B. Opt-in only |
+| `VLLM_FP8_G32_V_BF16` | `0` | Keep V dequant multiply in bf16 (skip fp32 round-trip). Bit-exact (UE8M0 scales are exact pow2). Wash at C=64 serving |
+| `VLLM_FP8_G32_V_DOT_SCALED` | `0` | Use fp8×fp8 `dot_scaled` for PV (native scaled FP8 MFMA, 2× bf16 ceiling). **Forces TILE_SIZE=128 and NUM_STAGES_3D=1** — regresses at C=64 due to launch overhead. Opt-in only |
+| `VLLM_FP8_G32_AMD_HINTS` | `0` | Pass `waves_per_eu=2`, `matrix_instr_nonkdim=16`, `kpack=2` to the AMD Triton backend. Experimental per-workload tuning |
+| `VLLM_FP8_G32_ARCHB` | `0` | Use Arch B codebook (multiply E8M0 scale by constant `c`). Default is Arch A. Do not change without re-quantizing the model |
+
+#### What's faster, what's slower vs TQ44 V3
+
+| Dimension | fp8_g32 V3 | TQ44 V3 | Notes |
+|---|---|---|---|
+| Slot size | 136 B | 136 B | Same (fp8_g32 saves 8 B vs fp4_g32's 144 B) |
+| QK MFMA | native scaled F8F6F4 (K=128) | bf16 (K=32) | fp8_g32 has higher instruction throughput ceiling |
+| V MFMA | bf16 (K=32) | bf16 (K=32) | Same |
+| K-scale loads | **AoS** — 1 byte per group scattered per slot | **SoA** — contiguous per block | TQ44 V3 wins: ~25% vs ~3% L1 efficiency |
+| V-scale loads | **AoS** — scattered per slot | **SoA** — contiguous per block | TQ44 V3 wins: same reason |
+| Serving Qwen-72B 8K C=64 | similar or slightly slower | baseline | SoA metadata gap is the primary explanation |
+
+**Known next optimization (Path 4 — SoA scales):** migrate K/V scale storage from AoS to SoA
+per-block (same total bytes, same quantization, just reordered). Expected to close the
+remaining metadata-load gap vs TQ44 V3. Gated under `VLLM_FP8_G32_SOA_SCALES` (not yet
+implemented).
+
+---
+
 ## Part 3 — Full launch example (MiniMax-M2.5, FlyDSL v4 + butterfly, TP=2)
 
 ```bash
