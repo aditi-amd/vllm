@@ -35,6 +35,7 @@ from vllm.v1.attention.ops.fp8_g32.fp8_levels import (
     SORTED_TO_BITS,
     UE8M0_BIAS,
     get_constant_c,
+    is_arch_b,
     n_groups,
     ue8m0_decode,
     ue8m0_encode,
@@ -131,17 +132,34 @@ def _unpack_nibbles_last_dim(packed: torch.Tensor, out_dim: int) -> torch.Tensor
     return out
 
 
-def _ue8m0_snap_tensor(s_raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Snap a positive-scale tensor `s_raw` to nearest power of two and
-    return `(s_snapped_fp32, byte_uint8)`.
+def _ue8m0_snap_tensor(
+    s_raw: torch.Tensor, *, mode: str = "round",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Snap a positive-scale tensor `s_raw` to a power of two and return
+    ``(s_snapped_fp32, byte_uint8)``.
 
     Matches the kernel: zero / non-finite inputs map to byte=0 / value=0.0.
-    The exponent is computed via `floor(log2(s) + 0.5)` (round-half-up),
-    which matches Triton's `tl.floor(... + 0.5)` idiom.
+
+    ``mode``:
+        - ``"round"`` — Arch A. Round-half-up via ``floor(log2(s) + 0.5)``,
+          matching Triton's ``tl.floor(... + 0.5)`` idiom.
+        - ``"ceil"``  — Arch B. ``ceil(log2(s))`` — never makes
+          ``2^exp < s``, so the codebook's max codepoint
+          ``6c · 2^exp = 6c · pow2_ceil(absmax) ≥ 6c · absmax`` is enough
+          to cover any single sample's normalised magnitude (since
+          ``absmax / 2^exp ∈ (0.5, 1]`` and ``6c ≈ 0.936`` covers most of
+          the upper octave; a small intentional clip at the top is the
+          constOpt design).
     """
     is_zero = (s_raw <= 0) | ~torch.isfinite(s_raw)
     s_safe = torch.where(is_zero, torch.ones_like(s_raw), s_raw)
-    exp = torch.floor(torch.log2(s_safe) + 0.5).to(torch.int32)
+    log2_s = torch.log2(s_safe)
+    if mode == "ceil":
+        exp = torch.ceil(log2_s).to(torch.int32)
+    elif mode == "round":
+        exp = torch.floor(log2_s + 0.5).to(torch.int32)
+    else:
+        raise ValueError(f"_ue8m0_snap_tensor: unknown mode {mode!r}")
     # Clamp to UE8M0's representable exponent range (signed pre-bias).
     exp = torch.clamp(exp, min=-126, max=127)
     byte = (exp + UE8M0_BIAS).to(torch.int32)
@@ -159,14 +177,27 @@ class FP8G32Encoded:
     Shapes assume input shape `[..., D]`:
     - codes_packed: `[..., D // 2]` uint8 — 2 FP4 nibbles per byte
     - scale_bytes:  `[..., D // GROUP_SIZE]` uint8 — E8M0 byte per group
+    - arch_b: Architecture B flag. Determines how `scale_bytes` are
+      interpreted on dequant:
+          False → dequant = code · 2^(byte - 127)   (c is folded into byte)
+          True  → dequant = code · c · 2^(byte - 127)
+      and how the codes were computed at encode (different effective
+      divisor and different pow2 rounding rule). The two paths produce
+      different on-disk bytes for the same input; this flag must stay
+      attached to the encoded payload.
     """
 
     codes_packed: torch.Tensor   # uint8, [..., D//2]
     scale_bytes: torch.Tensor    # uint8, [..., D//GROUP_SIZE]
+    arch_b: bool = False
 
     @property
     def scales_fp32(self) -> torch.Tensor:
-        """Decode the E8M0 bytes back to fp32 (for dequant / inspection)."""
+        """Decode the E8M0 bytes back to fp32 (for dequant / inspection).
+
+        Note: this is the *raw* pow2 of the byte, **without** the Arch B
+        ``c`` factor. The dequant path applies ``c`` separately for Arch B.
+        """
         b = self.scale_bytes.to(torch.int32)
         exp = b - UE8M0_BIAS
         is_zero = b == 0
@@ -182,6 +213,7 @@ def fp8_g32_encode(
     *,
     rotate: bool = True,
     constant_c: float | None = None,
+    arch_b: bool | None = None,
 ) -> FP8G32Encoded:
     """Encode `x` (shape [..., D]) to FP4 codes + E8M0 per-group-of-32 scales.
 
@@ -189,13 +221,18 @@ def fp8_g32_encode(
     1. Optional Hadamard rotation: `x_rot = x @ H.T`
     2. Reshape to `[..., G, GROUP_SIZE]`.
     3. `absmax = max(|x_rot|)` per group.
-    4. `s_raw = c * absmax` (fp32); `s_snapped = 2^round(log2(s_raw))`,
-       stored as a single E8M0 byte. Zero-amax groups encode byte=0.
-    5. `sorted_idx = bucketize(x_rot / s_snapped, midpoints)` ∈ [0, 14].
+    4. Arch A (default): `s_raw = c · absmax`; `s_snapped = 2^round(log2(s_raw))`.
+       Arch B           : `s_snapped = 2^ceil(log2(absmax))`. Either way the
+                          stored byte is `exp + 127` and the codes are computed
+                          against the same FP4 grid by dividing the input by
+                          (Arch A: ``s_snapped``) or (Arch B: ``c · s_snapped``).
+                          Zero-amax groups encode byte=0.
+    5. `sorted_idx = bucketize(x_g / divisor, midpoints)` ∈ [0, 14].
     6. Remap sorted_idx → FP4 E2M1 bit pattern via SORTED_TO_BITS.
     7. Pack pairs of 4-bit codes into bytes.
 
-    Returns (codes_packed [..., D//2] uint8, scale_bytes [..., G] uint8).
+    Returns ``FP8G32Encoded`` with ``arch_b`` attached so the dequant path
+    can apply the right scale interpretation.
     """
     if x.shape[-1] % GROUP_SIZE != 0:
         raise ValueError(
@@ -205,6 +242,7 @@ def fp8_g32_encode(
     D = x.shape[-1]
     G = D // GROUP_SIZE
     c = constant_c if constant_c is not None else get_constant_c()
+    use_arch_b = is_arch_b() if arch_b is None else bool(arch_b)
 
     x_f32 = x.to(torch.float32)
     if rotate:
@@ -215,11 +253,26 @@ def fp8_g32_encode(
 
     x_g = x_rot.reshape(*x.shape[:-1], G, GROUP_SIZE)
     absmax = x_g.abs().amax(dim=-1, keepdim=True)   # [..., G, 1]
-    s_raw = absmax * c                              # [..., G, 1]
-    s_snapped, scale_bytes = _ue8m0_snap_tensor(s_raw.squeeze(-1))
+    if use_arch_b:
+        # Arch B: pow2_ceil of absmax (no c folded in the snap).
+        s_snapped, scale_bytes = _ue8m0_snap_tensor(
+            absmax.squeeze(-1), mode="ceil",
+        )
+    else:
+        # Arch A: pow2_round of (c · absmax).
+        s_raw = absmax * c                          # [..., G, 1]
+        s_snapped, scale_bytes = _ue8m0_snap_tensor(
+            s_raw.squeeze(-1), mode="round",
+        )
     s_snapped = s_snapped.unsqueeze(-1)             # [..., G, 1]
+    # The divisor that puts inputs onto the raw FP4 grid bucketization.
+    # Arch A: divisor = s_A (c already folded). Arch B: divisor = c · s_B.
+    if use_arch_b:
+        divisor = s_snapped * c
+    else:
+        divisor = s_snapped
     s_for_div = torch.where(
-        s_snapped == 0, torch.ones_like(s_snapped), s_snapped
+        s_snapped == 0, torch.ones_like(divisor), divisor
     )
 
     sorted_idx = _snap_to_sorted_idx(x_g / s_for_div)
@@ -234,12 +287,26 @@ def fp8_g32_encode(
     fp4_bits_flat = fp4_bits.reshape(*x.shape[:-1], D)
     codes_packed = _pack_nibbles_last_dim(fp4_bits_flat)             # [..., D//2]
 
-    return FP8G32Encoded(codes_packed=codes_packed, scale_bytes=scale_bytes)
+    return FP8G32Encoded(
+        codes_packed=codes_packed,
+        scale_bytes=scale_bytes,
+        arch_b=use_arch_b,
+    )
 
 
-def fp8_g32_dequant(encoded: FP8G32Encoded, head_dim: int) -> torch.Tensor:
+def fp8_g32_dequant(
+    encoded: FP8G32Encoded,
+    head_dim: int,
+    *,
+    constant_c: float | None = None,
+) -> torch.Tensor:
     """Decode `encoded` to fp32 (no inverse rotation — result in the
-    rotated basis if rotation was applied at encode)."""
+    rotated basis if rotation was applied at encode).
+
+    For Arch B the per-group scale is multiplied by ``c`` post-decode
+    (``dequant = code · c · 2^(byte - 127)``); for Arch A the byte
+    already includes ``c`` (``dequant = code · 2^(byte - 127)``).
+    """
     G = head_dim // GROUP_SIZE
     codes = _unpack_nibbles_last_dim(encoded.codes_packed, head_dim)
     bits_to_val = torch.tensor(
@@ -251,6 +318,9 @@ def fp8_g32_dequant(encoded: FP8G32Encoded, head_dim: int) -> torch.Tensor:
     decoded = bits_to_val[codes.to(torch.long)]                       # [..., D] fp32
     decoded_g = decoded.reshape(*decoded.shape[:-1], G, GROUP_SIZE)
     scales = encoded.scales_fp32.unsqueeze(-1)                        # [..., G, 1]
+    if encoded.arch_b:
+        c = constant_c if constant_c is not None else get_constant_c()
+        scales = scales * c
     return (decoded_g * scales).reshape(*decoded.shape[:-1], head_dim)
 
 
@@ -259,10 +329,13 @@ def fp8_g32_encode_decode(
     *,
     rotate: bool = True,
     constant_c: float | None = None,
+    arch_b: bool | None = None,
 ) -> torch.Tensor:
     """Full encode→decode round-trip in the rotated basis. Returns fp32."""
-    enc = fp8_g32_encode(x, rotate=rotate, constant_c=constant_c)
-    return fp8_g32_dequant(enc, x.shape[-1])
+    enc = fp8_g32_encode(
+        x, rotate=rotate, constant_c=constant_c, arch_b=arch_b,
+    )
+    return fp8_g32_dequant(enc, x.shape[-1], constant_c=constant_c)
 
 
 # ── Reference attention against the fp8_g32 encoded cache ──────────────────
@@ -274,6 +347,7 @@ def reference_fp8_g32_attention(
     scale: float,
     sinks: torch.Tensor | None = None,
     constant_c: float | None = None,
+    arch_b: bool | None = None,
 ) -> torch.Tensor:
     """End-to-end reference attention with fp8_g32 K/V encode→decode in
     the rotated basis. Q is Hadamard-rotated AND cast through FP8 E4M3
@@ -299,11 +373,13 @@ def reference_fp8_g32_attention(
         key.transpose(1, 2).contiguous(),
         rotate=True,
         constant_c=constant_c,
+        arch_b=arch_b,
     )
     v_recon = fp8_g32_encode_decode(
         value.transpose(1, 2).contiguous(),
         rotate=False,
         constant_c=constant_c,
+        arch_b=arch_b,
     )
 
     k_recon_rot = k_recon_rot.unsqueeze(2).expand(B, Hk, g, N, D).reshape(B, Hq, N, D)

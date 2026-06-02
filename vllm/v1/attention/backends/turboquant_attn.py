@@ -89,6 +89,21 @@ def _lazy_fp8_g32_imports():
     return fp8_g32_store, fp8_g32_decode_attention, fp8_g32_full_dequant_kv
 
 
+def _lazy_fp8_g32_v3_import():
+    """Lazy import for FP8-g32 V3 unified attention kernel.
+
+    Mirrors `_lazy_fp4_g32_v3_import`. Returns the launcher
+    ``fp8_g32_unified_attention``. This kernel uses AMD CDNA4's hardware
+    scaled F8F6F4 MFMA via ``tl.dot_scaled`` for QK (FP8 E4M3 query × FP4
+    E2M1 keys with E8M0 per-group-32 scales). PV stays bf16 ``tl.dot``
+    because our V scale axis doesn't match microscaling rhs layout.
+    """
+    from vllm.v1.attention.ops.fp8_g32.triton_unified_attention import (
+        fp8_g32_unified_attention,
+    )
+    return fp8_g32_unified_attention
+
+
 def _fp4_get_layer_dequant_bufs(
     layer: Any,
     Hk: int,
@@ -166,6 +181,14 @@ _USE_TQ_SOA_FUSION = os.environ.get("VLLM_TQ_SOA_FUSION", "0") == "1"
 # split-KV dispatch, fused Q rotation, main/tail split). When unset, the
 # FP4 path keeps the legacy v1-based decode + dequant-and-flash_attn path.
 _USE_FP4_G32_V3 = os.environ.get("VLLM_FP4_G32_V3", "0") == "1"
+# Opt-in flag for the v3-based FP8-g32 unified attention kernel. When set,
+# the FP8 path routes both decode and small-continuation-prefill through
+# `fp8_g32_unified_attention` (`triton_unified_attention.py`), which lowers
+# QK to AMD CDNA4's hardware scaled F8F6F4 MFMA via `tl.dot_scaled`
+# (FP8 E4M3 × FP4 E2M1 with E8M0 per-group-32 scales). PV stays bf16
+# `tl.dot` (same path as fp4_g32 V3). When unset, the FP8 path keeps the
+# legacy v1-based decode + dequant-and-flash_attn path.
+_USE_FP8_G32_V3 = os.environ.get("VLLM_FP8_G32_V3", "0") == "1"
 if _USE_TQ_V4 and not _flydsl_v4_available():
     logger.warning(
         "VLLM_TQ_DECODE_V4 requested but FlyDSL is unavailable; "
@@ -178,10 +201,11 @@ if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
 logger.info_once(
-    "TurboQuant has flash attn: %s, decode kernel: %s, fp4_g32_v3: %s",
+    "TurboQuant has flash attn: %s, decode kernel: %s, fp4_g32_v3: %s, fp8_g32_v3: %s",
     _HAS_FLASH_ATTN,
     "v4(flydsl)" if _USE_TQ_V4 else "v3" if _USE_TQ_V3 else "v2" if _USE_TQ_V2 else "v1",
     _USE_FP4_G32_V3,
+    _USE_FP8_G32_V3,
 )
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
@@ -595,21 +619,37 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             layer._tq_cached = True
 
     def _max_capture_batch_size(self) -> int:
-        """Return the largest batch size that will be captured in CUDA graphs.
+        """Return the largest batch size we might see at runtime decode.
 
         Used to pre-warm the WorkspaceManager before capture begins so that
-        workspace growth cannot happen mid-capture and invalidate baked-in ptrs.
-        Falls back to a generous heuristic (512) if config is unavailable.
+        workspace growth cannot happen mid-capture (invalidating baked-in
+        pointers) NOR after capture lock (assertion in
+        _ensure_workspace_size).
+
+        We must take max(cudagraph_capture_sizes, scheduler.max_num_seqs):
+        when a forward pass exceeds the largest captured graph size, vllm
+        falls back to the eager path — but the workspace is still locked
+        and that eager path can hit batch sizes up to max_num_seqs. Without
+        this max, lm-eval-style continuous batching that pushes B past 512
+        triggers the post-capture-lock assertion.
+
+        Falls back to a generous heuristic (1024) if config is unavailable.
         """
         try:
             from vllm.v1.utils import get_current_vllm_config as _gcvc
             cfg = _gcvc()
+            candidates: list[int] = []
             sizes = cfg.compilation_config.cudagraph_capture_sizes
             if sizes:
-                return int(max(sizes))
+                candidates.append(int(max(sizes)))
+            sched = getattr(cfg, "scheduler_config", None)
+            if sched is not None and getattr(sched, "max_num_seqs", None):
+                candidates.append(int(sched.max_num_seqs))
+            if candidates:
+                return max(candidates)
         except Exception:
             pass
-        return 512
+        return 1024
 
     def do_kv_cache_update(
         self,
@@ -1025,12 +1065,37 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]
                 synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
                 if self._is_fp8_g32:
-                    # fp8_g32: small continuation routes to the new decode
-                    # kernel; large continuation routes to the shared
-                    # `_fp4_g32_continuation_prefill` helper which auto-
-                    # dispatches the fp8 dequant kernel via `_is_fp8_g32`.
-                    _, _fp8_decode, _ = _lazy_fp8_g32_imports()
-                    if q_len <= _CONTINUATION_DECODE_THRESHOLD:
+                    # fp8_g32 continuation prefill:
+                    # - V3 + small chunk (≤128): route to the new V3 unified
+                    #   attention kernel (scaled F8F6F4 MFMA QK + bf16 PV),
+                    #   mirroring fp4_g32 V3.
+                    # - V1 + small chunk (≤128): route to the legacy v1-style
+                    #   stage1 decode kernel.
+                    # - Any large chunk (>128): route to the shared dequant +
+                    #   flash_attn path (`_fp4_g32_continuation_prefill`),
+                    #   which auto-dispatches the fp8 dequant kernel via
+                    #   `_is_fp8_g32`.
+                    if (
+                        _USE_FP8_G32_V3
+                        and q_len <= _CONTINUATION_DECODE_THRESHOLD
+                    ):
+                        _fp8_g32_unified = _lazy_fp8_g32_v3_import()
+                        cu_q = _arange_cache[: q_len + 1].to(torch.int32)
+                        out = _fp8_g32_unified(
+                            query=q_seq,
+                            kv_cache=kv_cache,
+                            block_table=synth_bt,
+                            seq_lens=synth_seq_lens,
+                            query_start_loc=cu_q,
+                            scale=self.scale,
+                            PiT=PiT,
+                            max_query_len=1,
+                            max_seq_len=int(seq_len),
+                            sinks=self.sinks,
+                            sliding_window=self.sliding_window,
+                        )
+                    elif q_len <= _CONTINUATION_DECODE_THRESHOLD:
+                        _, _fp8_decode, _ = _lazy_fp8_g32_imports()
                         out = _fp8_decode(
                             query=q_seq,
                             kv_cache=kv_cache,
@@ -1800,10 +1865,36 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
 
         if self._is_fp8_g32:
-            # fp8_g32 mirrors fp4_g32 V1 control flow: stage-1 split-KV
-            # decode kernel + stage-2 reduce (reused fp4_g32 stage-2).
-            # No V3 unified kernel yet — tl.dot_scaled E8M0 dispatch will
-            # land in a follow-up commit.
+            if _USE_FP8_G32_V3:
+                # v3-based unified decode: hardware F8F6F4 scaled MFMA on QK
+                # via tl.dot_scaled (FP8 E4M3 × FP4 E2M1 + E8M0 scales) +
+                # bf16 tl.dot on PV. GQA stacking + 2D/3D split-KV dispatch.
+                # Bit-similar to v1 decode in ops tests (cos_sim ≥ 0.999998
+                # vs v1, ≥ 0.99998 vs reference). Mirrors fp4_g32 V3
+                # dispatch pattern.
+                _fp8_g32_unified = _lazy_fp8_g32_v3_import()
+                cu_q = torch.arange(
+                    B + 1,
+                    dtype=attn_metadata.seq_lens.dtype,
+                    device=query.device,
+                )
+                _fp8_result = _fp8_g32_unified(
+                    query=query,
+                    kv_cache=kv_cache,
+                    block_table=attn_metadata.block_table,
+                    seq_lens=attn_metadata.seq_lens,
+                    query_start_loc=cu_q,
+                    scale=self.scale,
+                    PiT=PiT,
+                    max_query_len=1,
+                    max_seq_len=int(attn_metadata.max_seq_len),
+                    sinks=self.sinks,
+                    sliding_window=self.sliding_window,
+                    output=output_buf[:B] if output_buf is not None else None,
+                )
+                return _fp8_result
+
+            # Legacy v1-based decode + (reused fp4_g32) stage-2 reduce.
             _, _fp8_decode, _ = _lazy_fp8_g32_imports()
             return _fp8_decode(
                 query=query,

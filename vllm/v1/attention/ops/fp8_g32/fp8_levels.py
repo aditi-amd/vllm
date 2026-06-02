@@ -130,6 +130,39 @@ def get_token_norm() -> bool:
     return False
 
 
+# ── Architecture B opt-in (`c` baked into codebook, CEIL pow2 scale) ──────
+# Arch A (default): per-block scale `s_A = pow2_round(c · absmax)` stored
+#   as the E8M0 byte; codebook is the raw FP4 grid {0, ±0.5, ..., ±6};
+#   dequant = code · s_A. The constant `c` is folded into the scale and
+#   the post-snap effective `c` drifts within an octave of [c, 2c].
+#
+# Arch B (opt-in via VLLM_FP8_G32_ARCHB=1): per-block scale
+#   `s_B = pow2_ceil(absmax)` stored as the E8M0 byte (no `c` factor in
+#   the snap); codebook is `c · FP4_LEVELS` (the 15 codepoints
+#   {0, ±0.5c, ±c, ±1.5c, ±2c, ±3c, ±4c, ±6c}); dequant = code · c · s_B.
+#   Effective `c` is exactly `c` for every block — eliminates the
+#   per-block c-drift of Arch A. CEIL guarantees `M / s_B ∈ (0.5, 1]` so
+#   the codebook's outer codepoint `±6c ≈ ±0.94` never hard-clips the
+#   absmax sample (mild snap-to-±6c at top of octave is the intentional
+#   constOpt clipping that buys finer inner-sample resolution).
+#
+# This is exactly the `constOpt_LUT_noVRot_noNormfold_native` recipe from
+# `benchmarks/Algorithm walkthrough fp4fp16_g32_c.md`; CEIL + c-in-codebook
+# are co-designed and treated as one indivisible knob here. We read the
+# env at module-load time so the value is stable across the process
+# lifetime (Triton constexpr caching depends on this).
+_ARCH_B = os.environ.get("VLLM_FP8_G32_ARCHB", "0") == "1"
+
+
+def is_arch_b() -> bool:
+    """Return True if Arch B (c-baked codebook + CEIL pow2 scale) is enabled.
+
+    Read once at module-load time; the env var is not consulted again.
+    Toggle by relaunching the process with `VLLM_FP8_G32_ARCHB=1`.
+    """
+    return _ARCH_B
+
+
 # ── UE8M0 helpers ──────────────────────────────────────────────────────────
 # E8M0 = 8 exponent bits, 0 mantissa bits, no sign. The byte value `e`
 # represents `2^(e - 127)` for e in [1, 254]. e=0 and e=255 are reserved

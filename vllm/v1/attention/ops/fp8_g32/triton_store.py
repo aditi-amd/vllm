@@ -50,6 +50,7 @@ from vllm.v1.attention.ops.fp8_g32.fp8_levels import (
     UE8M0_BIAS,
     get_constant_c,
     get_group_size,
+    is_arch_b,
     k_scales_offset,
     n_groups,
     slot_size,
@@ -134,6 +135,7 @@ def _fp8_g32_store_kernel(
     V_SCALES_OFFSET: tl.constexpr,
     FP4_C: tl.constexpr,
     UE8M0_BIAS_C: tl.constexpr,
+    ARCH_B_C: tl.constexpr,  # 0 = Arch A (c folded into byte), 1 = Arch B (c baked in codebook)
 ):
     pid = tl.program_id(0)
     token_idx = pid // H
@@ -175,23 +177,40 @@ def _fp8_g32_store_kernel(
     k_absmax = tl.max(tl.abs(k_g), axis=1)            # [N_GROUPS]
     k_is_zero = k_absmax == 0.0
 
-    # 3. UE8M0 snap of s = c * absmax. ── the one algorithmic delta vs fp4_g32 ──
-    #    s_raw = c * absmax (fp32)
-    #    s_snapped = 2^round(log2(s_raw))
-    #    byte = round(log2(s_raw)) + 127
-    # For zero groups byte=0 (zero sentinel) and the snapped value is 0.0;
-    # we substitute 1.0 into the divisor below to avoid NaN.
-    k_s_raw = k_absmax * tl.cast(FP4_C, tl.float32)
-    k_s_safe = tl.where(k_is_zero, 1.0, k_s_raw)
-    k_log2 = tl.log2(k_s_safe)
-    # `round` here matches Python/torch's banker's rounding at .5; for
-    # well-behaved log2 values the difference vs round-half-away-from-zero
-    # is irrelevant. tl.extra.libdevice.rint() is the float-truncating
-    # round-to-nearest-even; we replicate it via add-half + floor for
-    # portability.
-    k_exp = tl.cast(tl.floor(k_log2 + 0.5), tl.int32)  # round-half-up
-    k_s_snapped = tl.exp2(tl.cast(k_exp, tl.float32))
-    k_s_div = tl.where(k_is_zero, 1.0, k_s_snapped)
+    # 3. UE8M0 snap. Two recipes share the byte format (`byte = exp + 127`)
+    #    but differ in what `exp` is and what the encode divisor is:
+    #
+    #    Arch A (ARCH_B_C == 0): s_raw = c * absmax (fp32)
+    #                            exp = round(log2(s_raw))    (round-half-up)
+    #                            divisor = 2^exp             (c folded in)
+    #
+    #    Arch B (ARCH_B_C == 1): exp = ceil(log2(absmax))
+    #                            divisor = 2^exp * c         (c applied here so
+    #                                                         the bucketize is
+    #                                                         still against the
+    #                                                         raw FP4 midpoints)
+    #
+    #    For zero groups byte=0 (zero sentinel), snapped value is 0.0,
+    #    and we substitute 1.0 into the divisor below to avoid NaN.
+    if ARCH_B_C == 1:
+        k_s_safe = tl.where(k_is_zero, 1.0, k_absmax)
+        k_log2 = tl.log2(k_s_safe)
+        k_exp = tl.cast(tl.ceil(k_log2), tl.int32)
+        k_pow2 = tl.exp2(tl.cast(k_exp, tl.float32))
+        k_s_snapped = k_pow2
+        k_s_div = tl.where(k_is_zero, 1.0, k_pow2 * tl.cast(FP4_C, tl.float32))
+    else:
+        k_s_raw = k_absmax * tl.cast(FP4_C, tl.float32)
+        k_s_safe = tl.where(k_is_zero, 1.0, k_s_raw)
+        k_log2 = tl.log2(k_s_safe)
+        # `round` here matches Python/torch's banker's rounding at .5; for
+        # well-behaved log2 values the difference vs round-half-away-from-zero
+        # is irrelevant. tl.extra.libdevice.rint() is the float-truncating
+        # round-to-nearest-even; we replicate it via add-half + floor for
+        # portability.
+        k_exp = tl.cast(tl.floor(k_log2 + 0.5), tl.int32)  # round-half-up
+        k_s_snapped = tl.exp2(tl.cast(k_exp, tl.float32))
+        k_s_div = tl.where(k_is_zero, 1.0, k_s_snapped)
 
     # 4. Normalize + snap to sorted FP4 idx via 14 sequential tl.where (`>` for
     #    bucketize(right=False) parity with the reference).
@@ -227,12 +246,20 @@ def _fp8_g32_store_kernel(
     v_absmax = tl.max(tl.abs(v_g), axis=1)
     v_is_zero = v_absmax == 0.0
 
-    v_s_raw = v_absmax * tl.cast(FP4_C, tl.float32)
-    v_s_safe = tl.where(v_is_zero, 1.0, v_s_raw)
-    v_log2 = tl.log2(v_s_safe)
-    v_exp = tl.cast(tl.floor(v_log2 + 0.5), tl.int32)
-    v_s_snapped = tl.exp2(tl.cast(v_exp, tl.float32))
-    v_s_div = tl.where(v_is_zero, 1.0, v_s_snapped)
+    if ARCH_B_C == 1:
+        v_s_safe = tl.where(v_is_zero, 1.0, v_absmax)
+        v_log2 = tl.log2(v_s_safe)
+        v_exp = tl.cast(tl.ceil(v_log2), tl.int32)
+        v_pow2 = tl.exp2(tl.cast(v_exp, tl.float32))
+        v_s_snapped = v_pow2
+        v_s_div = tl.where(v_is_zero, 1.0, v_pow2 * tl.cast(FP4_C, tl.float32))
+    else:
+        v_s_raw = v_absmax * tl.cast(FP4_C, tl.float32)
+        v_s_safe = tl.where(v_is_zero, 1.0, v_s_raw)
+        v_log2 = tl.log2(v_s_safe)
+        v_exp = tl.cast(tl.floor(v_log2 + 0.5), tl.int32)
+        v_s_snapped = tl.exp2(tl.cast(v_exp, tl.float32))
+        v_s_div = tl.where(v_is_zero, 1.0, v_s_snapped)
 
     v_norm = v_g / v_s_div[:, None]
     v_sorted = tl.zeros([N_GROUPS_C, GROUP_SIZE_C], dtype=tl.int32)
@@ -315,6 +342,7 @@ def fp8_g32_store(
     stride_head = kv_cache.stride(2)
 
     c = constant_c if constant_c is not None else get_constant_c()
+    arch_b_c = 1 if is_arch_b() else 0
 
     grid = (NH,)
     _fp8_g32_store_kernel[grid](
@@ -339,6 +367,7 @@ def fp8_g32_store(
         V_SCALES_OFFSET=V_SCALES_OFFSET,
         FP4_C=c,
         UE8M0_BIAS_C=UE8M0_BIAS,
+        ARCH_B_C=arch_b_c,
         num_warps=4,
         num_stages=1,
     )
