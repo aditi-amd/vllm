@@ -163,6 +163,26 @@ def is_arch_b() -> bool:
     return _ARCH_B
 
 
+# ── SoA scale layout opt-in (Path 4) ──────────────────────────────────────
+# When enabled, the store and decode kernels place per-group K/V scales in a
+# contiguous per-block SoA region instead of interleaving them inside each
+# slot (see the `soa_*` offset helpers below). Read once at module-load time
+# so store and decode agree for the lifetime of the process and Triton's
+# constexpr caching stays stable. The KV cache is process-local, so a cache
+# can never be written under one layout and read under another across runs.
+_SOA_SCALES = os.environ.get("VLLM_FP8_G32_SOA_SCALES", "0") == "1"
+
+
+def fp8_g32_soa_scales_enabled() -> bool:
+    """Return True if the SoA per-block scale layout is enabled.
+
+    Read once at module-load time; toggle by relaunching the process with
+    `VLLM_FP8_G32_SOA_SCALES=1`. Both the store kernel and the decode kernel
+    consult this same flag, so within a process they always agree.
+    """
+    return _SOA_SCALES
+
+
 # ── UE8M0 helpers ──────────────────────────────────────────────────────────
 # E8M0 = 8 exponent bits, 0 mantissa bits, no sign. The byte value `e`
 # represents `2^(e - 127)` for e in [1, 254]. e=0 and e=255 are reserved
@@ -276,3 +296,72 @@ def k_norm_offset(head_dim: int, group_size: int | None = None) -> int:
 
 def v_norm_offset(head_dim: int, group_size: int | None = None) -> int:
     return 0
+
+
+# ── SoA (Structure-of-Arrays) per-block layout (Path 4) ────────────────────
+# The default AoS layout above interleaves codes + scales inside each 136-byte
+# slot, so a decode tile of T tokens must issue T scattered byte loads to
+# gather the per-group scales (one per slot, slots are `num_heads * slot_size`
+# bytes apart). TQ44 V3 avoids this by pulling its per-token metadata into a
+# contiguous per-block region; the fp8_g32 SoA layout does the same.
+#
+# We keep the EXACT SAME cache allocation
+# (`[num_blocks, block_size, num_heads, padded_slot]`) and the same total
+# content bytes per block, but reinterpret each block as head-major,
+# field-major:
+#
+#   per-block budget  = block_size * num_heads * padded_slot   (allocation)
+#   per-head stride   = block_size * slot_size                 (content)
+#   for head h, base = h * (block_size * slot_size):
+#     [base + 0                                 ] K codes  : block_size × (D/2)   AoS
+#     [base + block_size*(D/2)                  ] K scales : block_size × Gk       SoA
+#     [base + block_size*(D/2 + Gk)             ] V codes  : block_size × (D/2)   AoS
+#     [base + block_size*(D + Gk)               ] V scales : block_size × Gk       SoA
+#
+# Within each SoA scale region, token t's group g is at `region + t*Gk + g`, so
+# the scales for an aligned tile [t0, t0+T) occupy the contiguous byte range
+# [region + t0*Gk, region + (t0+T)*Gk) → a single coalesced load.
+#
+# The content footprint per head is `block_size * slot_size`, identical to the
+# AoS footprint, so this always fits inside the allocated per-block budget
+# (which uses `padded_slot >= slot_size`). The store and decode kernels MUST
+# agree on which layout is active; `VLLM_FP8_G32_SOA_SCALES=1` selects SoA and
+# the backend stamps a consistency check so a mixed store/decode fails loudly.
+
+
+def soa_head_stride(head_dim: int, block_size: int,
+                    group_size: int | None = None) -> int:
+    """Content bytes per head within one block (block_size slots' worth)."""
+    return block_size * slot_size(head_dim, group_size)
+
+
+def soa_block_content_bytes(head_dim: int, block_size: int, num_heads: int,
+                            group_size: int | None = None) -> int:
+    """Total content bytes per block for the SoA layout (all heads)."""
+    return num_heads * soa_head_stride(head_dim, block_size, group_size)
+
+
+def soa_k_codes_region(head_dim: int, block_size: int,
+                       group_size: int | None = None) -> int:
+    """Byte offset (relative to a head's SoA base) of the K-codes region."""
+    return 0
+
+
+def soa_k_scales_region(head_dim: int, block_size: int,
+                        group_size: int | None = None) -> int:
+    """Byte offset (relative to head base) of the contiguous K-scale region."""
+    return block_size * k_codes_bytes(head_dim)
+
+
+def soa_v_codes_region(head_dim: int, block_size: int,
+                       group_size: int | None = None) -> int:
+    """Byte offset (relative to head base) of the V-codes region."""
+    return soa_k_scales_region(head_dim, block_size, group_size) \
+        + block_size * k_scales_bytes(head_dim, group_size)
+
+
+def soa_v_scales_region(head_dim: int, block_size: int,
+                        group_size: int | None = None) -> int:
+    """Byte offset (relative to head base) of the contiguous V-scale region."""
+    return soa_v_codes_region(head_dim, block_size, group_size) \
+        + block_size * v_codes_bytes(head_dim)

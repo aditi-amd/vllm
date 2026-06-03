@@ -354,7 +354,11 @@ Design notes:
   only) instead of 2-byte fp16. Slot size: **136 bytes** per (token, head) vs 144 B in fp4_g32.
 - K path uses `tl.dot_scaled` directly: raw FP4 codes + raw E8M0 scale bytes consumed by
   the native scaled MFMA without software dequant.
-- V path uses software FP4 LUT-decode → bf16 multiply by E8M0 scale → bf16 `tl.dot`.
+- V path uses **arithmetic FP4 decode** (default) → bf16 multiply by E8M0 scale → bf16 `tl.dot`.
+  Arithmetic decode reconstructs each FP4 E2M1 value from its 4-bit code using integer ALU
+  bit-assembly (`sign × 2^exp × mantissa`) instead of a 16-entry LUT gather, eliminating the
+  costly per-element vector fetch. Controlled by `VLLM_FP8_G32_V_ARITH` (default `1` = ON).
+  Bit-identical to the LUT path; verified across all 16 FP4 codes.
 - K is Hadamard-rotated before quantization (same as TQ44 / fp4_g32).
 - Layout is **AoS** (codes + scales interleaved per slot). A SoA layout migration
   (Path 4) is planned to match TQ44 V3's coalesced scale loads.
@@ -412,6 +416,8 @@ Reports OutTPS / TPOT / TTFT / ITL side by side for TQ44 V3 vs fp8_g32 V3.
 | `VLLM_FP8_G32_V_BF16` | `0` | Keep V dequant multiply in bf16 (skip fp32 round-trip). Bit-exact (UE8M0 scales are exact pow2). Wash at C=64 serving |
 | `VLLM_FP8_G32_V_DOT_SCALED` | `0` | Use fp8×fp8 `dot_scaled` for PV (native scaled FP8 MFMA, 2× bf16 ceiling). **Forces TILE_SIZE=128 and NUM_STAGES_3D=1** — regresses at C=64 due to launch overhead. Opt-in only |
 | `VLLM_FP8_G32_AMD_HINTS` | `0` | Pass `waves_per_eu=2`, `matrix_instr_nonkdim=16`, `kpack=2` to the AMD Triton backend. Experimental per-workload tuning |
+| `VLLM_FP8_G32_SOA_SCALES` | `0` | **Path 4 (SoA scales).** Store per-group K/V scales in a contiguous per-block region instead of interleaved per-slot. Collapses the per-tile scattered scale loads into one coalesced load (mirrors TQ44 V3). Bit-identical (same codes/scales, only byte placement changes). Store + both decode kernels read the same module-load flag, so they always agree within a process. Default OFF pending the serving A/B vs TQ44 V3. Targets the main remaining decode gap vs TQ44 V3 |
+| `VLLM_FP8_G32_V_ARITH` | **`1` (ON by default)** | Arithmetic FP4 V-decode: reconstructs each FP4 E2M1 code via integer ALU bit-assembly instead of a 16-entry LUT gather. Reduces VFetchInsts by ~48% on the decode kernel (1272 → 662). Bit-identical to the LUT path across all 16 codes. Set to `0` to fall back to LUT gather (debugging only) |
 | `VLLM_FP8_G32_ARCHB` | `0` | Use Arch B codebook (multiply E8M0 scale by constant `c`). Default is Arch A. Do not change without re-quantizing the model |
 
 #### What's faster, what's slower vs TQ44 V3
@@ -421,14 +427,40 @@ Reports OutTPS / TPOT / TTFT / ITL side by side for TQ44 V3 vs fp8_g32 V3.
 | Slot size | 136 B | 136 B | Same (fp8_g32 saves 8 B vs fp4_g32's 144 B) |
 | QK MFMA | native scaled F8F6F4 (K=128) | bf16 (K=32) | fp8_g32 has higher instruction throughput ceiling |
 | V MFMA | bf16 (K=32) | bf16 (K=32) | Same |
+| V decode | **arithmetic** (default, `V_ARITH=1`) — integer ALU bit-assembly, no LUT gather | affine `idx*scale+zero` (irreducible) | fp8_g32 wins: ~48% fewer VFetchInsts |
 | K-scale loads | **AoS** — 1 byte per group scattered per slot | **SoA** — contiguous per block | TQ44 V3 wins: ~25% vs ~3% L1 efficiency |
 | V-scale loads | **AoS** — scattered per slot | **SoA** — contiguous per block | TQ44 V3 wins: same reason |
-| Serving Qwen-72B 8K C=64 | similar or slightly slower | baseline | SoA metadata gap is the primary explanation |
+| Serving Qwen-72B 8K C=64 | **+0.7% OutTPS** (511.9 vs 508.5) | baseline | V_ARITH flipped the delta: −0.6% → +0.7% |
 
-**Known next optimization (Path 4 — SoA scales):** migrate K/V scale storage from AoS to SoA
-per-block (same total bytes, same quantization, just reordered). Expected to close the
-remaining metadata-load gap vs TQ44 V3. Gated under `VLLM_FP8_G32_SOA_SCALES` (not yet
-implemented).
+**Serving benchmark results (Qwen2.5-72B, ISL=8K, OSL=1K, C=64, TP=2, MI355X):**
+
+| Kernel | OutTPS | vs TQ44 V3 |
+|---|---|---|
+| TQ44 V3 optimized | 508.5 | baseline |
+| fp8_g32 V3 (V_ARITH=OFF) | 504.0 | −0.9% |
+| **fp8_g32 V3 (V_ARITH=ON, default)** | **511.9** | **+0.7% ✅** |
+
+V_ARITH is the decisive optimization: replacing the per-element LUT gather in the V decode path
+with integer ALU bit-assembly reduces VFetchInsts by ~48% (1272 → 662), a ~5.5% kernel
+speedup, flipping fp8_g32 from slightly behind to slightly ahead of the optimized TQ44 V3
+Triton kernel at serving concurrency (C=64).
+
+**LCB-128K accuracy (Qwen2.5-72B and MiniMax-M2.5, MI355X x2, TP=2):**
+
+| Model | TQ44 V3 optimized | fp8_g32 V3 (V_ARITH=ON) | Δ |
+|---|---|---|---|
+| Qwen2.5-72B | 56.52% strict | 57.61% strict | +1.1 pp |
+| MiniMax-M2.5 | 64.13% strict | **68.48%** strict | **+4.4 pp** |
+
+The MiniMax accuracy advantage is a quantization quality difference: fp8_g32's UE8M0
+per-group-of-32 scales adapt better to MiniMax's attention value distributions than TQ44's
+learned 4-bit codebook. V_ARITH itself is bit-identical to the LUT path and does not affect
+accuracy.
+
+**Note — SoA scales (Path 4):** `VLLM_FP8_G32_SOA_SCALES` migrates K/V scale byte placement
+from AoS to SoA. Implemented, validated bit-identical, but a wash at C=64 serving — after
+V_ARITH the bottleneck shifted away from scale loads. Available as opt-in; not recommended
+for production.
 
 ---
 

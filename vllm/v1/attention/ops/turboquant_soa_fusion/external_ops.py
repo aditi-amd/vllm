@@ -819,4 +819,16 @@ def triton_turboquant_decode_attention_v3(*args, **kwargs):
     hip_out = _maybe_hip_v3_scalar_decode(*args, **kwargs)
     if hip_out is not None:
         return hip_out
+    # Triton fallback: the Triton v3 launcher doesn't accept the HIP-only
+    # `signs` kwarg (WHT-butterfly q-rotation, implemented only in the HIP
+    # decode kernels). Drop it when unused; if a butterfly was actually
+    # requested, fail loudly rather than silently skipping the rotation.
+    if "signs" in kwargs:
+        if kwargs["signs"] is not None:
+            raise NotImplementedError(
+                "WHT-butterfly q-rotation (signs) requires the HIP decode "
+                "kernel; no Triton fallback. Disable "
+                "VLLM_TQ_SOA_FUSION_WHT_BUTTERFLY or build the HIP .so."
+            )
+        kwargs = {k: v for k, v in kwargs.items() if k != "signs"}
     return _unified_module().triton_turboquant_decode_attention_v3(*args, **kwargs)

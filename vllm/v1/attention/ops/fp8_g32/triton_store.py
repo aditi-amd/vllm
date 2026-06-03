@@ -48,12 +48,19 @@ from vllm.v1.attention.ops.fp8_g32.fp8_levels import (
     MIDPOINTS_SORTED,
     SORTED_TO_BITS,
     UE8M0_BIAS,
+    fp8_g32_soa_scales_enabled,
     get_constant_c,
     get_group_size,
     is_arch_b,
+    k_codes_bytes,
     k_scales_offset,
     n_groups,
     slot_size,
+    soa_head_stride,
+    soa_k_codes_region,
+    soa_k_scales_region,
+    soa_v_codes_region,
+    soa_v_scales_region,
     v_codes_offset,
     v_scales_offset,
 )
@@ -136,6 +143,16 @@ def _fp8_g32_store_kernel(
     FP4_C: tl.constexpr,
     UE8M0_BIAS_C: tl.constexpr,
     ARCH_B_C: tl.constexpr,  # 0 = Arch A (c folded into byte), 1 = Arch B (c baked in codebook)
+    # SoA layout (Path 4) — when SOA_SCALES=1 the per-group scales live in a
+    # contiguous per-block region instead of inside each slot. These constexpr
+    # are only consulted on the SoA branch; ignored (pass 0) for AoS.
+    SOA_SCALES: tl.constexpr = 0,
+    SOA_HEAD_STRIDE: tl.constexpr = 0,   # bytes per head within a block (block_size * slot_size)
+    SOA_K_CODES_REGION: tl.constexpr = 0,
+    SOA_K_SCALES_REGION: tl.constexpr = 0,
+    SOA_V_CODES_REGION: tl.constexpr = 0,
+    SOA_V_SCALES_REGION: tl.constexpr = 0,
+    KC_BYTES: tl.constexpr = 0,          # head_dim // 2 (K/V code bytes per token)
 ):
     pid = tl.program_id(0)
     token_idx = pid // H
@@ -146,11 +163,26 @@ def _fp8_g32_store_kernel(
         return
     blk = slot // BLOCK_SIZE
     off = slot % BLOCK_SIZE
-    slot_base = (
-        blk * stride_cache_block
-        + off * stride_cache_pos
-        + head_idx * stride_cache_head
-    ).to(tl.int64)
+    if SOA_SCALES:
+        # Head-major, field-major within the block. Codes stay token-strided
+        # (AoS within their region); scales land in the contiguous SoA region.
+        per_head_base = (
+            blk * stride_cache_block + head_idx * SOA_HEAD_STRIDE
+        ).to(tl.int64)
+        k_code_base = per_head_base + SOA_K_CODES_REGION + off * KC_BYTES
+        k_scale_base = per_head_base + SOA_K_SCALES_REGION + off * N_GROUPS_C
+        v_code_base = per_head_base + SOA_V_CODES_REGION + off * KC_BYTES
+        v_scale_base = per_head_base + SOA_V_SCALES_REGION + off * N_GROUPS_C
+    else:
+        slot_base = (
+            blk * stride_cache_block
+            + off * stride_cache_pos
+            + head_idx * stride_cache_head
+        ).to(tl.int64)
+        k_code_base = slot_base
+        k_scale_base = slot_base + K_SCALES_OFFSET
+        v_code_base = slot_base + V_CODES_OFFSET
+        v_scale_base = slot_base + V_SCALES_OFFSET
 
     base = pid * HEAD_DIM
     d_offs = tl.arange(0, BLOCK_D)
@@ -228,14 +260,14 @@ def _fp8_g32_store_kernel(
     k_bits_flat = tl.reshape(k_bits, [HEAD_DIM])
     k_pairs = tl.reshape(k_bits_flat, [HEAD_DIM // 2, 2])
     k_packed = tl.sum((k_pairs & 0xF) << shifts_4[None, :], axis=1).to(tl.uint8)
-    k_code_addrs = slot_base + tl.arange(0, HEAD_DIM // 2)
+    k_code_addrs = k_code_base + tl.arange(0, HEAD_DIM // 2)
     tl.store(KV_cache_ptr + k_code_addrs, k_packed)
 
     # 7. Store K scales as E8M0 bytes (one per group). Zero-amax groups
     #    write byte=0 (zero sentinel).
     k_byte = tl.where(k_is_zero, 0, k_exp + UE8M0_BIAS_C)
     k_byte = tl.where((k_byte < 0) | (k_byte > 255), 0, k_byte).to(tl.uint8)
-    k_scale_addrs = slot_base + K_SCALES_OFFSET + g_offs
+    k_scale_addrs = k_scale_base + g_offs
     tl.store(KV_cache_ptr + k_scale_addrs, k_byte)
 
     # ── V side (mirror K but skip rotation) ────────────────────────────
@@ -272,12 +304,12 @@ def _fp8_g32_store_kernel(
     v_bits_flat = tl.reshape(v_bits, [HEAD_DIM])
     v_pairs = tl.reshape(v_bits_flat, [HEAD_DIM // 2, 2])
     v_packed = tl.sum((v_pairs & 0xF) << shifts_4[None, :], axis=1).to(tl.uint8)
-    v_code_addrs = slot_base + V_CODES_OFFSET + tl.arange(0, HEAD_DIM // 2)
+    v_code_addrs = v_code_base + tl.arange(0, HEAD_DIM // 2)
     tl.store(KV_cache_ptr + v_code_addrs, v_packed)
 
     v_byte = tl.where(v_is_zero, 0, v_exp + UE8M0_BIAS_C)
     v_byte = tl.where((v_byte < 0) | (v_byte > 255), 0, v_byte).to(tl.uint8)
-    v_scale_addrs = slot_base + V_SCALES_OFFSET + g_offs
+    v_scale_addrs = v_scale_base + g_offs
     tl.store(KV_cache_ptr + v_scale_addrs, v_byte)
 
 
@@ -344,6 +376,15 @@ def fp8_g32_store(
     c = constant_c if constant_c is not None else get_constant_c()
     arch_b_c = 1 if is_arch_b() else 0
 
+    soa = fp8_g32_soa_scales_enabled()
+    soa_scales = 1 if soa else 0
+    SOA_HEAD_STRIDE = soa_head_stride(D, block_size, gs) if soa else 0
+    SOA_K_CODES_REGION = soa_k_codes_region(D, block_size, gs) if soa else 0
+    SOA_K_SCALES_REGION = soa_k_scales_region(D, block_size, gs) if soa else 0
+    SOA_V_CODES_REGION = soa_v_codes_region(D, block_size, gs) if soa else 0
+    SOA_V_SCALES_REGION = soa_v_scales_region(D, block_size, gs) if soa else 0
+    KC_BYTES = k_codes_bytes(D)
+
     grid = (NH,)
     _fp8_g32_store_kernel[grid](
         k_flat,
@@ -368,6 +409,13 @@ def fp8_g32_store(
         FP4_C=c,
         UE8M0_BIAS_C=UE8M0_BIAS,
         ARCH_B_C=arch_b_c,
+        SOA_SCALES=soa_scales,
+        SOA_HEAD_STRIDE=SOA_HEAD_STRIDE,
+        SOA_K_CODES_REGION=SOA_K_CODES_REGION,
+        SOA_K_SCALES_REGION=SOA_K_SCALES_REGION,
+        SOA_V_CODES_REGION=SOA_V_CODES_REGION,
+        SOA_V_SCALES_REGION=SOA_V_SCALES_REGION,
+        KC_BYTES=KC_BYTES,
         num_warps=4,
         num_stages=1,
     )

@@ -90,6 +90,20 @@ Perf optimization env knobs (all opt-in, all preserve correctness):
   - VLLM_FP8_G32_AMD_HINTS=1 : pass waves_per_eu=2 /
     matrix_instr_nonkdim=16 / kpack=2 to the AMD Triton backend. Opt-in
     for experimental tuning per workload.
+  - VLLM_FP8_G32_SOA_SCALES=1 : store per-group K/V scales in a contiguous
+    per-block SoA region instead of interleaved inside each slot (Path 4).
+    The default AoS layout forces TILE_SIZE scattered byte loads per scale
+    field (one per slot, slots `num_heads * slot_size` bytes apart, ~3% L1
+    cache-line efficiency); SoA collapses an aligned tile's scale bytes into
+    a single coalesced load (~25% efficiency), matching TQ44 V3's metadata
+    layout. Same FP4 codes, same UE8M0 scales, same total bytes per block —
+    only the byte placement changes, so it's bit-identical numerically.
+    Read once at module load; the store kernel and BOTH decode kernels
+    consult the same flag, so store/decode always agree within a process
+    (the KV cache is process-local, so a cache can never be written under
+    one layout and read under the other). Default OFF until the serving A/B
+    vs TQ44 V3 confirms the metadata-load win. Targets the primary remaining
+    gap vs TQ44 V3 on long-context decode.
 
 How to run (canonical defaults, MI355X / Qwen-72B)
 --------------------------------------------------
@@ -158,12 +172,18 @@ from vllm.v1.attention.ops.triton_unified_attention import (
 from vllm.v1.attention.ops.fp8_g32.fp8_levels import (
     FP4_BITS_TO_VALUE,
     UE8M0_BIAS,
+    fp8_g32_soa_scales_enabled,
     get_constant_c,
     get_group_size,
     is_arch_b,
+    k_codes_bytes,
     k_scales_offset,
     n_groups,
     slot_size,
+    soa_head_stride,
+    soa_k_scales_region,
+    soa_v_codes_region,
+    soa_v_scales_region,
     v_codes_offset,
     v_scales_offset,
 )
@@ -246,7 +266,8 @@ def _fp8_g32_fuse_q_rotation(
 @triton.jit
 def _fp8_g32_load_k_fp8(
     KV_cache_ptr,          # uint8 view of cache
-    data_bases,            # [TILE_SIZE] int64 — slot base byte offset
+    data_bases,            # [TILE_SIZE] int64 — K codes base byte offset
+    k_scales_addrs,        # [TILE_SIZE] int64 — K scales base byte offset
     Fp4_decode_ptr,        # [16] bf16 — FP4 LUT (re-cast to FP8 in-kernel)
     d_offs,                # [BLOCK_D] int32
     d_mask,                # [BLOCK_D] int1
@@ -256,7 +277,6 @@ def _fp8_g32_load_k_fp8(
     GROUP_SIZE_C: tl.constexpr,
     N_GROUPS_C: tl.constexpr,
     TILE_SIZE: tl.constexpr,
-    K_SCALES_OFFSET: tl.constexpr,
     UE8M0_BIAS_C: tl.constexpr,
     UNMASKED: tl.constexpr,
     ARCH_B_C: tl.constexpr,  # 0 = Arch A, 1 = Arch B (multiply scales by SCALE_C)
@@ -291,8 +311,10 @@ def _fp8_g32_load_k_fp8(
     fp4_vals = tl.load(Fp4_decode_ptr + codes).to(tl.float32)  # [TILE, BLOCK_D]
 
     # E8M0 scales -> fp32, then broadcast-multiply per group.
+    # `k_scales_addrs` already points at this token's K-scale region base
+    # (AoS: slot_base + K_SCALES_OFFSET; SoA: contiguous per-block region).
     grp = tl.arange(0, N_GROUPS_C)
-    scale_addrs = data_bases[:, None] + K_SCALES_OFFSET + grp[None, :]
+    scale_addrs = k_scales_addrs[:, None] + grp[None, :]
     if UNMASKED:
         scale_bytes = tl.load(KV_cache_ptr + scale_addrs).to(tl.int32)
     else:
@@ -320,7 +342,8 @@ def _fp8_g32_load_k_fp8(
 @triton.jit
 def _fp8_g32_load_k_packed(
     KV_cache_ptr,          # uint8 view of cache
-    data_bases,            # [TILE_SIZE] int64 — slot base byte offset
+    data_bases,            # [TILE_SIZE] int64 — K codes base byte offset
+    k_scales_addrs,        # [TILE_SIZE] int64 — K scales base byte offset
     d_half_offs,           # [BLOCK_D // 2] int32
     half_mask,             # [BLOCK_D // 2] int1
     tile_mask,             # [TILE_SIZE] int1 (ignored when UNMASKED=True)
@@ -329,7 +352,6 @@ def _fp8_g32_load_k_packed(
     GROUP_SIZE_C: tl.constexpr,
     N_GROUPS_C: tl.constexpr,
     TILE_SIZE: tl.constexpr,
-    K_SCALES_OFFSET: tl.constexpr,
     UNMASKED: tl.constexpr,
 ):
     """Load packed FP4 K codes (no decode) + E8M0 K scales as uint8 tensors.
@@ -355,7 +377,7 @@ def _fp8_g32_load_k_packed(
     K_T_packed = tl.trans(K_codes)  # [D // 2, TILE]
 
     grp = tl.arange(0, N_GROUPS_C)
-    scale_addrs = data_bases[:, None] + K_SCALES_OFFSET + grp[None, :]
+    scale_addrs = k_scales_addrs[:, None] + grp[None, :]
     if UNMASKED:
         K_scales = tl.load(KV_cache_ptr + scale_addrs)
     else:
@@ -389,6 +411,36 @@ def _fp8_g32_load_k_packed(
 
 
 @triton.jit
+def _fp8_g32_fp4_decode_arith(codes):
+    """Arithmetic FP4 E2M1 decode → fp32, bit-exact to FP4_BITS_TO_VALUE.
+
+    The V dequant path otherwise gathers per element from a 16-entry global
+    LUT (``tl.load(Fp4_decode_ptr + codes)``), which lowers to a vector-memory
+    gather on every element — the dominant cost of V decode at decode shapes
+    (QK decodes FP4 in-hardware via dot_scaled; only PV pays the software LUT).
+    Reconstructing the value from the 4-bit code with integer ALU ops removes
+    the gather entirely, moving the work onto the (idle) VALU units.
+
+    Code layout (matches fp8_levels.FP4_BITS_TO_VALUE): sign(bit3) | exp(bit2:1)
+    | mant(bit0). Magnitudes by ``code & 7``:
+        0→0.0 1→0.5 2→1.0 3→1.5 4→2.0 5→3.0 6→4.0 7→6.0
+    """
+    mag = codes & 7
+    e = mag >> 1                       # 0,0,1,1,2,2,3,3
+    m = mag & 1
+    # fp32 exponent field: 0.5→126, 1.0/1.5→127, 2.0/3.0→128, 4.0/6.0→129.
+    exp_field = 126 + e
+    # Mantissa half-bit applies only for the "1.x" magnitudes (e != 0);
+    # for mag==1 (0.5) the mantissa must be 0.
+    mant_field = tl.where(e != 0, m, 0) << 22
+    bits = (exp_field << 23) | mant_field
+    magval = bits.to(tl.float32, bitcast=True)
+    magval = tl.where(mag == 0, 0.0, magval)   # 0/-0 codes → exact zero
+    signf = tl.where((codes & 8) != 0, -1.0, 1.0)
+    return magval * signf
+
+
+@triton.jit
 def _fp8_g32_load_v_tile(
     KV_cache_ptr,
     val_bases,             # [TILE_SIZE] int64 — V codes base
@@ -408,6 +460,7 @@ def _fp8_g32_load_v_tile(
     ARCH_B_C: tl.constexpr,  # 0 = Arch A, 1 = Arch B (multiply scales by SCALE_C)
     SCALE_C: tl.constexpr,   # c factor used in Arch B's c-baked codebook
     V_BF16_MUL: tl.constexpr = 0,  # 1 = keep mul in bf16 (faster on MFMA), 0 = fp32 mul + cast
+    V_ARITH: tl.constexpr = 0,  # 1 = arithmetic FP4 decode (no LUT gather)
 ):
     """Load + dequant a [TILE_SIZE, BLOCK_D] block of V (raw, not rotated).
 
@@ -446,7 +499,10 @@ def _fp8_g32_load_v_tile(
     scale_exp = scale_bytes - UE8M0_BIAS_C
 
     if V_BF16_MUL:
-        fp4_vals = tl.load(Fp4_decode_ptr + codes)  # bf16 already
+        if V_ARITH:
+            fp4_vals = _fp8_g32_fp4_decode_arith(codes).to(tl.bfloat16)
+        else:
+            fp4_vals = tl.load(Fp4_decode_ptr + codes)  # bf16 already
         scales = tl.where(
             scale_bytes == 0,
             tl.zeros([], tl.float32),
@@ -458,7 +514,10 @@ def _fp8_g32_load_v_tile(
         V = tl.reshape(V_g * scales[:, :, None], [TILE_SIZE, BLOCK_D])
         return V.to(OUT_DTYPE)
     else:
-        fp4_vals = tl.load(Fp4_decode_ptr + codes).to(tl.float32)
+        if V_ARITH:
+            fp4_vals = _fp8_g32_fp4_decode_arith(codes)
+        else:
+            fp4_vals = tl.load(Fp4_decode_ptr + codes).to(tl.float32)
         scales = tl.where(
             scale_bytes == 0, 0.0, tl.exp2(tl.cast(scale_exp, tl.float32))
         )  # [TILE, N_GROUPS] fp32
@@ -539,6 +598,7 @@ def _fp8_g32_pv(
     SCALE_C: tl.constexpr,
     V_BF16_MUL: tl.constexpr,
     V_DOT_KIND: tl.constexpr,   # 0=bf16 dot (default), 1=fp8×fp8 dot_scaled
+    V_ARITH: tl.constexpr = 0,  # 1 = arithmetic FP4 decode (no LUT gather)
 ):
     """Compute the (P @ V_tile) contribution. Returns [BLOCK_M, BLOCK_D] fp32.
 
@@ -557,6 +617,7 @@ def _fp8_g32_pv(
             UNMASKED=UNMASKED, UE8M0_BIAS_C=UE8M0_BIAS_C,
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
             V_BF16_MUL=V_BF16_MUL,
+            V_ARITH=V_ARITH,
         )
         return tl.dot(P.to(tl.bfloat16), V, out_dtype=tl.float32)
     else:
@@ -572,6 +633,7 @@ def _fp8_g32_pv(
             UNMASKED=UNMASKED, UE8M0_BIAS_C=UE8M0_BIAS_C,
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
             V_BF16_MUL=1,  # bf16 multiply + fp8 cast (skip fp32 round-trip)
+            V_ARITH=V_ARITH,
         )
 
         # 2) Row-wise P fp8 quantization with one E8M0 scale per row.
@@ -623,7 +685,8 @@ def _fp8_g32_pv(
 def _fp8_g32_qk(
     Q,                       # [BLOCK_M, BLOCK_D] fp8_e4m3fn
     KV_cache_ptr,
-    data_bases,              # [TILE_SIZE] int64
+    data_bases,              # [TILE_SIZE] int64 — K codes base
+    k_scales_addrs,          # [TILE_SIZE] int64 — K scales base
     Fp4_decode_ptr,          # [16] bf16
     offs_d, dim_mask,
     offs_d_half, half_mask,
@@ -633,7 +696,6 @@ def _fp8_g32_qk(
     GROUP_SIZE_C: tl.constexpr,
     N_GROUPS_C: tl.constexpr,
     TILE_SIZE: tl.constexpr,
-    K_SCALES_OFFSET: tl.constexpr,
     UE8M0_BIAS_C: tl.constexpr,
     UNMASKED: tl.constexpr,
     DOT_KIND: tl.constexpr,  # 0=fp8mfma, 1=dot_scaled. BOTH emit native F8F6F4
@@ -651,13 +713,13 @@ def _fp8_g32_qk(
         K_T_fp8 = _fp8_g32_load_k_fp8(
             KV_cache_ptr,
             data_bases,
+            k_scales_addrs,
             Fp4_decode_ptr,
             offs_d, dim_mask,
             tile_mask,
             BLOCK_D=BLOCK_D, HEAD_DIM=HEAD_DIM,
             GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
             TILE_SIZE=TILE_SIZE,
-            K_SCALES_OFFSET=K_SCALES_OFFSET,
             UE8M0_BIAS_C=UE8M0_BIAS_C,
             UNMASKED=UNMASKED,
             ARCH_B_C=ARCH_B_C,
@@ -678,12 +740,12 @@ def _fp8_g32_qk(
         K_T_packed, K_scales = _fp8_g32_load_k_packed(
             KV_cache_ptr,
             data_bases,
+            k_scales_addrs,
             offs_d_half, half_mask,
             tile_mask,
             BLOCK_D=BLOCK_D, HEAD_DIM=HEAD_DIM,
             GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
             TILE_SIZE=TILE_SIZE,
-            K_SCALES_OFFSET=K_SCALES_OFFSET,
             UNMASKED=UNMASKED,
         )
         S = tl.dot_scaled(
@@ -691,6 +753,66 @@ def _fp8_g32_qk(
             out_dtype=tl.float32,
         )
     return S
+
+
+# ---------------------------------------------------------------------------
+# Slot address helper — computes K-codes / K-scales / V-codes / V-scales base
+# address tensors for the active layout. Branches on SOA_SCALES constexpr.
+#
+#   AoS (SOA_SCALES=0, default): codes + scales interleaved inside each slot;
+#     scale loads are scattered (one slot stride apart) across the tile.
+#   SoA (SOA_SCALES=1, opt-in):  codes token-strided in their region; per-group
+#     scales live in a contiguous per-block region, so an aligned tile's scale
+#     bytes coalesce into a single wide load (mirrors TQ44 V3's metadata
+#     layout — see fp8_levels.soa_* helpers).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fp8_g32_slot_addrs(
+    block_base,            # int64 scalar — physical_block_idx * stride_cache_block
+    slot_within_block,     # [TILE_SIZE] int64 — token position within the block
+    kv_head_idx,
+    stride_cache_pos: tl.int64,
+    stride_cache_head: tl.int64,
+    N_GROUPS_C: tl.constexpr,
+    K_SCALES_OFFSET: tl.constexpr,
+    V_CODES_OFFSET: tl.constexpr,
+    V_SCALES_OFFSET: tl.constexpr,
+    SOA_SCALES: tl.constexpr,
+    SOA_HEAD_STRIDE: tl.constexpr,
+    SOA_K_SCALES_REGION: tl.constexpr,
+    SOA_V_CODES_REGION: tl.constexpr,
+    SOA_V_SCALES_REGION: tl.constexpr,
+    KC_BYTES: tl.constexpr,    # head_dim // 2 — K/V code bytes per token
+):
+    """Return (k_code_bases, k_scales_addrs, v_code_bases, v_scales_addrs),
+    each [TILE_SIZE] int64, for the active layout."""
+    if SOA_SCALES:
+        per_head_base = (
+            block_base + tl.cast(kv_head_idx, tl.int64) * SOA_HEAD_STRIDE
+        )
+        k_code_bases = per_head_base + slot_within_block * KC_BYTES
+        k_scales_addrs = (
+            per_head_base + SOA_K_SCALES_REGION + slot_within_block * N_GROUPS_C
+        )
+        v_code_bases = (
+            per_head_base + SOA_V_CODES_REGION + slot_within_block * KC_BYTES
+        )
+        v_scales_addrs = (
+            per_head_base + SOA_V_SCALES_REGION + slot_within_block * N_GROUPS_C
+        )
+    else:
+        data_bases = (
+            block_base
+            + slot_within_block * stride_cache_pos
+            + tl.cast(kv_head_idx, tl.int64) * stride_cache_head
+        )
+        k_code_bases = data_bases
+        k_scales_addrs = data_bases + K_SCALES_OFFSET
+        v_code_bases = data_bases + V_CODES_OFFSET
+        v_scales_addrs = data_bases + V_SCALES_OFFSET
+    return k_code_bases, k_scales_addrs, v_code_bases, v_scales_addrs
 
 
 # ===========================================================================
@@ -743,6 +865,15 @@ def kernel_fp8_g32_unified_attention_2d(
     FUSE_Q_ROT: tl.constexpr = 0,  # 1 = load raw bf16 Q + fused rotate, 0 = pre-rotated fp8
     V_BF16_MUL: tl.constexpr = 0,  # 1 = V dequant in bf16 (skip fp32 intermediate)
     V_DOT_KIND: tl.constexpr = 0,  # 0=bf16 dot (default), 1=fp8×fp8 dot_scaled (TILE_SIZE must be 32)
+    V_ARITH: tl.constexpr = 0,  # 1 = arithmetic FP4 V decode (no LUT gather)
+    # SoA scale layout (Path 4). When SOA_SCALES=1 the per-group scales live in
+    # a contiguous per-block region; consumed by _fp8_g32_slot_addrs.
+    SOA_SCALES: tl.constexpr = 0,
+    SOA_HEAD_STRIDE: tl.constexpr = 0,
+    SOA_K_SCALES_REGION: tl.constexpr = 0,
+    SOA_V_CODES_REGION: tl.constexpr = 0,
+    SOA_V_SCALES_REGION: tl.constexpr = 0,
+    KC_BYTES: tl.constexpr = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -854,21 +985,29 @@ def kernel_fp8_g32_unified_attention_2d(
             ).to(tl.int64)
             slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
         block_base = physical_block_idx * stride_cache_block
-        data_bases = (
-            block_base
-            + slot_within_block * stride_cache_pos
-            + tl.cast(kv_head_idx, tl.int64) * stride_cache_head
+        data_bases, k_scales_addrs, val_bases, v_scales_addrs = (
+            _fp8_g32_slot_addrs(
+                block_base, slot_within_block, kv_head_idx,
+                stride_cache_pos, stride_cache_head,
+                N_GROUPS_C=N_GROUPS_C,
+                K_SCALES_OFFSET=K_SCALES_OFFSET,
+                V_CODES_OFFSET=V_CODES_OFFSET,
+                V_SCALES_OFFSET=V_SCALES_OFFSET,
+                SOA_SCALES=SOA_SCALES,
+                SOA_HEAD_STRIDE=SOA_HEAD_STRIDE,
+                SOA_K_SCALES_REGION=SOA_K_SCALES_REGION,
+                SOA_V_CODES_REGION=SOA_V_CODES_REGION,
+                SOA_V_SCALES_REGION=SOA_V_SCALES_REGION,
+                KC_BYTES=KC_BYTES,
+            )
         )
-        val_bases = data_bases + V_CODES_OFFSET
-        v_scales_addrs = data_bases + V_SCALES_OFFSET
 
         S = scale * _fp8_g32_qk(
-            Q, KV_cache_ptr, data_bases, Fp4_decode_ptr,
+            Q, KV_cache_ptr, data_bases, k_scales_addrs, Fp4_decode_ptr,
             offs_d, dim_mask, offs_d_half, half_mask, dummy_tile_mask,
             BLOCK_D=HEAD_SIZE_PADDED, HEAD_DIM=HEAD_SIZE,
             GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
             TILE_SIZE=TILE_SIZE,
-            K_SCALES_OFFSET=K_SCALES_OFFSET,
             UE8M0_BIAS_C=UE8M0_BIAS_C,
             UNMASKED=True, DOT_KIND=DOT_KIND,
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
@@ -900,6 +1039,7 @@ def kernel_fp8_g32_unified_attention_2d(
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
             V_BF16_MUL=V_BF16_MUL,
             V_DOT_KIND=V_DOT_KIND,
+            V_ARITH=V_ARITH,
         )
 
     # Tail tile (masked)
@@ -918,21 +1058,29 @@ def kernel_fp8_g32_unified_attention_2d(
             ).to(tl.int64)
             slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
         block_base = physical_block_idx * stride_cache_block
-        data_bases = (
-            block_base
-            + slot_within_block * stride_cache_pos
-            + tl.cast(kv_head_idx, tl.int64) * stride_cache_head
+        data_bases, k_scales_addrs, val_bases, v_scales_addrs = (
+            _fp8_g32_slot_addrs(
+                block_base, slot_within_block, kv_head_idx,
+                stride_cache_pos, stride_cache_head,
+                N_GROUPS_C=N_GROUPS_C,
+                K_SCALES_OFFSET=K_SCALES_OFFSET,
+                V_CODES_OFFSET=V_CODES_OFFSET,
+                V_SCALES_OFFSET=V_SCALES_OFFSET,
+                SOA_SCALES=SOA_SCALES,
+                SOA_HEAD_STRIDE=SOA_HEAD_STRIDE,
+                SOA_K_SCALES_REGION=SOA_K_SCALES_REGION,
+                SOA_V_CODES_REGION=SOA_V_CODES_REGION,
+                SOA_V_SCALES_REGION=SOA_V_SCALES_REGION,
+                KC_BYTES=KC_BYTES,
+            )
         )
-        val_bases = data_bases + V_CODES_OFFSET
-        v_scales_addrs = data_bases + V_SCALES_OFFSET
 
         S = scale * _fp8_g32_qk(
-            Q, KV_cache_ptr, data_bases, Fp4_decode_ptr,
+            Q, KV_cache_ptr, data_bases, k_scales_addrs, Fp4_decode_ptr,
             offs_d, dim_mask, offs_d_half, half_mask, tile_mask,
             BLOCK_D=HEAD_SIZE_PADDED, HEAD_DIM=HEAD_SIZE,
             GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
             TILE_SIZE=TILE_SIZE,
-            K_SCALES_OFFSET=K_SCALES_OFFSET,
             UE8M0_BIAS_C=UE8M0_BIAS_C,
             UNMASKED=False, DOT_KIND=DOT_KIND,
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
@@ -964,6 +1112,7 @@ def kernel_fp8_g32_unified_attention_2d(
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
             V_BF16_MUL=V_BF16_MUL,
             V_DOT_KIND=V_DOT_KIND,
+            V_ARITH=V_ARITH,
         )
 
     acc = acc / L[:, None]
@@ -1031,6 +1180,15 @@ def kernel_fp8_g32_unified_attention_3d(
     FUSE_Q_ROT: tl.constexpr = 0,  # 1 = load raw bf16 Q + fused rotate, 0 = pre-rotated fp8
     V_BF16_MUL: tl.constexpr = 0,  # 1 = V dequant in bf16 (skip fp32 intermediate)
     V_DOT_KIND: tl.constexpr = 0,  # 0=bf16 dot (default), 1=fp8×fp8 dot_scaled (TILE_SIZE must be 32)
+    V_ARITH: tl.constexpr = 0,  # 1 = arithmetic FP4 V decode (no LUT gather)
+    # SoA scale layout (Path 4). When SOA_SCALES=1 the per-group scales live in
+    # a contiguous per-block region; consumed by _fp8_g32_slot_addrs.
+    SOA_SCALES: tl.constexpr = 0,
+    SOA_HEAD_STRIDE: tl.constexpr = 0,
+    SOA_K_SCALES_REGION: tl.constexpr = 0,
+    SOA_V_CODES_REGION: tl.constexpr = 0,
+    SOA_V_SCALES_REGION: tl.constexpr = 0,
+    KC_BYTES: tl.constexpr = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -1150,21 +1308,29 @@ def kernel_fp8_g32_unified_attention_3d(
             ).to(tl.int64)
             slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
         block_base = physical_block_idx * stride_cache_block
-        data_bases = (
-            block_base
-            + slot_within_block * stride_cache_pos
-            + tl.cast(kv_head_idx, tl.int64) * stride_cache_head
+        data_bases, k_scales_addrs, val_bases, v_scales_addrs = (
+            _fp8_g32_slot_addrs(
+                block_base, slot_within_block, kv_head_idx,
+                stride_cache_pos, stride_cache_head,
+                N_GROUPS_C=N_GROUPS_C,
+                K_SCALES_OFFSET=K_SCALES_OFFSET,
+                V_CODES_OFFSET=V_CODES_OFFSET,
+                V_SCALES_OFFSET=V_SCALES_OFFSET,
+                SOA_SCALES=SOA_SCALES,
+                SOA_HEAD_STRIDE=SOA_HEAD_STRIDE,
+                SOA_K_SCALES_REGION=SOA_K_SCALES_REGION,
+                SOA_V_CODES_REGION=SOA_V_CODES_REGION,
+                SOA_V_SCALES_REGION=SOA_V_SCALES_REGION,
+                KC_BYTES=KC_BYTES,
+            )
         )
-        val_bases = data_bases + V_CODES_OFFSET
-        v_scales_addrs = data_bases + V_SCALES_OFFSET
 
         S = scale * _fp8_g32_qk(
-            Q, KV_cache_ptr, data_bases, Fp4_decode_ptr,
+            Q, KV_cache_ptr, data_bases, k_scales_addrs, Fp4_decode_ptr,
             offs_d, dim_mask, offs_d_half, half_mask, dummy_tile_mask,
             BLOCK_D=HEAD_SIZE_PADDED, HEAD_DIM=HEAD_SIZE,
             GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
             TILE_SIZE=TILE_SIZE,
-            K_SCALES_OFFSET=K_SCALES_OFFSET,
             UE8M0_BIAS_C=UE8M0_BIAS_C,
             UNMASKED=True, DOT_KIND=DOT_KIND,
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
@@ -1196,6 +1362,7 @@ def kernel_fp8_g32_unified_attention_3d(
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
             V_BF16_MUL=V_BF16_MUL,
             V_DOT_KIND=V_DOT_KIND,
+            V_ARITH=V_ARITH,
         )
 
     # Tail
@@ -1214,21 +1381,29 @@ def kernel_fp8_g32_unified_attention_3d(
             ).to(tl.int64)
             slot_within_block = (seq_offset % BLOCK_SIZE).to(tl.int64)
         block_base = physical_block_idx * stride_cache_block
-        data_bases = (
-            block_base
-            + slot_within_block * stride_cache_pos
-            + tl.cast(kv_head_idx, tl.int64) * stride_cache_head
+        data_bases, k_scales_addrs, val_bases, v_scales_addrs = (
+            _fp8_g32_slot_addrs(
+                block_base, slot_within_block, kv_head_idx,
+                stride_cache_pos, stride_cache_head,
+                N_GROUPS_C=N_GROUPS_C,
+                K_SCALES_OFFSET=K_SCALES_OFFSET,
+                V_CODES_OFFSET=V_CODES_OFFSET,
+                V_SCALES_OFFSET=V_SCALES_OFFSET,
+                SOA_SCALES=SOA_SCALES,
+                SOA_HEAD_STRIDE=SOA_HEAD_STRIDE,
+                SOA_K_SCALES_REGION=SOA_K_SCALES_REGION,
+                SOA_V_CODES_REGION=SOA_V_CODES_REGION,
+                SOA_V_SCALES_REGION=SOA_V_SCALES_REGION,
+                KC_BYTES=KC_BYTES,
+            )
         )
-        val_bases = data_bases + V_CODES_OFFSET
-        v_scales_addrs = data_bases + V_SCALES_OFFSET
 
         S = scale * _fp8_g32_qk(
-            Q, KV_cache_ptr, data_bases, Fp4_decode_ptr,
+            Q, KV_cache_ptr, data_bases, k_scales_addrs, Fp4_decode_ptr,
             offs_d, dim_mask, offs_d_half, half_mask, tile_mask,
             BLOCK_D=HEAD_SIZE_PADDED, HEAD_DIM=HEAD_SIZE,
             GROUP_SIZE_C=GROUP_SIZE_C, N_GROUPS_C=N_GROUPS_C,
             TILE_SIZE=TILE_SIZE,
-            K_SCALES_OFFSET=K_SCALES_OFFSET,
             UE8M0_BIAS_C=UE8M0_BIAS_C,
             UNMASKED=False, DOT_KIND=DOT_KIND,
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
@@ -1260,6 +1435,7 @@ def kernel_fp8_g32_unified_attention_3d(
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
             V_BF16_MUL=V_BF16_MUL,
             V_DOT_KIND=V_DOT_KIND,
+            V_ARITH=V_ARITH,
         )
 
     # Write segment partials for stage-2 reduce.
@@ -1379,6 +1555,15 @@ def fp8_g32_unified_attention(
     v_bf16_mul = (
         os.environ.get("VLLM_FP8_G32_V_BF16", "0") == "1"
     )
+    # [Perf OPT V_ARITH] Decode the FP4 V codes arithmetically (integer ALU
+    # bit-assembly) instead of gathering from the 16-entry global LUT. The LUT
+    # path lowers to a per-element vector-memory gather, which profiling showed
+    # to be the dominant V-decode cost at decode shapes (QK decodes FP4 in the
+    # MFMA via dot_scaled; only PV pays the software LUT). Bit-exact to the LUT;
+    # default ON. Set VLLM_FP8_G32_V_ARITH=0 to fall back to the LUT gather.
+    v_arith = (
+        os.environ.get("VLLM_FP8_G32_V_ARITH", "1") == "1"
+    )
     # [Perf OPT V_DOT_SCALED] Use fp8×fp8 dot_scaled for PV instead of bf16
     # dot. Lowers to native v_mfma_scale_f32_16x16x32_f8f8 on CDNA4 (2× the
     # bf16 MFMA throughput per issue). The V loader bakes D-axis scales into
@@ -1486,6 +1671,16 @@ def fp8_g32_unified_attention(
     V_CODES_OFFSET = v_codes_offset(D, gs)
     V_SCALES_OFFSET = v_scales_offset(D, gs)
 
+    # SoA scale layout (Path 4). Read once at module load; the store kernel
+    # consults the same flag so store/decode always agree within a process.
+    soa = fp8_g32_soa_scales_enabled()
+    SOA_SCALES = 1 if soa else 0
+    SOA_HEAD_STRIDE = soa_head_stride(D, block_size, gs) if soa else 0
+    SOA_K_SCALES_REGION = soa_k_scales_region(D, block_size, gs) if soa else 0
+    SOA_V_CODES_REGION = soa_v_codes_region(D, block_size, gs) if soa else 0
+    SOA_V_SCALES_REGION = soa_v_scales_region(D, block_size, gs) if soa else 0
+    KC_BYTES = k_codes_bytes(D)
+
     # QK dispatch path selector.
     #
     # DEFAULT = "dot_scaled" → ``tl.dot_scaled(Q_fp8, K_packed, "e4m3",
@@ -1589,6 +1784,13 @@ def fp8_g32_unified_attention(
             FUSE_Q_ROT=1 if fuse_q_rot else 0,
             V_BF16_MUL=1 if v_bf16_mul else 0,
             V_DOT_KIND=V_DOT_KIND,
+            V_ARITH=1 if v_arith else 0,
+            SOA_SCALES=SOA_SCALES,
+            SOA_HEAD_STRIDE=SOA_HEAD_STRIDE,
+            SOA_K_SCALES_REGION=SOA_K_SCALES_REGION,
+            SOA_V_CODES_REGION=SOA_V_CODES_REGION,
+            SOA_V_SCALES_REGION=SOA_V_SCALES_REGION,
+            KC_BYTES=KC_BYTES,
             num_warps=4,
             num_stages=num_stages_2d,
         )
@@ -1679,6 +1881,13 @@ def fp8_g32_unified_attention(
         FUSE_Q_ROT=1 if fuse_q_rot else 0,
         V_BF16_MUL=1 if v_bf16_mul else 0,
         V_DOT_KIND=V_DOT_KIND,
+        V_ARITH=1 if v_arith else 0,
+        SOA_SCALES=SOA_SCALES,
+        SOA_HEAD_STRIDE=SOA_HEAD_STRIDE,
+        SOA_K_SCALES_REGION=SOA_K_SCALES_REGION,
+        SOA_V_CODES_REGION=SOA_V_CODES_REGION,
+        SOA_V_SCALES_REGION=SOA_V_SCALES_REGION,
+        KC_BYTES=KC_BYTES,
         num_warps=int(os.environ.get("VLLM_FP8_G32_NUM_WARPS_3D", "2")),
         num_stages=num_stages_3d,
         **(_amd_stage1_hints() if _is_hip and
