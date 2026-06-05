@@ -151,6 +151,11 @@ from vllm.v1.attention.ops.flydsl_turboquant_decode_v4 import (
     is_flydsl_available as _flydsl_v4_available,
     is_flydsl_gqa6_available as _flydsl_v4_gqa6_available,
 )
+from vllm.v1.attention.ops.flydsl_fp8_g32_decode_v4 import (
+    flydsl_fp8_g32_decode_attention_v4,
+    is_flydsl_available as _flydsl_fp8_v4_available,
+    is_flydsl_fp8_gqa6_available as _flydsl_fp8_v4_gqa6_available,
+)
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -189,23 +194,39 @@ _USE_FP4_G32_V3 = os.environ.get("VLLM_FP4_G32_V3", "0") == "1"
 # `tl.dot` (same path as fp4_g32 V3). When unset, the FP8 path keeps the
 # legacy v1-based decode + dequant-and-flash_attn path.
 _USE_FP8_G32_V3 = os.environ.get("VLLM_FP8_G32_V3", "0") == "1"
+# Opt-in flag for the FlyDSL fp8_g32 decode kernel (MI355X / gfx950 only,
+# HEAD_SIZE=128, GQA in {8, 16}, no sinks/SWA). When set and FlyDSL is
+# importable + the layer is eligible, the fp8_g32 DECODE path routes to
+# `flydsl_fp8_g32_decode_attention_v4` (the FlyDSL port of the bug-free TQ v4
+# kernel adapted to FP4 E2M1 + UE8M0 group scales). Ineligible layers and
+# continuation-prefill fall back to the fp8_g32 Triton path (V3 if also set,
+# else V1). Independent of VLLM_FP8_G32_V3.
+_USE_FP8_G32_V4 = os.environ.get("VLLM_FP8_G32_DECODE_V4", "0") == "1"
 if _USE_TQ_V4 and not _flydsl_v4_available():
     logger.warning(
         "VLLM_TQ_DECODE_V4 requested but FlyDSL is unavailable; "
         "falling back to v3."
     )
     _USE_TQ_V4 = False
+if _USE_FP8_G32_V4 and not _flydsl_fp8_v4_available():
+    logger.warning(
+        "VLLM_FP8_G32_DECODE_V4 requested but FlyDSL is unavailable; "
+        "falling back to the fp8_g32 Triton path."
+    )
+    _USE_FP8_G32_V4 = False
 
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
 logger.info_once(
-    "TurboQuant has flash attn: %s, decode kernel: %s, fp4_g32_v3: %s, fp8_g32_v3: %s",
+    "TurboQuant has flash attn: %s, decode kernel: %s, fp4_g32_v3: %s, "
+    "fp8_g32_v3: %s, fp8_g32_v4(flydsl): %s",
     _HAS_FLASH_ATTN,
     "v4(flydsl)" if _USE_TQ_V4 else "v3" if _USE_TQ_V3 else "v2" if _USE_TQ_V2 else "v1",
     _USE_FP4_G32_V3,
     _USE_FP8_G32_V3,
+    _USE_FP8_G32_V4,
 )
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
@@ -1865,6 +1886,48 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
 
         if self._is_fp8_g32:
+            if _USE_FP8_G32_V4:
+                # FlyDSL fp8_g32 decode kernel: MI355X/gfx950 only,
+                # HEAD_SIZE=128, no sinks, no SWA. GQA factor:
+                #   * 8, 16 → canonical fp8_g32_decode_v4    (Qwen2.5/3)
+                #   * 6     → fp8_g32_decode_v4_gqa6 sibling (MiniMax-M2.5),
+                #             only when that sibling imported successfully.
+                # Falls back to the Triton fp8_g32 path below when the layer
+                # is ineligible. The kernel is a port of the bug-free TQ v4
+                # FlyDSL kernel adapted to FP4 E2M1 codes + UE8M0 per-group-32
+                # scales (Arch A/B read from fp8_levels).
+                _g = self.num_kv_groups
+                fp8_v4_gqa_ok = (_g in (8, 16)) or (
+                    _g == 6 and _flydsl_fp8_v4_gqa6_available()
+                )
+                fp8_v4_eligible = (
+                    self.head_size == 128
+                    and fp8_v4_gqa_ok
+                    and self.sinks is None
+                    and not (self.sliding_window and self.sliding_window > 0)
+                )
+                if fp8_v4_eligible:
+                    return flydsl_fp8_g32_decode_attention_v4(
+                        query=query,
+                        kv_cache=kv_cache,
+                        block_table=attn_metadata.block_table,
+                        seq_lens=attn_metadata.seq_lens,
+                        scale=self.scale,
+                        PiT=PiT,
+                        max_seq_len=attn_metadata.max_seq_len,
+                        output_buf=output_buf,
+                        buf_holder=layer,
+                        max_num_kv_splits=self.max_num_kv_splits,
+                        sinks=self.sinks,
+                    )
+                logger.warning_once(
+                    "fp8_g32 v4 eligibility failed (head_size=%s "
+                    "num_kv_groups=%s sinks=%s swa=%s) — falling back to the "
+                    "fp8_g32 Triton path",
+                    self.head_size, self.num_kv_groups,
+                    self.sinks is not None,
+                    bool(self.sliding_window and self.sliding_window > 0),
+                )
             if _USE_FP8_G32_V3:
                 # v3-based unified decode: hardware F8F6F4 scaled MFMA on QK
                 # via tl.dot_scaled (FP8 E4M3 × FP4 E2M1 + E8M0 scales) +

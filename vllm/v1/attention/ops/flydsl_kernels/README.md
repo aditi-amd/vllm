@@ -16,7 +16,24 @@ must be installed once per machine.
     - `ds_read_tr16_b64` hardware V-transpose (with cross-lane LDS race fence)
     - Flash-Attention-2 style online softmax with split-K reduction
 
-The canonical upstream copy lives at `<FlyDSL repo>/kernels/tq_decode_v4.py`.
+- `fp8_g32_decode_v4.py` — fp8_g32 (FP4 E2M1 codes + UE8M0 per-group-of-32
+  scales) decode attention kernel. A direct port of `tq_decode_v4.py`: the
+  MFMA layouts, online-softmax loop, HW/SW V-transpose, output store and
+  split-K reducer are reused verbatim. Only the dequant + cache addressing
+  differ:
+    - AoS cache slot `[num_blocks, BS, Hk, padded_slot]` (K codes@0, K
+      scales@64, V codes@68, V scales@132 for D=128/group=32)
+    - fixed FP4 value table reused via the LDS centroid LUT
+    - K/V dequant = `FP4_value[nibble] * 2^(scale_byte-127)` where the pow2
+      scale is `bitcast_f32(byte << 23)` (no `exp2`); each lane owns exactly
+      one group so it loads one K-scale + one V-scale byte
+    - Q is Hadamard-rotated + FP8-E4M3-haircut in the launcher, fed bf16
+  Launcher: `vllm/v1/attention/ops/flydsl_fp8_g32_decode_v4.py`. Enable with
+  `VLLM_FP8_G32_DECODE_V4=1` (eligible: HEAD_SIZE=128, GQA {8,16}, no
+  sinks/SWA). Parity test: `tests/kernels/turboquant_v4/test_fp8_g32_v4_parity.py`.
+
+The canonical upstream copies live at `<FlyDSL repo>/kernels/tq_decode_v4.py`
+and `<FlyDSL repo>/kernels/fp8_g32_decode_v4.py`.
 This directory is updated by re-copying that file when a new tested snapshot
 is ready. **Do not edit the vendored copy in-place** — make changes in the
 FlyDSL repo, validate, then re-vendor.

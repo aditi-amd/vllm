@@ -464,6 +464,83 @@ for production.
 
 ---
 
+### FP8-g32 FlyDSL V4 (recommended on MI355X / gfx950)
+
+Best fp8_g32 throughput. Direct FlyDSL port of the bug-free TQ V4 decode kernel
+with three CDNA4 hardware optimizations now ON by default. Requires the FlyDSL
+build (see Part 1) and gfx950. Supports GQA group sizes 8 and 16 (Qwen2.5/3,
+canonical kernel) and 6 (MiniMax-M2.5, sibling kernel).
+
+#### Launch — defaults are production-ready
+
+```bash
+HIP_VISIBLE_DEVICES=0,1 \
+VLLM_FLYDSL_ROOT=/opt/FlyDSL \
+VLLM_FLYDSL_PKGS=/opt/FlyDSL/build-fly/python_packages \
+HSA_NO_SCRATCH_RECLAIM=1 \
+VLLM_FP8_G32_DECODE_V4=1 \
+VLLM_FP8_G32_V3=1 \
+    vllm serve /shareddata/Qwen/Qwen2.5-72B-Instruct \
+        --tensor-parallel-size 2 \
+        --gpu-memory-utilization 0.85 \
+        --kv-cache-dtype fp8_kv_g32 \
+        --block-size 32 \
+        --trust-remote-code \
+        --no-enable-prefix-caching \
+        --attention-backend ROCM_AITER_UNIFIED_ATTN \
+        --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+```
+
+`VLLM_FP8_G32_DECODE_V4=1` enables the FlyDSL decode kernel for eligible
+layers (HEAD_SIZE=128, GQA in {6, 8, 16}, no sinks/SWA). `VLLM_FP8_G32_V3=1`
+is kept for the Triton fallback (continuation prefill, ineligible layers).
+All three CDNA4 optimizations below are ON by default — no further env vars
+required.
+
+#### CDNA4 hardware optimizations (defaults ON)
+
+| Env var | New default | Purpose |
+|---|---|---|
+| `VLLM_FP8_G32_DECODE_V4_QK_SCALED` | **`1`** | Native scaled FP4xFP8 MFMA for QK via `mfma_scale_f32_16x16x128_f8f6f4` on gfx950. Replaces the bf16 MFMA QK path with a single K=128 scaled MFMA — higher instruction throughput ceiling. Set to `0` to fall back to the bf16 path. |
+| `VLLM_FP8_G32_DECODE_V4_V_CVT` | **`1`** | Native scaled FP4→bf16 hardware CVT (`cvt_scalef32_pk_bf16_fp4`) for V dequant. Replaces the software LUT FP4 decode + scale multiply with a single hardware CVT. Requires the HW V-transpose LDS layout (gfx950). Set to `0` to fall back to the software LUT. |
+| `VLLM_FP8_G32_DECODE_V4_Q_HOIST` | **`1`** | Hoist the loop-invariant scaled-MFMA Q operand (FP8 build in STEP C) out of the K-tile loop and reuse it across tiles. No-op unless `_QK_SCALED=1`. Set to `0` to disable. |
+
+To run the leg with all three optimizations OFF (bf16 MFMA QK + software-LUT V dequant) for A/B comparison:
+
+```bash
+VLLM_FP8_G32_DECODE_V4_QK_SCALED=0 \
+VLLM_FP8_G32_DECODE_V4_V_CVT=0 \
+VLLM_FP8_G32_DECODE_V4_Q_HOIST=0 \
+... (rest of launch line)
+```
+
+#### Validated results
+
+**Serving throughput (MiniMax-M2.5, ISL=32K, OSL=1K, C=64, N=128, TP=2, MI355X — 5-way decode-kernel sweep):**
+
+| Kernel | OutTPS | TPOT p50 | ITL p50 | vs TQ44 V3 |
+|---|---:|---:|---:|---:|
+| v1 (legacy Triton) | 86.8 | 686.1 ms | 595.8 ms | −59% |
+| TQ44 V3 (Triton) | 210.7 | 281.9 ms | 170.8 ms | baseline |
+| TQ44 V4 FlyDSL (+ butterfly) | 254.0 | 188.3 ms | 64.9 ms | +20.5% |
+| fp8_g32 V3 (Triton) | 199.2 | 297.9 ms | 189.9 ms | −5.5% |
+| **fp8_g32 V4 FlyDSL (defaults: QK_SCALED + V_CVT + Q_HOIST)** | **303.4** | **173.7 ms** | **54.6 ms** | **+44.0%** |
+
+The fp8_g32 V4 FlyDSL leg with all three optimizations on is the fastest
+decode path measured on MI355X at C=64 serving — beating TQ44 V4 FlyDSL by
++19.4% OutTPS and the optimized TQ44 V3 Triton kernel by +44.0%.
+
+**LCB-128K accuracy (Qwen2.5-72B, YaRN ×4 → 131072, TP=2, MI355X):**
+
+| Configuration | acc_strict | acc_answered | n correct / null |
+|---|---:|---:|---:|
+| fp8_g32 V4 FlyDSL (defaults ON) | **61.96%** | **72.15%** | 57 / 12 |
+
+Accuracy is on par with fp8_g32 V3 Triton (the three hardware
+optimizations are bit-similar to within bf16 ULP of the reference path).
+
+---
+
 ## Part 3 — Full launch example (MiniMax-M2.5, FlyDSL v4 + butterfly, TP=2)
 
 ```bash

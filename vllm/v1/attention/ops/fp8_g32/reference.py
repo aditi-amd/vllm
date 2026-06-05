@@ -104,7 +104,20 @@ def _snap_to_sorted_idx(
     in [0, 14]. Same semantic as `torch.bucketize` against midpoints
     (reproduced by 14 `tl.where` in the kernel)."""
     boundaries = _get_midpoints(x_norm.device, dtype)
-    return torch.bucketize(x_norm.to(dtype), boundaries)
+    x = x_norm.to(dtype)
+    # ROCm's bucketize uses int32 element indexing and raises
+    # hipErrorInvalidConfiguration once numel >= 2**31 (e.g. a [B, Hk, N, D]
+    # K tensor at B=128, N=16384, Hk=8, D=128 is exactly 2**31). Chunk the
+    # flattened input so each call stays under the limit (bit-identical output).
+    _INT32_LIMIT = 2**31
+    if x.numel() < _INT32_LIMIT:
+        return torch.bucketize(x, boundaries)
+    flat = x.reshape(-1)
+    out = torch.empty_like(flat, dtype=torch.long)
+    chunk = _INT32_LIMIT // 2
+    for i in range(0, flat.numel(), chunk):
+        out[i:i + chunk] = torch.bucketize(flat[i:i + chunk], boundaries)
+    return out.reshape(x.shape)
 
 
 def _pack_nibbles_last_dim(codes: torch.Tensor) -> torch.Tensor:
