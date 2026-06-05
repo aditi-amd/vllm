@@ -72,7 +72,10 @@ VLLM_TQ_DECODE_V2=0
 VLLM_TQ_SOA_FUSION_STORE=1    # write SoA layout that v4 decode reads
 VLLM_TQ_SOA_FUSION=0          # must be OFF (that flag is for HIP path)
 HSA_NO_SCRATCH_RECLAIM=1
-VLLM_ROCM_USE_AITER=1
+VLLM_ROCM_USE_AITER=0         # OFF: triggered TQ44 KV-cache coherence
+                              # regression on MiniMax (incoherent decode).
+                              # The AITER attention backend is still used via
+                              # --attention-backend ROCM_AITER_UNIFIED_ATTN.
 ```
 
 #### FlyDSL v4 — butterfly optimizations (opt-in)
@@ -110,8 +113,12 @@ VLLM_TQ_DECODE_V4=1 VLLM_TQ_DECODE_V3=0 VLLM_TQ_DECODE_V2=0 \
 VLLM_TQ_SOA_FUSION_STORE=1 VLLM_TQ_SOA_FUSION=0 \
 VLLM_TQ_DECODE_V4_WHT_BUTTERFLY=1 \
 VLLM_TQ_STORE_WHT_BUTTERFLY=1 \
-HSA_NO_SCRATCH_RECLAIM=1 VLLM_ROCM_USE_AITER=1
+HSA_NO_SCRATCH_RECLAIM=1 VLLM_ROCM_USE_AITER=0
 ```
+
+Note: `VLLM_ROCM_USE_AITER=0` is the safe default — `=1` caused TQ44
+incoherent-decode on MiniMax in a May ablation. The AITER attention
+backend is still active via `--attention-backend ROCM_AITER_UNIFIED_ATTN`.
 
 Benchmark results (MiniMax-M2.5, 32K/1K, C=64, N=80, TP=2, MI355X):
 
@@ -552,7 +559,7 @@ VLLM_TQ_DECODE_V4=1 VLLM_TQ_DECODE_V3=0 VLLM_TQ_DECODE_V2=0 \
 VLLM_TQ_SOA_FUSION_STORE=1 VLLM_TQ_SOA_FUSION=0 \
 VLLM_TQ_DECODE_V4_WHT_BUTTERFLY=1 \
 VLLM_TQ_STORE_WHT_BUTTERFLY=1 \
-HSA_NO_SCRATCH_RECLAIM=1 VLLM_ROCM_USE_AITER=1 \
+HSA_NO_SCRATCH_RECLAIM=1 VLLM_ROCM_USE_AITER=0 \
 vllm serve /shareddata/larryli2/MiniMax-M2.5 \
     --tensor-parallel-size 2 \
     --attention-backend ROCM_AITER_UNIFIED_ATTN \
