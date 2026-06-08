@@ -106,15 +106,30 @@ in-register WHT butterfly (O(D log₂D) = 896 additions for D=128).  No PiT
 matrix is loaded from HBM at store time.  Constraints: D must be a power of 2,
 non-FP8 keys only.
 
-**Recommended production config (both opts on):**
+**Recommended config — butterfly OFF for now (default, safe):**
+
+Both butterfly opts are kept **OFF** by default for now. The store/decode
+rotation paths must stay paired, and the butterfly variant has not yet been
+validated against the full multi-turn / prefix-cache read path. Run with the
+flags at `0` unless you are deliberately enabling butterfly under the
+instructions below.
 
 ```bash
 VLLM_TQ_DECODE_V4=1 VLLM_TQ_DECODE_V3=0 VLLM_TQ_DECODE_V2=0 \
 VLLM_TQ_SOA_FUSION_STORE=1 VLLM_TQ_SOA_FUSION=0 \
-VLLM_TQ_DECODE_V4_WHT_BUTTERFLY=1 \
-VLLM_TQ_STORE_WHT_BUTTERFLY=1 \
+VLLM_TQ_DECODE_V4_WHT_BUTTERFLY=0 \
+VLLM_TQ_STORE_WHT_BUTTERFLY=0 \
 HSA_NO_SCRATCH_RECLAIM=1 VLLM_ROCM_USE_AITER=0
 ```
+
+**Enabling butterfly (opt-in, advanced):** the two butterfly opts above can be
+turned on for the throughput gains shown — but only together and under the
+constraints documented in this section (decode: D=128 + `bf16` query; store:
+D a power of 2 + non-FP8 keys). Keep `VLLM_TQ_DECODE_V4_WHT_BUTTERFLY` and
+`VLLM_TQ_STORE_WHT_BUTTERFLY` set to the **same** value so the store-side and
+decode-side rotations stay paired; enabling only one mismatches the rotation
+and corrupts decode output. Validate accuracy (incl. a multi-turn / prefix-
+cache run) before using butterfly in production.
 
 Note: `VLLM_ROCM_USE_AITER=0` is the safe default — `=1` caused TQ44
 incoherent-decode on MiniMax in a May ablation. The AITER attention
@@ -548,7 +563,12 @@ optimizations are bit-similar to within bf16 ULP of the reference path).
 
 ---
 
-## Part 3 — Full launch example (MiniMax-M2.5, FlyDSL v4 + butterfly, TP=2)
+## Part 3 — Full launch example (MiniMax-M2.5, FlyDSL v4, TP=2)
+
+Butterfly is kept OFF here (the safe default for now). To enable it, set both
+`VLLM_TQ_DECODE_V4_WHT_BUTTERFLY` and `VLLM_TQ_STORE_WHT_BUTTERFLY` to `1`
+together — see "Enabling butterfly (opt-in, advanced)" above for the
+constraints.
 
 ```bash
 HIP_VISIBLE_DEVICES=4,5 \
@@ -557,8 +577,8 @@ VLLM_FLYDSL_PKGS=/opt/FlyDSL/build-fly/python_packages \
 PYTHONPATH="${VLLM_FLYDSL_ROOT}:${VLLM_FLYDSL_PKGS}" \
 VLLM_TQ_DECODE_V4=1 VLLM_TQ_DECODE_V3=0 VLLM_TQ_DECODE_V2=0 \
 VLLM_TQ_SOA_FUSION_STORE=1 VLLM_TQ_SOA_FUSION=0 \
-VLLM_TQ_DECODE_V4_WHT_BUTTERFLY=1 \
-VLLM_TQ_STORE_WHT_BUTTERFLY=1 \
+VLLM_TQ_DECODE_V4_WHT_BUTTERFLY=0 \
+VLLM_TQ_STORE_WHT_BUTTERFLY=0 \
 HSA_NO_SCRATCH_RECLAIM=1 VLLM_ROCM_USE_AITER=0 \
 vllm serve /shareddata/larryli2/MiniMax-M2.5 \
     --tensor-parallel-size 2 \

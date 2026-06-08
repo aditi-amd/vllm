@@ -143,6 +143,19 @@ def _lazy_soa_store_imports():
         _tq_full_dequant_kv as soa_dequant,
     )
     return soa_store, load_soa_fn, soa_safe, soa_dequant
+
+
+def _lazy_soa_decode_v3():
+    """Return the SoA-layout-aware v3 decode kernel.
+
+    Must be kept lazy (same reason as _lazy_soa_store_imports): the
+    turboquant_soa_fusion package imports from turboquant_attn at init time,
+    so importing it at module level causes a circular import.
+    """
+    from vllm.v1.attention.ops.turboquant_soa_fusion.external_ops import (
+        triton_turboquant_decode_attention_v3 as soa_v3,
+    )
+    return soa_v3
 from vllm.v1.attention.ops.triton_turboquant_unified_attention import (
     triton_turboquant_decode_attention_v3,
 )
@@ -850,6 +863,48 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         return output
 
     # ------------------------------------------------------------------ #
+    #  Layout-aware v3 decode dispatcher                                  #
+    # ------------------------------------------------------------------ #
+    def _dispatch_decode_v3(self, **kwargs):
+        """Call the v3 decode kernel that matches the current cache layout.
+
+        When the cache was written in SoA layout (VLLM_TQ_SOA_FUSION_STORE=1,
+        required for the v4 FlyDSL decode kernel), the continuation-prefill
+        path must also use a SoA-aware v3 reader.  Using the default AoS v3
+        on a SoA-written cache mis-addresses k_norm / v_scale / v_zero and
+        produces garbage attention output for every cached-prefix turn.
+
+        AoS legs (pure v3 / default store) are unchanged: self._soa_store is
+        False, so they keep the same AoS v3 they always used.
+        """
+        if not self._soa_store:
+            return triton_turboquant_decode_attention_v3(**kwargs)
+
+        # The SoA v3 wrapper forwards to the SoA unified launcher, whose
+        # signature differs slightly from the AoS v3 (e.g. it has no
+        # `sliding_window` parameter). Filter kwargs to the params the SoA
+        # launcher accepts so a benign extra (e.g. sliding_window=None) cannot
+        # crash the engine; raise loudly if a *meaningful* (non-None) kwarg
+        # would be silently dropped.
+        import inspect
+        from vllm.v1.attention.ops.turboquant_soa_fusion.triton_turboquant_unified_attention import (  # noqa: E501
+            triton_turboquant_decode_attention_v3 as _soa_unified_v3,
+        )
+        accepted = set(inspect.signature(_soa_unified_v3).parameters)
+        dropped_meaningful = [
+            k for k, v in kwargs.items() if k not in accepted and v is not None
+        ]
+        if dropped_meaningful:
+            raise NotImplementedError(
+                "SoA v3 decode does not support kwargs "
+                f"{sorted(dropped_meaningful)} (set on a SoA-store TurboQuant "
+                "config). Extend the SoA launcher or disable the unsupported "
+                "feature."
+            )
+        filtered = {k: v for k, v in kwargs.items() if k in accepted}
+        return _lazy_soa_decode_v3()(**filtered)
+
+    # ------------------------------------------------------------------ #
     #  Store K/V into combined cache (vectorized)                         #
     # ------------------------------------------------------------------ #
     def _store_kv(
@@ -1217,7 +1272,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         # main decode kernel (v4 is decode-batch only, q_len=1
                         # implicit). Keeping v3 here makes the v3-leg vs v4-leg
                         # differ ONLY in the decode-batch kernel — clean A/B.
-                        out = triton_turboquant_decode_attention_v3(
+                        #
+                        # IMPORTANT: use _dispatch_decode_v3 so that when the
+                        # cache was written in SoA layout (VLLM_TQ_SOA_FUSION_STORE=1,
+                        # required for v4), we read it with the SoA-aware v3.
+                        # The default AoS v3 mis-addresses k_norm/v_scale/v_zero
+                        # in a SoA cache → garbage cached-prefix output → accuracy
+                        # collapse on every multi-turn / prefix-cached request.
+                        out = self._dispatch_decode_v3(
                             query=q_seq,
                             kv_cache=kv_cache,
                             block_table=synth_bt,
@@ -2047,7 +2109,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     self.num_kv_groups,
                     self.sinks is not None,
                 )
-                result = triton_turboquant_decode_attention_v3(
+                result = self._dispatch_decode_v3(
                     query=query,
                     kv_cache=kv_cache,
                     block_table=attn_metadata.block_table,
