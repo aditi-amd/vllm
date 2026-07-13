@@ -975,6 +975,16 @@ def triton_turboquant_unified_attention(
         if PiT is None:
             PiT = Pi.T.contiguous()
         apply_fuse_q_rot = bool(fuse_q_rot)
+        if apply_fuse_q_rot and D >= 256:
+            # The fused prologue stages PiT (D x D fp32) in LDS to do the
+            # in-kernel tl.dot(Q, PiT). At D=256 that is 256*256*4 = 256 KiB,
+            # which alone exceeds the 160 KiB (163840 B) per-workgroup LDS cap
+            # on gfx950/CDNA4 -> triton OutOfResources at launch. Fall back to
+            # the launcher-side rotation (a small query@PiT GEMM, off the LDS
+            # budget). Scoped to D>=256 so the D=128 fused path -- and its
+            # compiled kernel -- is unchanged. Numerically this is the existing
+            # A/B "legacy rotation" path (fp32 matmul, then cast).
+            apply_fuse_q_rot = False
         if apply_fuse_q_rot:
             q_rot = query.contiguous()
         else:
@@ -1051,6 +1061,17 @@ def triton_turboquant_unified_attention(
         # large (B=64 Q=1k C=8k; 5.6x speedup vs BM=16). BLOCK_M must be a
         # multiple of kv_group_size so BLOCK_Q is an integer.
         BLOCK_M = max(128, triton.next_power_of_2(kv_group_size))
+        if D >= 256:
+            # head_dim=256 doubles every per-tile LDS buffer (Q, K_T, V, probs
+            # all scale with HEAD_SIZE_PADDED). At BLOCK_M=128/TILE=32 that
+            # lands at ~256 KiB > the 160 KiB (163840 B) per-workgroup LDS cap
+            # on gfx950/CDNA4 -> triton OutOfResources at launch. Halving
+            # BLOCK_M for the 256 specialization brings it back under the cap.
+            # BLOCK_M is a pure tiling knob (masking handles partial rows), so
+            # results are numerically identical -- only occupancy/perf changes.
+            # This branch is D>=256 only: the D=128 path keeps BLOCK_M=128 and
+            # therefore compiles to the exact same kernel as before.
+            BLOCK_M = max(64, triton.next_power_of_2(kv_group_size))
     else:
         # Decode: BLOCK_Q > 1 in decode just pads rows (at most 1 query
         # token per sequence), so there's little to amortize. Inherit
@@ -1066,6 +1087,11 @@ def triton_turboquant_unified_attention(
     #   decode  (max_query_len == 1): 16
     if tile_size is None:
         tile_size = 32 if is_prefill_like else 16
+        if D >= 256 and is_prefill_like:
+            # Extra LDS headroom for the 256-wide head (K_T/V tiles scale with
+            # TILE_SIZE * HEAD_SIZE_PADDED). Scoped to D>=256 so the D=128
+            # prefill config (TILE_SIZE=32) is unchanged.
+            tile_size = 16
 
     # Pair-LUT fast path for 4-bit MSE keys. Skipped for FP8 and non-4-bit.
     # When USE_PAIR_LUT==0 the kernel never dereferences pair_lut, but Triton

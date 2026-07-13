@@ -99,6 +99,12 @@ if _USE_TQ_FLYDSL:
     from vllm.v1.attention.ops.flydsl_turboquant_decode import (
         is_flydsl_gqa6_available as _flydsl_gqa6_available,
     )
+    from vllm.v1.attention.ops.flydsl_turboquant_decode import (
+        is_flydsl_hd256_available as _flydsl_hd256_available,
+    )
+    from vllm.v1.attention.ops.flydsl_turboquant_decode import (
+        is_flydsl_gqa6_hd256_available as _flydsl_gqa6_hd256_available,
+    )
 
     if not _flydsl_available():
         raise ValueError(
@@ -1153,18 +1159,35 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
 
         if _USE_TQ_FLYDSL:
-            # FlyDSL decode (MI355X/gfx950, MSE-key, HEAD_SIZE=128,
-            # GQA in {6, 8, 16}). GQA-6 routes to the MiniMax sibling kernel.
+            # FlyDSL decode (MI355X/gfx950, MSE-key).
+            #   * HEAD_SIZE=128: GQA in {6, 8, 16}. GQA-6 routes to the MiniMax
+            #     sibling kernel (tq_decode_gqa6).
+            #   * HEAD_SIZE=256: GQA in {8, 16} routes to the tq_decode_hd256
+            #     sibling kernel (Qwen3.6 / Qwen3.5-397B class).
             # Ineligible layers / missing FlyDSL fall back to SoA Triton v3.
             _gqa = self.num_kv_groups
-            flydsl_gqa_ok = (_gqa in (8, 16)) or (
-                _gqa == 6 and _flydsl_gqa6_available()
-            )
+            if self.head_size == 256:
+                # 256-wide-head kernels: GQA-{8,16} via tq_decode_hd256,
+                # GQA-6 via tq_decode_gqa6_hd256 (Qwen3.6-27B full-attn).
+                if _gqa in (8, 16):
+                    flydsl_hs_ok = _flydsl_hd256_available()
+                    flydsl_gqa_ok = True
+                elif _gqa == 6:
+                    flydsl_hs_ok = _flydsl_gqa6_hd256_available()
+                    flydsl_gqa_ok = True
+                else:
+                    flydsl_hs_ok = False
+                    flydsl_gqa_ok = False
+            else:
+                flydsl_hs_ok = self.head_size == 128
+                flydsl_gqa_ok = (_gqa in (8, 16)) or (
+                    _gqa == 6 and _flydsl_gqa6_available()
+                )
             flydsl_eligible = (
                 not self.tq_config.key_fp8
                 and self.tq_config.key_mse_bits == 4
                 and self.tq_config.effective_value_quant_bits == 4
-                and self.head_size == 128
+                and flydsl_hs_ok
                 and flydsl_gqa_ok
                 and self.sinks is None
                 and not (self.sliding_window and self.sliding_window > 0)

@@ -45,8 +45,10 @@ logger = init_logger(__name__)
 
 
 _FLYDSL_AVAILABLE: bool | None = None
-_TQ_MOD = None  # kernels.tq_decode module (Qwen GQA-{8,16})
+_TQ_MOD = None  # kernels.tq_decode module (Qwen GQA-{8,16}, HEAD_SIZE=128)
 _TQ_MOD_GQA6 = None  # kernels.tq_decode_gqa6 module (MiniMax GQA-6, optional)
+_TQ_MOD_HD256 = None  # kernels.tq_decode_hd256 module (HEAD_SIZE=256, optional)
+_TQ_MOD_GQA6_HD256 = None  # kernels.tq_decode_gqa6_hd256 (GQA-6 + 256, optional)
 _FLYC = None  # flydsl.compiler
 _FX = None  # flydsl.expr
 _TYPING_T = None
@@ -62,7 +64,8 @@ def is_flydsl_available() -> bool:
     MiniMax support) the canonical Qwen path stays fully functional and
     only GQA-6 dispatches will fail with a clear error at launch time.
     """
-    global _FLYDSL_AVAILABLE, _TQ_MOD, _TQ_MOD_GQA6
+    global _FLYDSL_AVAILABLE, _TQ_MOD, _TQ_MOD_GQA6, _TQ_MOD_HD256
+    global _TQ_MOD_GQA6_HD256
     global _FLYC, _FX, _TYPING_T, _CC, _IR
     if _FLYDSL_AVAILABLE is not None:
         return _FLYDSL_AVAILABLE
@@ -108,6 +111,42 @@ def is_flydsl_available() -> bool:
             "GQA-6 models will fall back to Triton v3.",
             ex,
         )
+    # Best-effort HEAD_SIZE=256 sibling import (does NOT gate HEAD_SIZE=128
+    # availability). Routes GQA-{8,16} layers with head_dim==256 (Qwen3.6-class,
+    # Qwen3.5-397B) to the 256-wide-head kernel; missing it just means those
+    # layers fall back to Triton v3.
+    try:
+        from vllm.v1.attention.ops.flydsl_kernels import (
+            tq_decode_hd256 as tq_mod_hd256,
+        )
+
+        _TQ_MOD_HD256 = tq_mod_hd256
+        logger.info_once("FlyDSL TQ decode HEAD_SIZE=256 sibling: available")
+    except Exception as ex:  # noqa: BLE001
+        _TQ_MOD_HD256 = None
+        logger.info_once(
+            "FlyDSL TQ decode HEAD_SIZE=256 sibling: not available (%s); "
+            "head_dim=256 models will fall back to Triton v3.",
+            ex,
+        )
+    # Best-effort GQA-6 + HEAD_SIZE=256 sibling (Qwen3.6-27B full-attn layers).
+    try:
+        from vllm.v1.attention.ops.flydsl_kernels import (
+            tq_decode_gqa6_hd256 as tq_mod_gqa6_hd256,
+        )
+
+        _TQ_MOD_GQA6_HD256 = tq_mod_gqa6_hd256
+        logger.info_once(
+            "FlyDSL TQ decode GQA-6 HEAD_SIZE=256 sibling: available "
+            "(Qwen3.6-27B class)"
+        )
+    except Exception as ex:  # noqa: BLE001
+        _TQ_MOD_GQA6_HD256 = None
+        logger.info_once(
+            "FlyDSL TQ decode GQA-6 HEAD_SIZE=256 sibling: not available (%s); "
+            "GQA-6 head_dim=256 layers will fall back to Triton v3.",
+            ex,
+        )
     return _FLYDSL_AVAILABLE
 
 
@@ -121,6 +160,29 @@ def is_flydsl_gqa6_available() -> bool:
     if _FLYDSL_AVAILABLE is None:
         is_flydsl_available()
     return _TQ_MOD_GQA6 is not None
+
+
+def is_flydsl_hd256_available() -> bool:
+    """True iff the optional HEAD_SIZE=256 sibling kernel module loaded.
+
+    Used by the eligibility gate in turboquant_attn.py to decide whether a
+    layer with head_dim==256 can run on FlyDSL or must fall back to Triton v3.
+    """
+    if _FLYDSL_AVAILABLE is None:
+        is_flydsl_available()
+    return _TQ_MOD_HD256 is not None
+
+
+def is_flydsl_gqa6_hd256_available() -> bool:
+    """True iff the optional GQA-6 + HEAD_SIZE=256 sibling kernel module loaded.
+
+    Used by the eligibility gate to decide whether a layer with num_kv_groups==6
+    AND head_dim==256 (Qwen3.6-27B full-attention layers) can run on FlyDSL or
+    must fall back to Triton v3.
+    """
+    if _FLYDSL_AVAILABLE is None:
+        is_flydsl_available()
+    return _TQ_MOD_GQA6_HD256 is not None
 
 
 # -- Kernel module cache -------------------------------------------------------
@@ -392,6 +454,7 @@ def _get_kernel(
     num_seqs_hint: int = 1,
     tile_groups_per_partition: int = 1,
     use_wht_butterfly: bool = False,
+    head_size: int = 128,
 ):
     # ``num_seqs_hint`` (= runtime B) is forwarded to the build for shape
     # awareness; it does NOT participate in the cache key because the
@@ -410,6 +473,7 @@ def _get_kernel(
         bool(use_hw_v_transpose),
         int(tile_groups_per_partition),
         bool(use_wht_butterfly),
+        int(head_size),
     )
     cached = _KERN_CACHE.get(key)
     if cached is not None:
@@ -421,11 +485,56 @@ def _get_kernel(
 
     _build_t0 = _t.perf_counter()
 
-    # Per-GQA dispatch: GQA-6 (MiniMax-M2.5) lives in the sibling module
-    # tq_decode_gqa6 to keep the Qwen kernel's invariants untouched.
-    # GQA-{8,16} (Qwen) keep using the canonical tq_decode kernel.
+    # Per-(head_size, GQA) dispatch:
+    #   * head_size == 256 → tq_decode_hd256 sibling (Qwen3.6 / Qwen3.5-397B).
+    #     Keeps the HEAD_SIZE=128 kernels byte-identical.
+    #   * head_size == 128, GQA-6 → tq_decode_gqa6 sibling (MiniMax-M2.5).
+    #   * head_size == 128, GQA-{8,16} → canonical tq_decode kernel.
     qg = int(query_group_size)
-    if qg == 6:
+    hs = int(head_size)
+    if hs == 256:
+        if qg == 6:
+            # GQA-6 + 256 → Qwen3.6-27B full-attention sibling.
+            if _TQ_MOD_GQA6_HD256 is None:
+                raise RuntimeError(
+                    "FlyDSL TQ GQA-6 HEAD_SIZE=256 sibling kernel "
+                    "(vllm.v1.attention.ops.flydsl_kernels.tq_decode_gqa6_hd256) "
+                    "failed to import; check that FlyDSL is importable."
+                )
+            kmod = _TQ_MOD_GQA6_HD256
+            kfn = kmod.build_tq_decode_gqa6_hd256_module(
+                num_seqs=int(num_seqs_hint),
+                num_kv_heads=num_kv_heads,
+                num_partitions=num_partitions,
+                max_blocks_per_seq=max_blocks_per_seq,
+                softmax_scale=float(scale),
+                query_group_size=qg,
+                kv_block_size=int(kv_block_size),
+                use_hw_v_transpose=bool(use_hw_v_transpose),
+                tile_groups_per_partition=int(tile_groups_per_partition),
+                use_wht_butterfly=bool(use_wht_butterfly),
+            )
+        else:
+            if _TQ_MOD_HD256 is None:
+                raise RuntimeError(
+                    "FlyDSL TQ HEAD_SIZE=256 sibling kernel "
+                    "(vllm.v1.attention.ops.flydsl_kernels.tq_decode_hd256) "
+                    "failed to import; check that FlyDSL is importable."
+                )
+            kmod = _TQ_MOD_HD256
+            kfn = kmod.build_tq_decode_hd256_module(
+                num_seqs=int(num_seqs_hint),
+                num_kv_heads=num_kv_heads,
+                num_partitions=num_partitions,
+                max_blocks_per_seq=max_blocks_per_seq,
+                softmax_scale=float(scale),
+                query_group_size=qg,
+                kv_block_size=int(kv_block_size),
+                use_hw_v_transpose=bool(use_hw_v_transpose),
+                tile_groups_per_partition=int(tile_groups_per_partition),
+                use_wht_butterfly=bool(use_wht_butterfly),
+            )
+    elif qg == 6:
         if _TQ_MOD_GQA6 is None:
             raise RuntimeError(
                 "FlyDSL TQ GQA-6 sibling kernel "
@@ -634,12 +743,40 @@ def flydsl_turboquant_decode_attention(
     Hk = kv_cache.shape[2]
     block_size = kv_cache.shape[1]
     QG = Hq // Hk
-    assert D == _TQ_MOD.HEAD_SIZE
-    assert block_size in (16, 32), (
-        f"FlyDSL supports kv_block_size 16 or 32, got {block_size}"
+    # HEAD_SIZE=128 uses the canonical/GQA-6 kernels; HEAD_SIZE=256 uses the
+    # tq_decode_hd256 sibling. Both share the same TQ profile constants
+    # (N_CENTROIDS, KV_COMPUTE_BLOCK); only the per-head width differs.
+    assert D in (_TQ_MOD.HEAD_SIZE, 256), (
+        f"FlyDSL supports head_dim 128 or 256, got {D}"
     )
+    if D == 256 and _TQ_MOD_HD256 is None:
+        raise RuntimeError(
+            "FlyDSL launcher: head_dim=256 requested but the tq_decode_hd256 "
+            "sibling module is not available. Update your FlyDSL checkout "
+            "(must include flydsl_kernels/tq_decode_hd256.py) or set "
+            "VLLM_ROCM_TQ_FLYDSL_DECODE=0 to fall back to Triton v3."
+        )
+    # head_dim=128 kernels support {16,32}; head_dim=256 (incl. hybrid models
+    # like Qwen3.6-27B, which force a larger mamba-aligned block) also accept
+    # 64/128/256. Keeps the 128-head path constraint unchanged.
+    if D == 256:
+        assert block_size in (16, 32, 64, 128, 256), (
+            f"FlyDSL head_dim=256 supports kv_block_size 16/32/64/128/256, "
+            f"got {block_size}"
+        )
+    else:
+        assert block_size in (16, 32), (
+            f"FlyDSL supports kv_block_size 16 or 32, got {block_size}"
+        )
     assert QG in (6, 8, 16), f"FlyDSL supports GQA factor 6, 8 or 16, got {QG}"
-    if QG == 6 and _TQ_MOD_GQA6 is None:
+    if D == 256 and QG == 6 and _TQ_MOD_GQA6_HD256 is None:
+        raise RuntimeError(
+            "FlyDSL launcher: GQA-6 head_dim=256 requested (Qwen3.6-class) but "
+            "the tq_decode_gqa6_hd256 sibling module is not available. Update "
+            "your FlyDSL checkout or set VLLM_ROCM_TQ_FLYDSL_DECODE=0 to fall "
+            "back to Triton v3."
+        )
+    if D == 128 and QG == 6 and _TQ_MOD_GQA6 is None:
         raise RuntimeError(
             "FlyDSL launcher: GQA-6 requested (MiniMax-class) but the "
             "tq_decode_gqa6 sibling module is not available. Update your "
@@ -800,6 +937,16 @@ def flydsl_turboquant_decode_attention(
     # launcher skips the external q@PiT GEMM and the kernel computes H @ q
     # in-register (see STEP B' in the kernels).
     use_wht_bf = _wht_butterfly_enabled()
+    if use_wht_bf and D == 256:
+        # The in-register WHT butterfly is not yet ported to 256-wide heads
+        # (see tq_decode_hd256 module header). Fall back to the launcher-side
+        # q@PiT GEMM rotation, which is fully supported for head_dim=256.
+        logger.warning_once(
+            "FlyDSL head_dim=256: WHT butterfly not supported yet; using the "
+            "q@PiT GEMM rotation path instead (VLLM_TQ_FLYDSL_WHT_BUTTERFLY "
+            "ignored for 256-wide heads)."
+        )
+        use_wht_bf = False
     if not use_wht_bf:
         _q_float = pool_bufs["q_float"]  # [B, Hq, D] fp32, stable
         _q_rot_f32 = pool_bufs["q_rot_fp32"]  # [B, Hq, D] fp32, stable mm output
@@ -833,6 +980,7 @@ def flydsl_turboquant_decode_attention(
         num_seqs_hint=int(B),
         tile_groups_per_partition=int(tile_groups_per_partition),
         use_wht_butterfly=use_wht_bf,
+        head_size=int(D),
     )
     # T1.3: zero-overhead one-shot info log (replaces logger.info_once which
     # hashes its format string on every call to dedup).

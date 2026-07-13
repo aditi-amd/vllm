@@ -29,15 +29,14 @@ from vllm.v1.attention.ops.flydsl_turboquant_decode import (  # noqa: E402
     flydsl_turboquant_decode_attention,
     is_flydsl_available,
     is_flydsl_gqa6_available,
+    is_flydsl_gqa6_hd256_available,
+    is_flydsl_hd256_available,
 )
 
 if not is_flydsl_available():
     pytest.skip("FlyDSL runtime is not available.", allow_module_level=True)
 
-HEAD_SIZE = 128
 N_CENTROIDS = 16
-KEY_DATA_BYTES = HEAD_SIZE // 2  # 4-bit packed key nibbles
-DATA_BYTES_PER_SLOT = HEAD_SIZE  # packed K (64) + packed V (64)
 NUM_SOA_FIELDS = 3
 SOA_K_NORM, SOA_V_SCALE, SOA_V_ZERO = 0, 1, 2
 
@@ -46,8 +45,18 @@ ATOL = 5e-3
 
 
 def _build_cache(
-    num_seqs, num_kv_heads, seq_len, qg, kv_block_size, seed=0xC0FFEE, device="cuda"
+    num_seqs,
+    num_kv_heads,
+    seq_len,
+    qg,
+    kv_block_size,
+    head_size=128,
+    seed=0xC0FFEE,
+    device="cuda",
 ):
+    HEAD_SIZE = head_size
+    KEY_DATA_BYTES = HEAD_SIZE // 2  # 4-bit packed key nibbles
+    DATA_BYTES_PER_SLOT = HEAD_SIZE  # packed K + packed V
     """Vectorized builder for a SoA-layout 4-bit KV cache + fp32 ground truth.
 
     Returns ``(centroids, q_bf16, kv_cache_4d, block_table, seq_lens,
@@ -217,16 +226,38 @@ def _reference_attention(q_bf16, k_ref, v_ref, seq_lens, scale):
         ),
     ],
 )
-@pytest.mark.parametrize("kv_block_size", [16, 32])
+@pytest.mark.parametrize("kv_block_size", [16, 32, 128])
+@pytest.mark.parametrize(
+    "head_size",
+    [
+        128,
+        pytest.param(
+            256,  # Qwen3.6 / Qwen3.5-397B class (HEAD_SIZE=256 sibling kernel)
+            marks=pytest.mark.skipif(
+                not is_flydsl_hd256_available(),
+                reason="FlyDSL HEAD_SIZE=256 sibling kernel not available",
+            ),
+        ),
+    ],
+)
 def test_flydsl_matches_reference(
-    num_seqs, seq_len, num_kv_heads, qg, kv_block_size
+    num_seqs, seq_len, num_kv_heads, qg, kv_block_size, head_size
 ):
     """FlyDSL decode must match fp32 attention on dequantized KV."""
+    # HEAD_SIZE=256: GQA-{8,16} via tq_decode_hd256, GQA-6 via the
+    # tq_decode_gqa6_hd256 sibling (Qwen3.6-27B full-attention layers).
+    if head_size == 256 and qg == 6 and not is_flydsl_gqa6_hd256_available():
+        pytest.skip("FlyDSL GQA-6 HEAD_SIZE=256 sibling kernel not available")
+    # block_size=128 (hybrid-model mamba-aligned page) is a head_dim=256-only
+    # relaxation; the 128-wide-head kernels keep the {16,32} constraint.
+    if kv_block_size == 128 and head_size != 256:
+        pytest.skip("kv_block_size=128 only supported for head_dim=256")
+    key_data_bytes = head_size // 2
     centroids, q_bf16, kv_cache, block_table, seq_lens, k_ref, v_ref = _build_cache(
-        num_seqs, num_kv_heads, seq_len, qg, kv_block_size
+        num_seqs, num_kv_heads, seq_len, qg, kv_block_size, head_size=head_size
     )
-    scale = 1.0 / (HEAD_SIZE**0.5)
-    identity = torch.eye(HEAD_SIZE, dtype=torch.float32, device="cuda")
+    scale = 1.0 / (head_size**0.5)
+    identity = torch.eye(head_size, dtype=torch.float32, device="cuda")
 
     out = flydsl_turboquant_decode_attention(
         query=q_bf16,
@@ -237,9 +268,9 @@ def test_flydsl_matches_reference(
         centroids=centroids,
         scale=scale,
         mse_bits=4,
-        key_packed_size=KEY_DATA_BYTES + 2,
+        key_packed_size=key_data_bytes + 2,
         value_quant_bits=4,
-        value_packed_size=KEY_DATA_BYTES + 4,
+        value_packed_size=key_data_bytes + 4,
         key_fp8=False,
         norm_correction=False,
         PiT=identity.T.contiguous(),
@@ -251,3 +282,147 @@ def test_flydsl_matches_reference(
     ref = _reference_attention(q_bf16.cpu(), k_ref, v_ref, seq_lens.cpu(), scale)
 
     torch.testing.assert_close(out.cpu().float(), ref, atol=ATOL, rtol=0.0)
+
+
+def _run_and_check(
+    num_seqs,
+    num_kv_heads,
+    qg,
+    kv_block_size,
+    head_size,
+    build_seq_len,
+    seq_lens=None,
+    max_seq_len=None,
+    corrupt_tail=False,
+):
+    """Build a synthetic cache, optionally shorten seq_lens / corrupt the
+    unused block_table tail, run the kernel and assert fp32-oracle parity."""
+    key_data_bytes = head_size // 2
+    (centroids, q_bf16, kv_cache, block_table, built_seq_lens, k_ref, v_ref) = (
+        _build_cache(
+            num_seqs, num_kv_heads, build_seq_len, qg, kv_block_size,
+            head_size=head_size,
+        )
+    )
+    if seq_lens is not None:
+        built_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+    if corrupt_tail:
+        # Serving condition: block_table is sized for max_model_len but each
+        # sequence uses only a prefix of columns; the unused tail holds
+        # unallocated (out-of-range) block ids. The kernel must never
+        # dereference them -- reads must be bounded by seq_lens.
+        oob = kv_cache.shape[0] + 1_000_000
+        for s in range(num_seqs):
+            used = (int(built_seq_lens[s].item()) + kv_block_size - 1) // kv_block_size
+            block_table[s, used:] = oob
+    scale = 1.0 / (head_size**0.5)
+    identity = torch.eye(head_size, dtype=torch.float32, device="cuda")
+    out = flydsl_turboquant_decode_attention(
+        query=q_bf16,
+        kv_cache=kv_cache,
+        block_table=block_table,
+        seq_lens=built_seq_lens,
+        Pi=identity,
+        centroids=centroids,
+        scale=scale,
+        mse_bits=4,
+        key_packed_size=key_data_bytes + 2,
+        value_quant_bits=4,
+        value_packed_size=key_data_bytes + 4,
+        key_fp8=False,
+        norm_correction=False,
+        PiT=identity.T.contiguous(),
+        max_seq_len=max_seq_len if max_seq_len is not None else build_seq_len,
+        max_num_kv_splits=32,
+        sinks=None,
+    )
+    ref = _reference_attention(
+        q_bf16.cpu(), k_ref, v_ref, built_seq_lens.cpu(), scale
+    )
+    torch.testing.assert_close(out.cpu().float(), ref, atol=ATOL, rtol=0.0)
+
+
+# (num_kv_heads, qg, kv_block_size, head_size) tuples spanning the shipped
+# attention shapes. head_dim=256 configs are gated on the sibling kernel.
+_LONG_SEQ_CONFIGS = [
+    (8, 8, 32, 128),  # Qwen2.5-72B class
+    (8, 16, 32, 128),  # Qwen3-32B class
+    pytest.param(
+        8, 8, 128, 256,  # Qwen3.5-397B class (HEAD_SIZE=256 sibling)
+        marks=pytest.mark.skipif(
+            not is_flydsl_hd256_available(),
+            reason="FlyDSL HEAD_SIZE=256 sibling kernel not available",
+        ),
+    ),
+    pytest.param(
+        4, 6, 128, 256,  # Qwen3.6-27B class (GQA-6 HEAD_SIZE=256 sibling)
+        marks=pytest.mark.skipif(
+            not is_flydsl_hd256_available(),
+            reason="FlyDSL HEAD_SIZE=256 sibling kernel not available",
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize("num_seqs", [1, 4])
+# seq_len > MAX_PARTITIONS * KV_COMPUTE_BLOCK (= 32 * 256 = 8192) forces the
+# launcher to set tile_groups_per_partition (TGPP) > 1, i.e. the in-kernel
+# tile-group looping path (16384 -> TGPP=2, 32768 -> TGPP=4). The main
+# parametrized test caps seq_len at 4096 (TGPP == 1 always), so without this
+# the long-context looping path has ZERO coverage despite being the exact
+# regime used at 32K-128K serving.
+@pytest.mark.parametrize("seq_len", [16384, 32768])
+@pytest.mark.parametrize(
+    "num_kv_heads,qg,kv_block_size,head_size", _LONG_SEQ_CONFIGS
+)
+def test_flydsl_long_seq_tgpp(
+    num_seqs, seq_len, num_kv_heads, qg, kv_block_size, head_size
+):
+    """FlyDSL decode must stay fp32-accurate when TGPP > 1 (long context)."""
+    if head_size == 256 and qg == 6 and not is_flydsl_gqa6_hd256_available():
+        pytest.skip("FlyDSL GQA-6 HEAD_SIZE=256 sibling kernel not available")
+    _run_and_check(num_seqs, num_kv_heads, qg, kv_block_size, head_size, seq_len)
+
+
+@pytest.mark.parametrize(
+    "num_seqs,actual_lens",
+    [
+        (4, [5000, 37000, 1000, 40000]),
+        (8, [512, 33000, 8000, 128, 40960, 20000, 3000, 15000]),
+    ],
+)
+@pytest.mark.parametrize(
+    "num_kv_heads,qg,kv_block_size,head_size",
+    [
+        pytest.param(
+            4, 6, 128, 256,  # Qwen3.6-27B class
+            marks=pytest.mark.skipif(
+                not is_flydsl_hd256_available(),
+                reason="FlyDSL HEAD_SIZE=256 sibling kernel not available",
+            ),
+        ),
+        pytest.param(
+            8, 8, 128, 256,  # Qwen3.5-397B class
+            marks=pytest.mark.skipif(
+                not is_flydsl_hd256_available(),
+                reason="FlyDSL HEAD_SIZE=256 sibling kernel not available",
+            ),
+        ),
+    ],
+)
+def test_flydsl_short_seqs_wide_table_oob_tail(
+    num_seqs, actual_lens, num_kv_heads, qg, kv_block_size, head_size
+):
+    """Paged-serving robustness: a block_table sized for max_model_len with
+    variable/short per-sequence lengths and out-of-range block ids in the
+    unused tail. The kernel must bound reads by seq_lens (never fault on the
+    garbage tail) and stay fp32-accurate. Guards the concurrent long-context
+    serving path where sequences share a wide, partially-filled block table."""
+    if qg == 6 and not is_flydsl_gqa6_hd256_available():
+        pytest.skip("FlyDSL GQA-6 HEAD_SIZE=256 sibling kernel not available")
+    MAXLEN = 40960
+    _run_and_check(
+        num_seqs, num_kv_heads, qg, kv_block_size, head_size,
+        build_seq_len=MAXLEN, seq_lens=actual_lens, max_seq_len=MAXLEN,
+        corrupt_tail=True,
+    )
