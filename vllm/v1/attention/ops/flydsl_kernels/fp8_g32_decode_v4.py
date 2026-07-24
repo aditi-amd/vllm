@@ -85,6 +85,8 @@ PV_N_CHUNKS = HEAD_SIZE // MFMA_N           # 8
 CENTROID_LDS_BYTES = N_CENTROIDS * 4                        # 64
 Q_LDS_BYTES = QUERY_GROUP_SIZE * HEAD_SIZE * 2              # 4096
 KV_TILE_LDS_BYTES = TILE_SIZE * HEAD_SIZE * 2               # 4096
+# qk_fp8 only: per-(token, group) K UE8M0 scale staged for the post-MFMA fold.
+SCALE_LDS_BYTES = TILE_SIZE * N_GROUPS * 4                  # 16*4*4 = 256
 
 LOG2E = 1.4426950408889634
 NEG_INF_VAL = float("-inf")
@@ -112,6 +114,10 @@ def build_fp8_g32_decode_v4_module(
     use_wht_butterfly: bool = False,
     arch_b: bool = False,
     scale_c: float = 0.156,
+    qk_fp8: bool = False,
+    qk_scaled: bool = False,
+    v_cvt: bool = False,
+    q_hoist: bool = False,
 ):
     """Build an fp8_g32 decode v4 kernel module.
 
@@ -182,6 +188,28 @@ def build_fp8_g32_decode_v4_module(
     PARTITION_EXTENT_TOKENS = TGPP * KV_COMPUTE_BLOCK
     ARCH_B = bool(arch_b)
     SCALE_C = float(scale_c)
+    # QK fp8 MFMA path (Step A): replace the bf16 wide-K QK MFMA with 4x
+    # mfma_f32_16x16x32_fp8_fp8 (one per UE8M0 group of 32 head-dims, since
+    # GROUP_SIZE==MFMA_K==32). Q and K codes are cast to E4M3 (lossless: the
+    # 15 FP4 E2M1 levels and the launcher's E4M3-rounded Q are exact in E4M3)
+    # and the per-(token,group) UE8M0 scale is folded on each group's fp32
+    # accumulator as a per-token vec4 (scores[t]=sum_g k_scale[t,g]*partial_g).
+    # PV stays bf16 MFMA (its scale is not separable on the output).
+    QK_FP8 = bool(qk_fp8)
+    # QK scaled-MFMA path: SINGLE native scaled mfma_scale_f32_16x16x128_f8f6f4
+    # (K=128 in one issue). A=K raw FP4 codes + per-(token,group) UE8M0 scaleA;
+    # B=Q E4M3. Output layout identical to bf16 path. Mutually exclusive with
+    # qk_fp8 (both replace the bf16 QK MFMA via different mechanisms).
+    QK_SCALED = bool(qk_scaled)
+    assert not (QK_FP8 and QK_SCALED), (
+        "qk_fp8 and qk_scaled are mutually exclusive QK MFMA paths"
+    )
+    # V cvt: replace per-nibble LUT dequant with native cvt_scalef32_pk_bf16_fp4.
+    # Only active when use_hw_v_transpose=True (requires HW-TR LDS layout).
+    V_CVT = bool(v_cvt)
+    # Q-operand hoist (qk_scaled only): build the loop-invariant fp8 Q operand
+    # once in STEP C instead of rebuilding it per K-tile.
+    Q_HOIST = bool(q_hoist)
 
     QG = int(query_group_size)
     QG_LOAD_ITERS = QG // 4         # 2 for QG=8, 4 for QG=16
@@ -231,6 +259,9 @@ def build_fp8_g32_decode_v4_module(
     allocator.ptr += Q_LDS_BYTES
     kv_off = allocator.ptr
     allocator.ptr += KV_TILE_LDS_BYTES
+    scale_off = allocator.ptr
+    if QK_FP8 or QK_SCALED:
+        allocator.ptr += SCALE_LDS_BYTES
 
     @flyc.kernel
     def fp8_g32_decode_v4_kernel(
@@ -271,6 +302,15 @@ def build_fp8_g32_decode_v4_module(
         kv_lds_i32 = SmemPtr(base, kv_off, T.i32, shape=(KV_TILE_LDS_BYTES // 4,)).get()
         kv_lds_i64 = SmemPtr(base, kv_off, T.i64, shape=(KV_TILE_LDS_BYTES // 8,)).get()
         kv_lds_i16 = SmemPtr(base, kv_off, T.i16, shape=(KV_TILE_LDS_BYTES // 2,)).get()
+        if const_expr(QK_FP8):
+            scale_lds = SmemPtr(
+                base, scale_off, T.f32, shape=(TILE_SIZE * N_GROUPS,)
+            )
+        if const_expr(QK_SCALED):
+            # qk_scaled stages raw UE8M0 bytes (0..255) for the scaleA word.
+            scale_lds_i32 = SmemPtr(
+                base, scale_off, T.i32, shape=(TILE_SIZE * N_GROUPS,)
+            )
 
         # ---- Constants ---------------------------------------------------
         c_sq = fx.Int32(_stride_q_seq)
@@ -290,6 +330,27 @@ def build_fp8_g32_decode_v4_module(
         ONE_F = fx.Float32(1.0)
         LOG2E_C = arith.constant(LOG2E, type=T.f32)
         QK_SCALE = arith.constant(_qk_scale, type=T.f32)
+
+        if const_expr(QK_FP8 or QK_SCALED):
+            c_zero_i32 = arith.constant(0, type=T.i32)
+
+            def _f32x8_to_fp8_i64(f):
+                # 8 f32 -> 8 E4M3 bytes packed as i64 (MFMA fp8 operand).
+                w0 = rocdl.cvt_pk_fp8_f32(T.i32, f[0], f[1], c_zero_i32, 0)
+                w0 = rocdl.cvt_pk_fp8_f32(T.i32, f[2], f[3], w0, 1)
+                w1 = rocdl.cvt_pk_fp8_f32(T.i32, f[4], f[5], c_zero_i32, 0)
+                w1 = rocdl.cvt_pk_fp8_f32(T.i32, f[6], f[7], w1, 1)
+                pv = vector.from_elements(T.vec(2, T.i32), [w0, w1])
+                return vector.extract(
+                    vector.bitcast(T.vec(1, T.i64), pv), static_position=[0]
+                )
+
+            def _bf16x8_to_fp8_i64(v_bf16):
+                f = [
+                    arith.extf(T.f32, vector.extract(v_bf16, static_position=[i]))
+                    for i in range(8)
+                ]
+                return _f32x8_to_fp8_i64(f)
 
         # Helper: unwrap fx wrapper → raw ir.Value (used in STEP B' and STEP F)
         def _ival(v):
@@ -442,6 +503,38 @@ def build_fp8_g32_decode_v4_module(
                 [arith.index_cast(T.index, q_idx_i64)],
             )
             q_chunks.append(vector.bitcast(T.vec(8, T.bf16), qv))
+        # qk_fp8: pre-convert each Q chunk (8 bf16) to an E4M3 i64 MFMA operand.
+        # Launcher already E4M3-rounded Q, so bf16 -> E4M3 is exact.
+        q_fp8_chunks = []
+        if const_expr(QK_FP8):
+            for chk in range_constexpr(QK_K_CHUNKS):
+                q_fp8_chunks.append(_bf16x8_to_fp8_i64(q_chunks[chk]))
+
+        # qk_scaled + Q_HOIST: build the loop-invariant scaled-MFMA Q operand
+        # once here. Lane t holds all 32 head-dims of group mfma_col_grp at
+        # query row mfma_row: 4 sub-chunks of 8 bf16, each repacked to E4M3 i64,
+        # assembled to vec8 i32. Held in registers and reused across the tile loop.
+        q_op_hoisted = None
+        if const_expr(QK_SCALED and Q_HOIST):
+            _q_hoist_words = []
+            for j in range_constexpr(4):
+                _q_hoist_idx = (
+                    mfma_row * fx.Int32(HEAD_SIZE * 2 // 8)
+                    + mfma_col_grp * fx.Int32(8)
+                    + fx.Int32(j * 2)
+                )
+                _q_hoist_v = vector.load_op(
+                    T.vec(2, T.i64), q_lds_i64,
+                    [arith.index_cast(T.index, _q_hoist_idx)],
+                )
+                _q_hoist_words.append(
+                    _bf16x8_to_fp8_i64(
+                        vector.bitcast(T.vec(8, T.bf16), _q_hoist_v))
+                )
+            q_op_hoisted = vector.bitcast(
+                T.vec(8, T.i32),
+                vector.from_elements(T.vec(4, T.i64), _q_hoist_words),
+            )
 
         # ===== STEP D: Online softmax + PV state =========================
         running_max = NEG_INF
@@ -630,46 +723,196 @@ def build_fp8_g32_decode_v4_module(
                     kscale_f32 = kscale_f32 * c_arch_b
                     vscale_f32 = vscale_f32 * c_arch_b
 
-                # K dequant → LDS [token, head_dim] (natural)
-                # Lane writes 32 bf16 (= 4×8) for token=tok_in_tile,
-                # head_dims chunk_in_tok*32..+31 (4 sub-chunks of 8).
-                tok_kreg = tok_in_tile * fx.Int32(HEAD_SIZE * 2 // 8)
-                chunk_kreg = tok_kreg + chunk_in_tok * fx.Int32(8)
-                for w in range_constexpr(4):
-                    word_i32 = vector.extract(k_packed, static_position=[w])
-                    bf16_elems = []
-                    for n in range_constexpr(8):
-                        nibble = (word_i32 >> fx.Int32(n * 4)) & fx.Int32(0xF)
-                        nibble_idx = arith.index_cast(T.index, nibble)
-                        cent_f32 = cent_lds.load([nibble_idx])
-                        elem_bf16 = arith.trunc_f(T.bf16, cent_f32 * kscale_f32)
-                        bf16_elems.append(elem_bf16)
-                    v_bf16 = vector.from_elements(T.vec(8, T.bf16), bf16_elems)
-                    v_i64 = vector.bitcast(T.vec(2, T.i64), v_bf16)
-                    vector.store(
-                        v_i64, kv_lds_i64,
-                        [arith.index_cast(T.index, chunk_kreg + fx.Int32(w * 2))],
+                if const_expr(QK_FP8):
+                    # qk_fp8 K dequant → LDS [token, head_dim] as E4M3 BYTES
+                    # (1 byte/elem), UNSCALED (raw FP4 grid value). The UE8M0
+                    # group scale is staged to scale_lds and folded post-MFMA.
+                    # Lane (tok_in_tile, group=chunk_in_tok) writes 32 E4M3
+                    # bytes = 4× i64 at byte tok*HEAD_SIZE + group*32 + w*8.
+                    for w in range_constexpr(4):
+                        word_i32 = vector.extract(k_packed, static_position=[w])
+                        cents = []
+                        for n in range_constexpr(8):
+                            nibble = (word_i32 >> fx.Int32(n * 4)) & fx.Int32(0xF)
+                            nibble_idx = arith.index_cast(T.index, nibble)
+                            cents.append(cent_lds.load([nibble_idx]))
+                        k_i64 = _f32x8_to_fp8_i64(cents)
+                        k_i64_idx = (
+                            tok_in_tile * fx.Int32(HEAD_SIZE // 8)
+                            + chunk_in_tok * fx.Int32(4)
+                            + fx.Int32(w)
+                        )
+                        vector.store(
+                            vector.from_elements(T.vec(1, T.i64), [k_i64]),
+                            kv_lds_i64,
+                            [arith.index_cast(T.index, k_i64_idx)],
+                        )
+                    # Stage this lane's (token, group) UE8M0 K scale for the
+                    # post-MFMA per-token fold.
+                    scale_lds.store(
+                        kscale_f32,
+                        [arith.index_cast(
+                            T.index,
+                            tok_in_tile * fx.Int32(N_GROUPS) + chunk_in_tok,
+                        )],
                     )
+                elif const_expr(QK_SCALED):
+                    # qk_scaled: store raw FP4 codes (natural contiguous order,
+                    # 16 bytes = 32 nibbles per group) directly to KV LDS for the
+                    # scaled MFMA A operand. No dequant needed here.
+                    k_code_idx = (
+                        tok_in_tile * fx.Int32(HEAD_SIZE // 8)
+                        + chunk_in_tok * fx.Int32(4)
+                    )
+                    vector.store(
+                        k_packed, kv_lds_i32,
+                        [arith.index_cast(T.index, k_code_idx)],
+                    )
+                    # Stage raw UE8M0 byte (0..255) for the scaleA word assembly.
+                    scale_lds_i32.store(
+                        kscale_byte,
+                        [arith.index_cast(
+                            T.index,
+                            tok_in_tile * fx.Int32(N_GROUPS) + chunk_in_tok,
+                        )],
+                    )
+                else:
+                    # K dequant → LDS [token, head_dim] (natural)
+                    # Lane writes 32 bf16 (= 4×8) for token=tok_in_tile,
+                    # head_dims chunk_in_tok*32..+31 (4 sub-chunks of 8).
+                    tok_kreg = tok_in_tile * fx.Int32(HEAD_SIZE * 2 // 8)
+                    chunk_kreg = tok_kreg + chunk_in_tok * fx.Int32(8)
+                    for w in range_constexpr(4):
+                        word_i32 = vector.extract(k_packed, static_position=[w])
+                        bf16_elems = []
+                        for n in range_constexpr(8):
+                            nibble = (word_i32 >> fx.Int32(n * 4)) & fx.Int32(0xF)
+                            nibble_idx = arith.index_cast(T.index, nibble)
+                            cent_f32 = cent_lds.load([nibble_idx])
+                            elem_bf16 = arith.trunc_f(T.bf16, cent_f32 * kscale_f32)
+                            bf16_elems.append(elem_bf16)
+                        v_bf16 = vector.from_elements(T.vec(8, T.bf16), bf16_elems)
+                        v_i64 = vector.bitcast(T.vec(2, T.i64), v_bf16)
+                        vector.store(
+                            v_i64, kv_lds_i64,
+                            [arith.index_cast(T.index, chunk_kreg + fx.Int32(w * 2))],
+                        )
                 gpu.barrier()
 
-                # QK MFMA (CDNA4 wide-K): A=K[token, head_dim], B=Q (= Q^T).
-                # K read: lane t = K[token=mfma_row, head_dim=chunk*32+col_grp*8..+7]
-                # Same i64×2 indexing as Q.
-                qk_acc = zero_v4
-                for chk in range_constexpr(QK_K_CHUNKS):
-                    k_idx_i64 = (
-                        mfma_row * fx.Int32(HEAD_SIZE * 2 // 8)
-                        + fx.Int32(chk * 8)
-                        + mfma_col_grp * fx.Int32(2)
+                if const_expr(QK_FP8):
+                    # qk_fp8 QK: 4× mfma_f32_16x16x32_fp8_fp8 (K=32 == one
+                    # UE8M0 group). A=K[token, head_dim] E4M3 (8 fp8/lane = 1
+                    # i64 at byte mfma_row*HEAD_SIZE + chk*32 + col_grp*8),
+                    # B=Q E4M3. Each group's fp32 accumulator is multiplied by
+                    # the per-token UE8M0 scale vec4 (lane holds 4 tokens
+                    # col_grp*4..+3) then summed:  scores = Σ_g scale_g·partial_g.
+                    qk_acc = zero_v4
+                    for chk in range_constexpr(QK_K_CHUNKS):
+                        k_idx_i64 = (
+                            mfma_row * fx.Int32(HEAD_SIZE // 8)
+                            + fx.Int32(chk * 4)
+                            + mfma_col_grp
+                        )
+                        k_op = vector.extract(
+                            vector.load_op(
+                                T.vec(1, T.i64), kv_lds_i64,
+                                [arith.index_cast(T.index, k_idx_i64)],
+                            ),
+                            static_position=[0],
+                        )
+                        grp_acc = rocdl.mfma_f32_16x16x32_fp8_fp8(
+                            T.f32x4, [k_op, q_fp8_chunks[chk], zero_v4, 0, 0, 0]
+                        )
+                        # Fold the per-token UE8M0 scale for this group: the 4
+                        # fp32/lane are tokens col_grp*4+elem; multiply each by
+                        # scale_lds[token, chk] and accumulate into qk_acc.
+                        for elem in range_constexpr(4):
+                            s_idx = (
+                                (mfma_col_grp * fx.Int32(4) + fx.Int32(elem))
+                                * fx.Int32(N_GROUPS)
+                                + fx.Int32(chk)
+                            )
+                            se = scale_lds.load([arith.index_cast(T.index, s_idx)])
+                            pe = vector.extract(grp_acc, static_position=[elem])
+                            cur = vector.extract(qk_acc, static_position=[elem])
+                            qk_acc = vector.insert(
+                                cur + pe * se, qk_acc,
+                                static_position=[elem], dynamic_position=[],
+                            )
+                elif const_expr(QK_SCALED):
+                    # qk_scaled QK: SINGLE native scaled MFMA over K=128.
+                    #   A = K raw FP4 codes (vec4 i32 = 16 bytes) per
+                    #       (token=mfma_row, group=mfma_col_grp) from K-code LDS.
+                    #   B = Q E4M3 (vec8 i32 = 32 bytes): 4 sub-chunks of 8 bf16
+                    #       from Q_LDS converted in-register (or hoisted).
+                    #   scaleA = per-(token,group) UE8M0 byte at op_sel byte 0.
+                    #   scaleB = 0x7F identity.
+                    BLGP_E2M1 = 4   # A operand type code = fp4 e2m1
+                    CBSZ_E4M3 = 0   # B operand type code = fp8 e4m3
+                    IDENT = fx.Int32(0x7F)
+                    k_code_idx = (
+                        mfma_row * fx.Int32(HEAD_SIZE // 8)
+                        + mfma_col_grp * fx.Int32(4)
                     )
-                    kv_load = vector.load_op(
-                        T.vec(2, T.i64), kv_lds_i64,
-                        [arith.index_cast(T.index, k_idx_i64)],
+                    k_op = vector.load_op(
+                        T.vec(4, T.i32), kv_lds_i32,
+                        [arith.index_cast(T.index, k_code_idx)],
                     )
-                    k_op = vector.bitcast(T.vec(8, T.bf16), kv_load)
-                    qk_acc = rocdl.mfma_f32_16x16x32_bf16(
-                        T.f32x4, [k_op, q_chunks[chk], qk_acc, 0, 0, 0]
+                    if const_expr(Q_HOIST):
+                        q_op = q_op_hoisted
+                    else:
+                        q_fp8_words = []
+                        for j in range_constexpr(4):
+                            q_idx_i64 = (
+                                mfma_row * fx.Int32(HEAD_SIZE * 2 // 8)
+                                + mfma_col_grp * fx.Int32(8)
+                                + fx.Int32(j * 2)
+                            )
+                            qv = vector.load_op(
+                                T.vec(2, T.i64), q_lds_i64,
+                                [arith.index_cast(T.index, q_idx_i64)],
+                            )
+                            q_fp8_words.append(
+                                _bf16x8_to_fp8_i64(
+                                    vector.bitcast(T.vec(8, T.bf16), qv))
+                            )
+                        q_op = vector.bitcast(
+                            T.vec(8, T.i32),
+                            vector.from_elements(T.vec(4, T.i64), q_fp8_words),
+                        )
+                    scbyte = fx.Int32(scale_lds_i32.load(
+                        [arith.index_cast(
+                            T.index,
+                            mfma_row * fx.Int32(N_GROUPS) + mfma_col_grp)]
+                    ))
+                    kscale = fx.Int32(0x7F7F7F00) | scbyte
+                    qk_acc = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        T.vec(4, T.f32),
+                        [k_op, q_op, zero_v4,
+                         BLGP_E2M1, CBSZ_E4M3, 0, kscale, 0, IDENT],
                     )
+                    if ARCH_B:
+                        qk_acc = _vsplat_mul(
+                            qk_acc, arith.constant(SCALE_C, type=T.f32))
+                else:
+                    # QK MFMA (CDNA4 wide-K): A=K[token, head_dim], B=Q (= Q^T).
+                    # K read: lane t = K[token=mfma_row, head_dim=chunk*32+col_grp*8..+7]
+                    # Same i64×2 indexing as Q.
+                    qk_acc = zero_v4
+                    for chk in range_constexpr(QK_K_CHUNKS):
+                        k_idx_i64 = (
+                            mfma_row * fx.Int32(HEAD_SIZE * 2 // 8)
+                            + fx.Int32(chk * 8)
+                            + mfma_col_grp * fx.Int32(2)
+                        )
+                        kv_load = vector.load_op(
+                            T.vec(2, T.i64), kv_lds_i64,
+                            [arith.index_cast(T.index, k_idx_i64)],
+                        )
+                        k_op = vector.bitcast(T.vec(8, T.bf16), kv_load)
+                        qk_acc = rocdl.mfma_f32_16x16x32_bf16(
+                            T.f32x4, [k_op, q_chunks[chk], qk_acc, 0, 0, 0]
+                        )
 
                 # qk_acc layout: lane t holds C[token=(t/16)*4..+3, query=t%16]
                 # 4 fp32/lane = 4 different tokens at SAME query_row.
@@ -741,16 +984,35 @@ def build_fp8_g32_decode_v4_module(
                     )
                     for w in range_constexpr(4):
                         word_i32 = vector.extract(v_packed, static_position=[w])
-                        bf16_elems = []
-                        for n in range_constexpr(8):
-                            nibble = (word_i32 >> fx.Int32(n * 4)) & fx.Int32(0xF)
-                            nibble_idx = arith.index_cast(T.index, nibble)
-                            cent_f32 = cent_lds.load([nibble_idx])
-                            elem_f32 = cent_f32 * vscale_f32
-                            elem_bf16 = arith.trunc_f(T.bf16, elem_f32)
-                            bf16_elems.append(elem_bf16)
-                        v_bf16 = vector.from_elements(T.vec(8, T.bf16), bf16_elems)
-                        v_i64 = vector.bitcast(T.vec(2, T.i64), v_bf16)
+                        if const_expr(V_CVT):
+                            # Native CDNA4 scaled convert: 2-wide cvt_scalef32_pk_bf16_fp4.
+                            # srcSelIndex s picks byte s of the 32-bit code word
+                            # (nibbles 2s, 2s+1) → 2 bf16 with UE8M0 scale fused.
+                            # 4 cvt calls/word replace 8×(LUT gather + mul + trunc).
+                            bf16_elems = []
+                            for s in range_constexpr(4):
+                                v2 = rocdl.cvt_scalef32_pk_bf16_fp4(
+                                    T.vec(2, T.bf16),
+                                    _ival(word_i32), _ival(vscale_f32), int(s),
+                                )
+                                bf16_elems.append(
+                                    vector.extract(v2, static_position=[0]))
+                                bf16_elems.append(
+                                    vector.extract(v2, static_position=[1]))
+                            v_bf16 = vector.from_elements(
+                                T.vec(8, T.bf16), bf16_elems)
+                            v_i64 = vector.bitcast(T.vec(2, T.i64), v_bf16)
+                        else:
+                            bf16_elems = []
+                            for n in range_constexpr(8):
+                                nibble = (word_i32 >> fx.Int32(n * 4)) & fx.Int32(0xF)
+                                nibble_idx = arith.index_cast(T.index, nibble)
+                                cent_f32 = cent_lds.load([nibble_idx])
+                                elem_f32 = cent_f32 * vscale_f32
+                                elem_bf16 = arith.trunc_f(T.bf16, elem_f32)
+                                bf16_elems.append(elem_bf16)
+                            v_bf16 = vector.from_elements(T.vec(8, T.bf16), bf16_elems)
+                            v_i64 = vector.bitcast(T.vec(2, T.i64), v_bf16)
                         v_lds_i64_idx = (
                             v_lds_elem_base + fx.Int32(w * 8)
                         ) // fx.Int32(4)
