@@ -163,6 +163,8 @@ from vllm.v1.attention.ops.flydsl_turboquant_decode_v4 import (
     flydsl_turboquant_decode_attention_v4,
     is_flydsl_available as _flydsl_v4_available,
     is_flydsl_gqa6_available as _flydsl_v4_gqa6_available,
+    is_flydsl_hd256_available as _flydsl_v4_hd256_available,
+    is_flydsl_gqa6_hd256_available as _flydsl_v4_gqa6_hd256_available,
 )
 from vllm.v1.attention.ops.flydsl_fp8_g32_decode_v4 import (
     flydsl_fp8_g32_decode_attention_v4,
@@ -2055,15 +2057,31 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # so the decode kernel just multiplies ``c_vals * stored_knorm``
             # regardless of whether the model uses norm_correction or not.
             # v3 keeps NORM_CORRECTION as a constexpr only for API parity.
+            #   * HEAD_SIZE=256 (Qwen3.6-27B / Qwen3.5-397B): GQA-{8,16} →
+            #     tq_decode_hd256 sibling; GQA-6 → tq_decode_gqa6_hd256 sibling.
+            #     Both are optional modules gated here so missing ones route to
+            #     v3 rather than erroring at launch.
             _gqa = self.num_kv_groups
-            v4_gqa_ok = (_gqa in (8, 16)) or (
-                _gqa == 6 and _flydsl_v4_gqa6_available()
-            )
+            if self.head_size == 256:
+                if _gqa in (8, 16):
+                    v4_hs_ok = _flydsl_v4_hd256_available()
+                    v4_gqa_ok = True
+                elif _gqa == 6:
+                    v4_hs_ok = _flydsl_v4_gqa6_hd256_available()
+                    v4_gqa_ok = True
+                else:
+                    v4_hs_ok = False
+                    v4_gqa_ok = False
+            else:
+                v4_hs_ok = self.head_size == 128
+                v4_gqa_ok = (_gqa in (8, 16)) or (
+                    _gqa == 6 and _flydsl_v4_gqa6_available()
+                )
             v4_eligible = (
                 not self.tq_config.key_fp8
                 and self.tq_config.key_mse_bits == 4
                 and self.tq_config.effective_value_quant_bits == 4
-                and self.head_size == 128
+                and v4_hs_ok
                 and v4_gqa_ok
                 and self.sinks is None
                 # SWA layers must route to V3 unified — V4 has no
