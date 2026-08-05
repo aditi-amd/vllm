@@ -115,6 +115,25 @@ CENTROID_LDS_BYTES = N_CENTROIDS * 4  # 64
 Q_LDS_BYTES = QUERY_GROUP_SIZE * HEAD_SIZE * 2  # 8192 for HEAD_SIZE=256
 KV_TILE_LDS_BYTES = TILE_SIZE * HEAD_SIZE * 2  # 8192 for HEAD_SIZE=256
 
+# --- KV-tile LDS bank-conflict padding (HW_TR / K path) ---------------------
+# The KV tile is laid out ``[token][head_dim]`` in LDS. With an unpadded row
+# stride of HEAD_SIZE=256 bf16 = 512 B = exactly 128 LDS banks (a multiple of
+# the 32-bank width), EVERY token-row starts on the same bank. The QK MFMA
+# read (lane ``t`` reads K[token=mfma_row, ...]) then has all 16 tokens hit
+# the same bank -> a 16-way bank conflict, which rocprof measured at ~64% of
+# the decode kernel's LDS cycles. Padding each token row by KV_ROW_PAD_ELEMS
+# bf16 shifts consecutive token rows onto different banks. PAD=8 (16 B, keeps
+# ds_write_b128 / ds_read_b64_tr alignment) turns the 16-way conflict into a
+# 2-way one (row bank offset = (264/2) % 32 = 4 banks/row). This is a pure
+# addressing change: the per-token base multiplier grows from 64 -> 66 i64,
+# while WITHIN-token offsets (the real 256 head-dims) are unchanged, so the
+# dequant math and MFMA operands are bit-identical.
+KV_ROW_PAD_ELEMS = 8                                  # bf16 padding per token row
+KV_ROW_ELEMS = HEAD_SIZE + KV_ROW_PAD_ELEMS           # 264
+KV_ROW_I64 = KV_ROW_ELEMS // 4                        # 66 (i64 per padded row)
+KV_ROW_BYTES = KV_ROW_ELEMS * 2                       # 528
+KV_TILE_LDS_BYTES_PADDED = TILE_SIZE * KV_ROW_BYTES   # 8448
+
 LOG2E = 1.4426950408889634
 NEG_INF_VAL = float("-inf")
 
@@ -138,6 +157,8 @@ def build_tq_decode_hd256_module(
     use_hw_v_transpose: bool = False,
     tile_groups_per_partition: int = 1,
     use_wht_butterfly: bool = False,
+    sliding_window: int = 0,
+    cache_block_stride_bytes: int = 0,
 ):
     """Build a HEAD_SIZE=256 TQ decode kernel module.
 
@@ -180,8 +201,13 @@ def build_tq_decode_hd256_module(
     pass the raw ``query`` tensor instead of ``q_rot`` when this is True.
     Gate: ``VLLM_TQ_FLYDSL_WHT_BUTTERFLY=1``.
     """
-    assert query_group_size in (8, 16), (
-        f"query_group_size must be 8 or 16; got {query_group_size}"
+    # GQA=2 (Gemma 4 sliding layers: 32 q-heads / 16 kv-heads) is under
+    # evaluation. The 16-row MFMA is filled with 2 real query rows and the
+    # remaining 14 are OOB-gated exactly as the QG=8 half-fill path already
+    # does. Q-load geometry is clean at QG=2 (QG*Q_GROUPS_PER_ROW == WARP_SIZE
+    # -> a single load iteration).
+    assert query_group_size in (2, 8, 16), (
+        f"query_group_size must be 2, 8 or 16; got {query_group_size}"
     )
     # Hybrid models (Qwen3.6-27B: mamba + full-attention) force the attention
     # block size up to match the mamba page size (e.g. 128), so 256-wide-head
@@ -214,6 +240,14 @@ def build_tq_decode_hd256_module(
     USE_HW_TR = bool(use_hw_v_transpose)
     TGPP = int(tile_groups_per_partition)
     PARTITION_EXTENT_TOKENS = TGPP * KV_COMPUTE_BLOCK
+    # Sliding-window attention (decode). The single decode query at position
+    # seq_len-1 attends to a contiguous window [seq_len-SWA, seq_len). We shift
+    # every partition's base to the KV_COMPUTE_BLOCK-aligned window start (so
+    # partitions cover only the window, not the full context) and mask the
+    # aligned-down slack per token. SWA==0 is the full-attention path, bit-
+    # identical to before (no base shift, no extra mask).
+    SWA = int(sliding_window)
+    assert SWA >= 0, f"sliding_window must be >= 0; got {SWA}"
 
     QG = int(query_group_size)
     # STEP B row-major Q load: total column-groups = QG * Q_GROUPS_PER_ROW,
@@ -240,7 +274,24 @@ def build_tq_decode_hd256_module(
 
     _data_region_bytes = _BS * num_kv_heads * DATA_BYTES_PER_SLOT
     _meta_region_bytes = num_kv_heads * NUM_SOA_FIELDS * _BS * 2
-    _stride_cache_block = _data_region_bytes + _meta_region_bytes
+    _natural_block_bytes = _data_region_bytes + _meta_region_bytes
+    # Block-to-block byte stride. For a contiguous KV cache this equals the
+    # natural [data|meta] block size. Gemma 4 unifies two page sizes (its
+    # D=256 sliding pages are padded up to the D=512 global page), so vLLM
+    # hands us a STRIDED view whose stride(0) exceeds the natural block. The
+    # within-block [data|meta] layout is unchanged (only trailing padding is
+    # added), so overriding just this block stride is sufficient; the launcher
+    # passes ``kv_cache.stride(0) * element_size``. 0 => use natural (Qwen /
+    # any contiguous cache), keeping those binaries bit-identical.
+    _stride_cache_block = (
+        int(cache_block_stride_bytes)
+        if int(cache_block_stride_bytes) > 0
+        else _natural_block_bytes
+    )
+    assert _stride_cache_block >= _natural_block_bytes, (
+        f"cache_block_stride_bytes={cache_block_stride_bytes} < natural block "
+        f"{_natural_block_bytes}; padding can only grow the block stride"
+    )
     _meta_region_offset = _data_region_bytes
 
     _stride_out_part = QG * HEAD_SIZE
@@ -250,13 +301,24 @@ def build_tq_decode_hd256_module(
     _stride_ml_seq = _stride_es_seq
 
     # --- LDS layout ---
+    # Q_LDS is sized to the ACTUAL GQA factor, not the max QUERY_GROUP_SIZE.
+    # The 16-row MFMA B-operand only has QG real query rows; the phantom rows
+    # (QG..15) are OOB-gated at store, and STEP C reads them via a
+    # ``mfma_row & (QG-1)`` replication (QG in {2,8,16} are powers of two) so
+    # no read ever lands outside the QG-row buffer. For Gemma's GQA=2 sliding
+    # layers this shrinks Q_LDS 8192 -> 1024 B, dropping per-CTA LDS from
+    # 16512 -> 9280 B and ~doubling occupancy (LDS was the binding limit at
+    # 64KB/CU -> 3 CTAs; 9280 B -> 6 CTAs). At QG=16 it equals the old size,
+    # so those binaries stay bit-identical.
+    _QLDS_BYTES = QG * HEAD_SIZE * 2
+    _QG_ROW_MASK = QG - 1  # QG is a power of two for the hd256 canonical kernel
     allocator = SmemAllocator(None, arch=arch, global_sym_name="tq_smem")
     centroid_off = 0
     allocator.ptr = CENTROID_LDS_BYTES
     q_off = allocator.ptr
-    allocator.ptr += Q_LDS_BYTES
+    allocator.ptr += _QLDS_BYTES
     kv_off = allocator.ptr
-    allocator.ptr += KV_TILE_LDS_BYTES
+    allocator.ptr += KV_TILE_LDS_BYTES_PADDED
 
     @flyc.kernel
     def tq_decode_kernel(
@@ -281,7 +343,6 @@ def build_tq_decode_hd256_module(
 
         # ---- Buffer resources -------------------------------------------
         q_rsrc = buffer_ops.create_buffer_resource(query_ptr, max_size=True)
-        kv_rsrc = buffer_ops.create_buffer_resource(kv_cache_ptr, max_size=True)
         bt_rsrc = buffer_ops.create_buffer_resource(block_tables_ptr, max_size=True)
         sl_rsrc = buffer_ops.create_buffer_resource(seq_lens_ptr, max_size=True)
         cent_rsrc = buffer_ops.create_buffer_resource(centroids_ptr, max_size=True)
@@ -292,11 +353,11 @@ def build_tq_decode_hd256_module(
         # ---- LDS pointers -----------------------------------------------
         base = allocator.get_base()
         cent_lds = SmemPtr(base, centroid_off, T.f32, shape=(N_CENTROIDS,))
-        q_lds_i32 = SmemPtr(base, q_off, T.i32, shape=(Q_LDS_BYTES // 4,)).get()
-        q_lds_i64 = SmemPtr(base, q_off, T.i64, shape=(Q_LDS_BYTES // 8,)).get()
-        kv_lds_i32 = SmemPtr(base, kv_off, T.i32, shape=(KV_TILE_LDS_BYTES // 4,)).get()  # noqa: F841
-        kv_lds_i64 = SmemPtr(base, kv_off, T.i64, shape=(KV_TILE_LDS_BYTES // 8,)).get()
-        kv_lds_i16 = SmemPtr(base, kv_off, T.i16, shape=(KV_TILE_LDS_BYTES // 2,)).get()
+        q_lds_i32 = SmemPtr(base, q_off, T.i32, shape=(_QLDS_BYTES // 4,)).get()
+        q_lds_i64 = SmemPtr(base, q_off, T.i64, shape=(_QLDS_BYTES // 8,)).get()
+        kv_lds_i32 = SmemPtr(base, kv_off, T.i32, shape=(KV_TILE_LDS_BYTES_PADDED // 4,)).get()  # noqa: F841
+        kv_lds_i64 = SmemPtr(base, kv_off, T.i64, shape=(KV_TILE_LDS_BYTES_PADDED // 8,)).get()
+        kv_lds_i16 = SmemPtr(base, kv_off, T.i16, shape=(KV_TILE_LDS_BYTES_PADDED // 2,)).get()
 
         # ---- Constants ---------------------------------------------------
         c_sq = fx.Int32(_stride_q_seq)
@@ -450,10 +511,17 @@ def build_tq_decode_hd256_module(
         #          = mfma_row * 256 + chunk*64 + col_grp*16
         # i64 idx  = mfma_row * 32 + chunk*8 + col_grp*2 (each i64 = 4 bf16)
         # Load 16 bytes (= 8 bf16 = 2 i64) per chunk via vec(2, i64).
+        # Q_LDS holds only QG real rows now (see LDS-layout note). Phantom MFMA
+        # rows QG..15 replicate a real row via ``mfma_row & (QG-1)`` so the read
+        # never leaves the QG-row buffer. Their MFMA outputs are OOB-gated at
+        # store, so replicating (vs. reading uninitialized LDS) is a functional
+        # no-op for the valid rows and avoids any out-of-range LDS access. At
+        # QG=16 the mask is identity -> bit-identical to the pre-shrink kernel.
+        q_row = mfma_row & fx.Int32(_QG_ROW_MASK)
         q_chunks = []
         for chk in range_constexpr(QK_K_CHUNKS):
             q_idx_i64 = (
-                mfma_row * fx.Int32(HEAD_SIZE * 2 // 8)
+                q_row * fx.Int32(HEAD_SIZE * 2 // 8)
                 + fx.Int32(chk * 8)
                 + mfma_col_grp * fx.Int32(2)
             )
@@ -480,6 +548,39 @@ def build_tq_decode_hd256_module(
         # (running_max, running_sum, acc_pv) accumulates across all
         # ``TGPP * 16`` tiles for this CTA — semantically identical to
         # processing one large 16*TGPP-tile partition.
+        # Sliding-window base shift. window_start = max(0, seq_len - SWA) is the
+        # exact per-token lower bound; ws_aligned rounds it down to a
+        # KV_COMPUTE_BLOCK boundary so the block-table / tile indexing stays
+        # aligned (KV_COMPUTE_BLOCK is a multiple of _BS). Partitions then tile
+        # [ws_aligned, seq_len); the [ws_aligned, window_start) slack is masked
+        # per token in STEP F. For SWA==0 both are 0 → unchanged full attention.
+        # Computed UNCONDITIONALLY (no traced `if`): FlyDSL lowers Python `if`
+        # to scf.if, whose block-local SSA values are invisible afterwards, so
+        # the branch idiom can only carry side effects — not the Python values
+        # window_start / ws_aligned / partition_base used below. Instead
+        # ``_SWA_FLAG`` (a compile-time Python constant) forces the shift and
+        # the mask bound to 0 when SWA==0, making the full-attention path a
+        # numeric no-op (``window_start = _ws_pos * 0`` folds to 0, the extra
+        # ``kv_tok < 0`` predicate never fires → output bit-identical).
+        _SWA_FLAG = 1 if SWA > 0 else 0
+        _ws_raw = seq_len - fx.Int32(SWA)
+        _ws_pos = (_ws_raw > fx.Int32(0)).select(_ws_raw, fx.Int32(0))
+        window_start = _ws_pos * fx.Int32(_SWA_FLAG)
+        # Correctness-first SWA: do NOT base-shift. Partition from absolute 0
+        # (full coverage, identical to the validated non-SWA path) and rely
+        # solely on the per-token window mask in STEP F for windowing. This
+        # mirrors the v3 SoA decode, which scans tiles from 0 and applies a
+        # per-token ``(query_abs_pos - key) < SLIDING_WINDOW`` mask. The earlier
+        # base-shift + window-resized partitioning was a pruning optimization
+        # that diverged from v3 once seq_len exceeded the window (shadow
+        # cos_min ~0.65 at seq_len=2226, window=1024) — the block-table /
+        # partition-reduction bookkeeping under the shifted base did not match
+        # v3's absolute-position scan. Dropped for numerical parity; tile
+        # pruning can be reintroduced later as a proven-safe skip of
+        # fully-masked leading tiles. ``window_start`` (computed above) is still
+        # the exact per-token lower bound used by the STEP F mask, and folds to
+        # 0 when SWA==0 so the full-attention path stays bit-identical.
+        ws_aligned = fx.Int32(0)
         partition_base = part * fx.Int32(PARTITION_EXTENT_TOKENS)
 
         # Per-K-tile dequant lane assignment:
@@ -600,9 +701,18 @@ def build_tq_decode_hd256_module(
                     vec_width=1,
                     dtype=T.i32,
                 )
-                block_base = phys_block * c_block
-                data_region = block_base
-                meta_region = block_base + c_meta_off
+                # A buffer descriptor addresses with a 32-bit voffset, so
+                # ``phys_block * c_block`` wraps once the cache view exceeds
+                # 4 GiB. Fold the block base into the descriptor's 64-bit
+                # base pointer and keep only in-block offsets below.
+                blk_off_i64 = (
+                    arith.extui(T.i64, phys_block) * fx.Int64(_stride_cache_block)
+                )
+                blk_rsrc = buffer_ops.create_block_buffer_resource(
+                    kv_cache_ptr, blk_off_i64
+                )
+                data_region = fx.Int32(0)
+                meta_region = c_meta_off
 
                 # ``slot`` is the absolute slot index within the cache block
                 # (range 0.._BS-1). For BS=16 it equals tok_in_tile; for BS=32
@@ -624,7 +734,7 @@ def build_tq_decode_hd256_module(
                 for hf in range_constexpr(HALVES):
                     k_packed_list.append(
                         buffer_ops.buffer_load(
-                            kv_rsrc,
+                            blk_rsrc,
                             (k_byte0 + fx.Int32(hf * 16)) // fx.Int32(4),
                             vec_width=4,
                             dtype=T.i32,
@@ -642,7 +752,7 @@ def build_tq_decode_hd256_module(
                 for hf in range_constexpr(HALVES):
                     v_packed_list.append(
                         buffer_ops.buffer_load(
-                            kv_rsrc,
+                            blk_rsrc,
                             (v_byte0 + fx.Int32(hf * 16)) // fx.Int32(4),
                             vec_width=4,
                             dtype=T.i32,
@@ -661,13 +771,13 @@ def build_tq_decode_hd256_module(
                     + slot
                 )
                 vscale_raw = buffer_ops.buffer_load(
-                    kv_rsrc,
+                    blk_rsrc,
                     vscale_u16,
                     vec_width=1,
                     dtype=T.i16,
                 )
                 vzero_raw = buffer_ops.buffer_load(
-                    kv_rsrc,
+                    blk_rsrc,
                     vzero_u16,
                     vec_width=1,
                     dtype=T.i16,
@@ -680,7 +790,7 @@ def build_tq_decode_hd256_module(
                     + slot
                 )
                 knorm_raw = buffer_ops.buffer_load(
-                    kv_rsrc,
+                    blk_rsrc,
                     knorm_u16,
                     vec_width=1,
                     dtype=T.i16,
@@ -692,7 +802,10 @@ def build_tq_decode_hd256_module(
                 # Lane writes SUBCHUNK_HDIMS bf16 for token=tok_in_tile,
                 # head_dims chunk_in_tok*SUBCHUNK_HDIMS..+ (HALVES halves of
                 # 32 head-dims each, 4 words × 8 nibbles per half).
-                tok_kreg = tok_in_tile * fx.Int32(I64_PER_TOKEN)
+                # Padded per-token base (KV_ROW_I64=66 vs natural 64) to break
+                # the 16-way QK-read bank conflict; within-token chunk offset
+                # (SUBCHUNK_I64) stays on the real head-dim layout.
+                tok_kreg = tok_in_tile * fx.Int32(KV_ROW_I64)
                 chunk_kreg = tok_kreg + chunk_in_tok * fx.Int32(SUBCHUNK_I64)
                 for hf in range_constexpr(HALVES):
                     k_packed = k_packed_list[hf]
@@ -724,8 +837,9 @@ def build_tq_decode_hd256_module(
                 # Same i64×2 indexing as Q.
                 qk_acc = zero_v4
                 for chk in range_constexpr(QK_K_CHUNKS):
+                    # Padded token-row stride (KV_ROW_I64) matches the K write.
                     k_idx_i64 = (
-                        mfma_row * fx.Int32(HEAD_SIZE * 2 // 8)
+                        mfma_row * fx.Int32(KV_ROW_I64)
                         + fx.Int32(chk * 8)
                         + mfma_col_grp * fx.Int32(2)
                     )
@@ -753,8 +867,18 @@ def build_tq_decode_hd256_module(
                     )
                     in_b = kv_tok < seq_len
                     v = vector.extract(qk_acc, static_position=[elem])
+                    v = in_b.select(v, NEG_INF)
+                    # SWA lower bound, applied UNCONDITIONALLY (see STEP E): mask
+                    # keys before the window start. window_start is 0 when
+                    # SWA==0, so ``kv_tok < 0`` never fires and this is a no-op
+                    # on the full-attention path (output bit-identical). Uses the
+                    # (kv_tok < window_start) -> NEG_INF form to avoid a >=
+                    # primitive; window_start is the exact bound so the
+                    # aligned-down slack tokens are correctly excluded.
+                    _below = kv_tok < window_start
+                    v = _below.select(NEG_INF, v)
                     qk_acc = vector.insert(
-                        in_b.select(v, NEG_INF),
+                        v,
                         qk_acc,
                         static_position=[elem],
                         dynamic_position=[],
@@ -803,6 +927,39 @@ def build_tq_decode_hd256_module(
                 vscale_f32 = arith.extf(T.f32, arith.bitcast(T.f16, vscale_raw))
                 vzero_f32 = arith.extf(T.f32, arith.bitcast(T.f16, vzero_raw))
 
+                # ---- Stale/OOB V-metadata sanitize (NaN-propagation fix) ----
+                # With prefix caching off, KV blocks are recycled; slots
+                # >= seq_len within the final block hold arbitrary bytes from a
+                # prior sequence. Their fp16 vscale/vzero can decode to +/-Inf
+                # or NaN. The QK stage masks those tokens (score -> NEG_INF, so
+                # P == 0), but the subsequent P@V MFMA still evaluates
+                # 0 * Inf = NaN, which poisons this partition's segm_out. The
+                # NaN then flows out through the reducer into the attention
+                # output, the residual stream and finally the KV store, so a
+                # single stale slot silently corrupts the cache for every later
+                # request (observed as a progressive GSM8K collapse
+                # 95 -> 82 -> 52 -> 35 that shadow-compare cannot see, because
+                # its v3 oracle reads the same already-corrupted KV).
+                #
+                # A legitimate vscale/vzero is always finite, so clamping any
+                # non-finite value to 0 is a no-op for real tokens and makes the
+                # masked-token product a clean 0 * 0 = 0. Clamp +/-Inf first,
+                # then map NaN (which fails both ordered compares) to 0.
+                _VBIG = fx.Float32(1.0e30)
+                _VNBIG = fx.Float32(-1.0e30)
+                vscale_f32 = (vscale_f32 > _VBIG).select(ZERO_F, vscale_f32)
+                vscale_f32 = (vscale_f32 < _VNBIG).select(ZERO_F, vscale_f32)
+                vscale_f32 = (vscale_f32 > ZERO_F).select(
+                    vscale_f32,
+                    (vscale_f32 < ZERO_F).select(vscale_f32, ZERO_F),
+                )
+                vzero_f32 = (vzero_f32 > _VBIG).select(ZERO_F, vzero_f32)
+                vzero_f32 = (vzero_f32 < _VNBIG).select(ZERO_F, vzero_f32)
+                vzero_f32 = (vzero_f32 > ZERO_F).select(
+                    vzero_f32,
+                    (vzero_f32 < ZERO_F).select(vzero_f32, ZERO_F),
+                )
+
                 if USE_HW_TR:
                     # V dequant → LDS [token][head_dim] (ROW-MAJOR, no transpose).
                     # Each lane writes SUBCHUNK_HDIMS contiguous bf16 (one token,
@@ -810,7 +967,7 @@ def build_tq_decode_hd256_module(
                     # HALVES=2 for HEAD_SIZE=256 (each half = 32 head-dims);
                     # HALVES=1 for HEAD_SIZE=128 → identical to canonical kernel.
                     v_lds_elem_base = tok_in_tile * fx.Int32(
-                        HEAD_SIZE
+                        KV_ROW_ELEMS
                     ) + chunk_in_tok * fx.Int32(SUBCHUNK_HDIMS)
                     for hf in range_constexpr(HALVES):
                         v_packed = v_packed_list[hf]
@@ -914,7 +1071,7 @@ def build_tq_decode_hd256_module(
                     hd_sub = (lane & fx.Int32(3)) * fx.Int32(4)
                     v_lane_byte = (
                         fx.Int32(kv_off)
-                        + token_idx * fx.Int32(HEAD_SIZE * 2)
+                        + token_idx * fx.Int32(KV_ROW_BYTES)
                         + hd_sub * fx.Int32(2)
                     )
                     for h in range_constexpr(PV_N_CHUNKS):

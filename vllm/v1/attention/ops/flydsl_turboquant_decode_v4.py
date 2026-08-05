@@ -381,6 +381,17 @@ class _SegmBufPool:
 
 
 _SEGM_POOL = _SegmBufPool()
+_SEGM_DEBUG = os.environ.get("VLLM_TQ_V4_SEGM_DEBUG", "0") == "1"
+# VLLM_TQ_V4_NAN_GUARD=1: after the reducer, scan the decode output for
+# NaN/Inf. A single non-finite value here propagates into the hidden state and
+# then into the KV store, spreading persistent corruption across the whole KV
+# cache (and thus every subsequent request) — the suspected seed of the E2E
+# progressive-accuracy collapse that shadow-compare cannot see (its v3 oracle
+# reads the same already-corrupted KV). On first hit we log the full call
+# context so the exact inputs can be reproduced offline.
+_V4_NAN_GUARD = os.environ.get("VLLM_TQ_V4_NAN_GUARD", "0") == "1"
+_V4_NAN_HITS = 0
+_TENSOR_PROPS_LOGGED = False
 
 
 _HW_TR_CACHED: bool | None = None
@@ -447,7 +458,9 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
                 num_seqs_hint: int = 1,
                 tile_groups_per_partition: int = 1,
                 use_wht_butterfly: bool = False,
-                head_size: int = 128):
+                head_size: int = 128,
+                sliding_window: int = 0,
+                cache_block_stride_bytes: int = 0):
     # ``num_seqs_hint`` (= runtime B) is forwarded to the build for shape
     # awareness; it does NOT participate in the cache key because the
     # kernel body uses gpu.block_idx.x (= seq index at runtime) and is
@@ -455,10 +468,16 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
     #
     # ``tile_groups_per_partition`` (Option A) IS in the cache key — each
     # value compiles a different unrolled K-tile loop body.
+    # ``sliding_window`` IS in the cache key: it toggles the base-shift + mask
+    # codegen (SWA==0 is the unchanged full-attention binary).
+    # ``cache_block_stride_bytes`` IS in the cache key: a padded KV cache
+    # (Gemma 4 unified page) bakes a different block stride than the natural /
+    # contiguous case (0), so they are distinct binaries.
     key = (num_kv_heads, int(num_partitions), int(max_blocks_per_seq),
            round(float(scale), 8), int(query_group_size), int(kv_block_size),
            bool(use_hw_v_transpose), int(tile_groups_per_partition),
-           bool(use_wht_butterfly), int(head_size))
+           bool(use_wht_butterfly), int(head_size), int(sliding_window),
+           int(cache_block_stride_bytes))
     cached = _KERN_CACHE.get(key)
     if cached is not None:
         _GET_KERNEL_STATS["hits"] += 1
@@ -517,6 +536,8 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
                 use_hw_v_transpose=bool(use_hw_v_transpose),
                 tile_groups_per_partition=int(tile_groups_per_partition),
                 use_wht_butterfly=bool(use_wht_butterfly),
+                sliding_window=int(sliding_window),
+                cache_block_stride_bytes=int(cache_block_stride_bytes),
             )
     elif qg == 6:
         if _TQ_MOD_GQA6 is None:
@@ -685,6 +706,7 @@ def flydsl_turboquant_decode_attention_v4(
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,
     sinks: torch.Tensor | None = None,
+    sliding_window: int | None = None,
 ) -> torch.Tensor:
     """v3-compatible launcher backed by the FlyDSL v4 decode kernel.
 
@@ -744,7 +766,16 @@ def flydsl_turboquant_decode_attention_v4(
         assert block_size in (16, 32), (
             f"v4 supports kv_block_size 16 or 32, got {block_size}"
         )
-    assert QG in (6, 8, 16), f"v4 supports GQA factor 6, 8 or 16, got {QG}"
+    # QG=2 (Gemma 4 sliding layers, 32 q / 16 kv) is under evaluation on the
+    # HEAD_SIZE=256 canonical kernel: the 16-row MFMA half-fill + mfma_row<QG
+    # store gate already generalize below GQA-8. Only the D=256 canonical path
+    # is validated for QG=2; D=128 still requires {6,8,16}.
+    if D == 256:
+        assert QG in (2, 6, 8, 16), (
+            f"v4 head_dim=256 supports GQA factor 2, 6, 8 or 16, got {QG}"
+        )
+    else:
+        assert QG in (6, 8, 16), f"v4 supports GQA factor 6, 8 or 16, got {QG}"
     if D == 256 and QG == 6 and _TQ_MOD_GQA6_HD256 is None:
         raise RuntimeError(
             "FlyDSL v4 launcher: GQA-6 head_dim=256 requested (Qwen3.6-class) "
@@ -835,6 +866,43 @@ def flydsl_turboquant_decode_attention_v4(
     else:
         sizing_max_seq_len = worst_case_max_seq_len
 
+    # Sliding-window layers read at most ``window`` keys plus one aligned
+    # KV_COMPUTE_BLOCK of slack (the kernel shifts every partition base to the
+    # aligned window start). Sizing partitions to that span instead of the full
+    # context is the whole point of SWA on the decode path: at 128K with
+    # window=1024 this drops num_partitions/TGPP from covering 131072 tokens to
+    # ~1280, i.e. the kernel stops walking 100x of masked-out tiles. ``window``
+    # is a fixed per-layer constant, so this keeps num_partitions cudagraph-
+    # stable. Only applied on the SWA-capable HEAD_SIZE=256 path.
+    _swa = int(sliding_window) if sliding_window else 0
+    if _swa > 0:
+        # Only the canonical HEAD_SIZE=256 kernel (QG in {2,8,16}) implements
+        # the base-shift + window mask. Routing a sliding-window layer through
+        # any other build path (hd128, gqa6_hd256, or a future hd512) would
+        # silently run full attention — correct only until context exceeds the
+        # window — so fail loudly instead. The backend gate already restricts
+        # the SWA relaxation to head_size==256; this is defense in depth for
+        # direct launcher callers.
+        if D != 256 or QG == 6:
+            raise NotImplementedError(
+                f"FlyDSL v4 sliding_window is implemented only on the "
+                f"canonical head_dim=256 kernel (QG in 2/8/16); got "
+                f"head_dim={D}, QG={QG}. Route this layer to v3."
+            )
+        # Correctness-first SWA (matches the kernel change in
+        # tq_decode_hd256.py STEP E): the kernel no longer base-shifts to the
+        # aligned window start — it partitions from absolute 0 and windows
+        # purely via the per-token mask, exactly like the v3 SoA decode. So the
+        # partitions must cover the FULL sequence, not just the window span;
+        # sizing to ``swa_span`` here would leave the tail of long sequences
+        # uncovered (the window lives at the END of the sequence, not the
+        # start). We therefore keep ``sizing_max_seq_len`` at the worst-case
+        # context. The window-span pruning optimization was the source of the
+        # seq_len>window divergence vs v3 and is intentionally removed until it
+        # can be reintroduced as a proven-safe leading-tile skip. The guard
+        # above still restricts SWA to the hd256 QG∈{2,8,16} kernel.
+        _ = _swa + kv_compute_block  # (span kept for reference; no longer caps)
+
     # ── Option A: bounded num_partitions + internal tile-group looping ──
     # The kernel previously hardcoded one partition = 256 tokens (=
     # KV_COMPUTE_BLOCK), forcing num_partitions to scale linearly with
@@ -914,6 +982,13 @@ def flydsl_turboquant_decode_attention_v4(
     # allocate/preserve the pool slots so the pool state is consistent, but
     # no computation is performed on them.
     use_wht_bf = _wht_butterfly_enabled()
+    if use_wht_bf and D == 256:
+        logger.warning_once(
+            "FlyDSL head_dim=256: WHT butterfly not supported yet; using the "
+            "q@PiT GEMM rotation path instead "
+            "(VLLM_TQ_DECODE_V4_WHT_BUTTERFLY ignored for 256-wide heads)."
+        )
+        use_wht_bf = False
     if not use_wht_bf:
         _q_float = pool_bufs["q_float"]          # [B, Hq, D] fp32, stable
         _q_rot_f32 = pool_bufs["q_rot_fp32"]     # [B, Hq, D] fp32, stable mm output
@@ -935,6 +1010,22 @@ def flydsl_turboquant_decode_attention_v4(
     # ---- FlyDSL kernel launch -------------------------------------------
     max_bps = int(block_table.shape[1])
     use_hw_tr = _hw_tr_enabled()
+    # Padded-cache block stride (Gemma 4 unified page). vLLM hands the D=256
+    # sliding layers a strided KV view whose stride(0) exceeds the natural
+    # [data|meta] block (the sliding page is padded up to the D=512 global
+    # page). The kernel bakes the block stride as a constant, so we must pass
+    # the true stride; the natural computation would read the wrong block and
+    # produce token-salad. Pass 0 whenever the cache is contiguous (Qwen /
+    # hd128) so those kernel binaries stay bit-identical.
+    _cache_block_stride_bytes = 0
+    if D == 256:
+        _actual_block_stride = int(kv_cache.stride(0)) * int(kv_cache.element_size())
+        _natural_block_stride = (
+            block_size * Hk * _TQ_MOD_HD256.DATA_BYTES_PER_SLOT
+            + Hk * _TQ_MOD_HD256.NUM_SOA_FIELDS * block_size * 2
+        )
+        if _actual_block_stride != _natural_block_stride:
+            _cache_block_stride_bytes = _actual_block_stride
     launch = _get_kernel(
         Hk, num_partitions, max_bps, scale, QG, block_size,
         use_hw_v_transpose=use_hw_tr,
@@ -942,6 +1033,8 @@ def flydsl_turboquant_decode_attention_v4(
         tile_groups_per_partition=int(tile_groups_per_partition),
         use_wht_butterfly=use_wht_bf,
         head_size=int(D),
+        sliding_window=_swa,
+        cache_block_stride_bytes=_cache_block_stride_bytes,
     )
     # T1.3: zero-overhead one-shot info log (replaces logger.info_once which
     # hashes its format string on every call to dedup).
@@ -972,6 +1065,54 @@ def flydsl_turboquant_decode_attention_v4(
         torch.cuda.current_stream(),
     )
 
+    if _SEGM_DEBUG and not _TENSOR_PROPS_LOGGED:
+        # The offline replay rebuilds every tensor as a fresh contiguous
+        # allocation, which would mask a non-contiguous view, odd stride or
+        # dtype mismatch that the kernel mis-reads in the live server.
+        globals()["_TENSOR_PROPS_LOGGED"] = True
+        def _props(name, t):
+            if not isinstance(t, torch.Tensor):
+                return f"{name}=<{type(t).__name__}>"
+            return (f"{name}: shape={tuple(t.shape)} stride={t.stride()} "
+                    f"dtype={t.dtype} contig={t.is_contiguous()} "
+                    f"ptr%256={t.data_ptr() % 256} off={t.storage_offset()}")
+        logger.warning(
+            "FlyDSL v4 TENSOR PROPS (B=%d):\n  %s", B, "\n  ".join([
+                _props("query", query), _props("q_for_kernel", q_for_kernel),
+                _props("kv_cache", kv_cache),
+                _props("block_table", block_table),
+                _props("seq_lens", seq_lens),
+                _props("segm_out", segm_out), _props("segm_max", segm_max),
+                _props("output", output),
+            ]))
+
+    if _SEGM_DEBUG:
+        # A row that ends up all-zero in the output got no valid partition
+        # from the kernel. Distinguish "kernel ran and found nothing"
+        # (segm_max written as -inf) from "kernel never touched the row"
+        # (stale pooled bytes) before the reducer collapses the evidence.
+        # Mirror the reducer's own condition: a row goes to exact zeros when
+        # every (kv_head, qgroup) has no partition with a positive weight.
+        _m = segm_max[:B]
+        _s = segm_sum[:B]
+        _valid = _m > float("-inf")
+        _eff = (_s * _valid).sum(dim=2)          # [B, Hk, QG]
+        _dead_rows = (_eff <= 0).reshape(B, -1).all(dim=1)
+        if bool(_dead_rows.any()):
+            _bad = [b for b in range(B) if bool(_dead_rows[b])]
+            logger.warning(
+                "FlyDSL v4 SEGM: DEAD ROWS %s (call ctx B=%d Hk=%d P=%d "
+                "QG=%d) seq_lens=%s valid_parts_per_row=%s "
+                "sum_absmax_per_row=%s max_finite_per_row=%s "
+                "q_absmax_per_row=%s",
+                _bad, B, Hk, num_partitions, QG, seq_lens[:B].tolist(),
+                _valid.reshape(B, -1).sum(dim=1).tolist(),
+                [round(float(_s[b].abs().max()), 6) for b in range(B)],
+                [int(torch.isfinite(_m[b]).sum()) for b in range(B)],
+                [round(float(q_for_kernel[b].abs().max()), 4)
+                 for b in range(B)],
+            )
+
     # ---- Reduce partitions -> [B, Hq, D] --------------------------------
     _reduce_partitions_v4[(B, Hq)](
         output_ptr=output,
@@ -985,6 +1126,68 @@ def flydsl_turboquant_decode_attention_v4(
         NUM_PARTS=num_partitions,
         HEAD_SIZE=D,
     )
+    if _V4_NAN_GUARD:
+        global _V4_NAN_HITS
+        _ob = output[:B]
+        _nonfin = ~torch.isfinite(_ob)
+        if bool(_nonfin.any()):
+            _V4_NAN_HITS += 1
+            _rows = _nonfin.reshape(B, -1).any(dim=1)
+            _bad = [b for b in range(B) if bool(_rows[b])]
+            logger.warning(
+                "FlyDSL v4 NAN-GUARD hit #%d: non-finite output rows=%s "
+                "(B=%d Hk=%d Hq=%d P=%d QG=%d D=%d) seq_lens=%s "
+                "n_nonfinite=%d q_absmax=%s segm_max_finite_per_bad=%s "
+                "segm_sum_absmax_per_bad=%s",
+                _V4_NAN_HITS, _bad, B, Hk, Hq, num_partitions, QG, D,
+                seq_lens[:B].tolist(), int(_nonfin.sum()),
+                [round(float(q_for_kernel[b].abs().max()), 4) for b in _bad],
+                [int(torch.isfinite(segm_max[b]).sum()) for b in _bad],
+                [round(float(segm_sum[b].abs().max()), 6) for b in _bad],
+            )
+            # segm_out NaN localization: is the non-finite value already in the
+            # kernel's segm_out (kernel bug) or introduced by the reducer?
+            _so = segm_out[:B]
+            _so_bad = ~torch.isfinite(_so)
+            logger.warning(
+                "  NAN-GUARD segm_out non-finite=%d (kernel-side) ; "
+                "per-bad-row segm_out_nonfinite=%s",
+                int(_so_bad.sum()),
+                [int(_so_bad[b].sum()) for b in _bad],
+            )
+            _dump = os.environ.get("VLLM_TQ_V4_NAN_DUMP", "")
+            if _dump and _V4_NAN_HITS == 1:
+                try:
+                    b0 = _bad[0]
+                    _bps = block_table.shape[1]
+                    _nblk = (int(seq_lens[b0]) + block_size - 1) // block_size
+                    _bt0 = block_table[b0, :_nblk].to(torch.long)
+                    torch.save({
+                        "query": query[b0:b0 + 1].detach().cpu(),
+                        "seq_len": int(seq_lens[b0]),
+                        "block_table_row": block_table[b0:b0 + 1].detach().cpu(),
+                        "kv_blocks": kv_cache.index_select(
+                            0, _bt0).detach().cpu(),
+                        "kv_block_ids": _bt0.detach().cpu(),
+                        "kv_stride": tuple(kv_cache.stride()),
+                        "kv_shape": tuple(kv_cache.shape),
+                        "centroids": centroids.detach().cpu(),
+                        "Pi": Pi.detach().cpu(),
+                        "PiT": (PiT.detach().cpu() if PiT is not None else None),
+                        "scale": float(scale),
+                        "sliding_window": int(_swa),
+                        "num_partitions": int(num_partitions),
+                        "QG": int(QG), "Hk": int(Hk), "D": int(D),
+                        "block_size": int(block_size),
+                        "segm_out_b0": segm_out[b0].detach().cpu(),
+                        "segm_max_b0": segm_max[b0].detach().cpu(),
+                        "segm_sum_b0": segm_sum[b0].detach().cpu(),
+                    }, _dump)
+                    logger.warning("  NAN-GUARD dumped seed inputs to %s "
+                                   "(row=%d seq_len=%d)", _dump, b0,
+                                   int(seq_lens[b0]))
+                except Exception as _de:  # noqa: BLE001
+                    logger.warning("  NAN-GUARD dump failed: %r", _de)
     if sinks is not None and not _LOG_SINKS_WARNED:
         _LOG_SINKS_WARNED = True
         logger.warning(

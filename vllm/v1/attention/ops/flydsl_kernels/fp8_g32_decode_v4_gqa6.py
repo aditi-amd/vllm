@@ -311,7 +311,6 @@ def build_fp8_g32_decode_v4_gqa6_module(
 
         # ---- Buffer resources -------------------------------------------
         q_rsrc = buffer_ops.create_buffer_resource(query_ptr, max_size=True)
-        kv_rsrc = buffer_ops.create_buffer_resource(kv_cache_ptr, max_size=True)
         bt_rsrc = buffer_ops.create_buffer_resource(block_tables_ptr, max_size=True)
         sl_rsrc = buffer_ops.create_buffer_resource(seq_lens_ptr, max_size=True)
         cent_rsrc = buffer_ops.create_buffer_resource(centroids_ptr, max_size=True)
@@ -715,7 +714,17 @@ def build_fp8_g32_decode_v4_gqa6_module(
                     bt_rsrc, bt_off_safe,
                     vec_width=1, dtype=T.i32,
                 )
-                block_base = phys_block * c_block
+                # A buffer descriptor addresses with a 32-bit voffset, so
+                # ``phys_block * c_block`` wraps once the cache view exceeds
+                # 4 GiB. Fold the block base into the descriptor's 64-bit
+                # base pointer and keep only in-block offsets below.
+                blk_off_i64 = (
+                    arith.extui(T.i64, phys_block) * fx.Int64(_stride_cache_block)
+                )
+                blk_rsrc = buffer_ops.create_block_buffer_resource(
+                    kv_cache_ptr, blk_off_i64
+                )
+                block_base = fx.Int32(0)
 
                 # ``slot`` is the absolute slot index within the cache block
                 # (range 0.._BS-1). For BS=16 it equals tok_in_tile; for BS=32
@@ -732,7 +741,7 @@ def build_fp8_g32_decode_v4_gqa6_module(
                 # K codes: 16 bytes (= group chunk_in_tok) at slot_base + chunk*16.
                 k_byte = slot_base_byte + chunk_in_tok * fx.Int32(16)
                 k_packed = buffer_ops.buffer_load(
-                    kv_rsrc, k_byte // fx.Int32(4),
+                    blk_rsrc, k_byte // fx.Int32(4),
                     vec_width=4, dtype=T.i32,
                 )
 
@@ -742,18 +751,18 @@ def build_fp8_g32_decode_v4_gqa6_module(
                 # of the V HBM latency behind compute.
                 v_byte = slot_base_byte + c_vcode_off + chunk_in_tok * fx.Int32(16)
                 v_packed = buffer_ops.buffer_load(
-                    kv_rsrc, v_byte // fx.Int32(4),
+                    blk_rsrc, v_byte // fx.Int32(4),
                     vec_width=4, dtype=T.i32,
                 )
                 # UE8M0 group scales: load the 4-byte scale word (4-aligned)
                 # and extract this lane's group byte. scale = 2^(byte-127) =
                 # bitcast_f32(byte << 23); byte==0 -> +0.0 (zero sentinel).
                 kscale_word = buffer_ops.buffer_load(
-                    kv_rsrc, (slot_base_byte + c_kscale_off) // fx.Int32(4),
+                    blk_rsrc, (slot_base_byte + c_kscale_off) // fx.Int32(4),
                     vec_width=1, dtype=T.i32,
                 )
                 vscale_word = buffer_ops.buffer_load(
-                    kv_rsrc, (slot_base_byte + c_vscale_off) // fx.Int32(4),
+                    blk_rsrc, (slot_base_byte + c_vscale_off) // fx.Int32(4),
                     vec_width=1, dtype=T.i32,
                 )
                 kscale_byte = (kscale_word >> c_scale_byte_shift) & fx.Int32(0xFF)

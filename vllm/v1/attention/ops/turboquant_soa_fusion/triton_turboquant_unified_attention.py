@@ -378,6 +378,10 @@ def kernel_tq_unified_attention_2d(
     FP8_E4B15: tl.constexpr = 0,
     FUSE_Q_ROT: tl.constexpr = 0,  # Fused Q @ PiT prologue when 1 (MSE path)
     USE_SINKS: tl.constexpr = 0,  # Per-head sink logit folded into softmax denom
+    # >0 enables causal sliding-window attention: tile pruning + per-tile
+    # masking. Ported from the AoS unified kernel (gpt-oss); required by
+    # models with per-layer sliding windows (Gemma 4: window=1024).
+    SLIDING_WINDOW: tl.constexpr = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -461,7 +465,26 @@ def kernel_tq_unified_attention_2d(
     max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
     num_tiles = tl.cdiv(max_seq_prefix_len, TILE_SIZE)
 
-    for j in range(0, num_tiles):
+    # ---- Sliding-window tile pruning (causal SWA) ----
+    # For query row q the allowed key range is [q - SLIDING_WINDOW + 1, q].
+    # The union over all rows in this q-block is [first, last]; convert to
+    # tile indices and clamp to [0, num_tiles). Tiles outside that range
+    # would be fully masked anyway, so skipping them is pure savings — with
+    # window=1024 and a 32K context this drops ~97% of the tile loop.
+    tile_start = 0
+    tile_end = num_tiles
+    if SLIDING_WINDOW > 0:
+        qpos_lo = q_block_local_idx * BLOCK_Q
+        qpos_hi = tl.minimum(
+            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
+            cur_batch_query_len - 1,
+        )
+        first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
+        last_allowed_key = context_len + qpos_hi
+        tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
+        tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
+
+    for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
@@ -539,6 +562,12 @@ def kernel_tq_unified_attention_2d(
         # Causal + query-padding mask
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = seq_offset[None, :] <= query_abs_pos
+        if SLIDING_WINDOW > 0:
+            # Tile pruning is per-q-block, so boundary tiles still contain
+            # keys outside an individual row's window; mask them per element.
+            seq_mask = seq_mask & (
+                (query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW
+            )
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
             S,
@@ -641,6 +670,10 @@ def kernel_tq_unified_attention_3d(
     FP8_E4B15: tl.constexpr = 0,
     FUSE_Q_ROT: tl.constexpr = 0,  # Fused Q @ PiT prologue when 1 (MSE path)
     USE_SINKS: tl.constexpr = 0,  # Per-head sink logit folded into softmax denom
+    # >0 enables causal sliding-window attention: tile pruning + per-tile
+    # masking. Ported from the AoS unified kernel (gpt-oss); required by
+    # models with per-layer sliding windows (Gemma 4: window=1024).
+    SLIDING_WINDOW: tl.constexpr = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -730,6 +763,24 @@ def kernel_tq_unified_attention_3d(
     tile_lo = segm_idx * tiles_per_segment
     tile_hi = tl.minimum((segm_idx + 1) * tiles_per_segment, num_tiles)
 
+    # ---- Sliding-window tile pruning (causal SWA) ----
+    # Intersect this segment's range with the window's allowed tile range.
+    # An empty intersection means the segment contributes nothing; the
+    # epilogue still stores valid (M=-inf, L=1, acc=0) partials, which the
+    # stage-2 online-softmax reduce absorbs as a no-op.
+    if SLIDING_WINDOW > 0:
+        qpos_lo = q_block_local_idx * BLOCK_Q
+        qpos_hi = tl.minimum(
+            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
+            cur_batch_query_len - 1,
+        )
+        first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
+        last_allowed_key = context_len + qpos_hi
+        swa_tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
+        swa_tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
+        tile_lo = tl.maximum(tile_lo, swa_tile_start)
+        tile_hi = tl.minimum(tile_hi, swa_tile_end)
+
     for j in range(tile_lo, tile_hi):
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
@@ -802,6 +853,12 @@ def kernel_tq_unified_attention_3d(
 
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = seq_offset[None, :] <= query_abs_pos
+        if SLIDING_WINDOW > 0:
+            # Tile pruning is per-q-block, so boundary tiles still contain
+            # keys outside an individual row's window; mask them per element.
+            seq_mask = seq_mask & (
+                (query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW
+            )
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
             S,
@@ -915,6 +972,7 @@ def triton_turboquant_unified_attention(
     force_2d: bool = False,
     fuse_q_rot: bool = True,
     sinks: torch.Tensor | None = None,  # [Hq] float — per-head sink logits
+    sliding_window: int | None = None,  # >0 enables causal SWA
 ) -> torch.Tensor:
     """Launch unified TQ attention (v3).
 
@@ -975,6 +1033,16 @@ def triton_turboquant_unified_attention(
         if PiT is None:
             PiT = Pi.T.contiguous()
         apply_fuse_q_rot = bool(fuse_q_rot)
+        if apply_fuse_q_rot and D >= 256:
+            # The fused prologue stages PiT (D x D fp32) in LDS to do the
+            # in-kernel tl.dot(Q, PiT). At D=256 that is 256*256*4 = 256 KiB,
+            # which alone exceeds the 160 KiB (163840 B) per-workgroup LDS cap
+            # on gfx950/CDNA4 -> triton OutOfResources at launch. Fall back to
+            # the launcher-side rotation (a small query@PiT GEMM, off the LDS
+            # budget). Scoped to D>=256 so the D=128 fused path -- and its
+            # compiled kernel -- is unchanged. Numerically this is the existing
+            # A/B "legacy rotation" path (fp32 matmul, then cast).
+            apply_fuse_q_rot = False
         if apply_fuse_q_rot:
             q_rot = query.contiguous()
         else:
@@ -1014,6 +1082,13 @@ def triton_turboquant_unified_attention(
         sinks_f32 = centroids  # harmless dummy; not dereferenced when USE_SINKS=0
         use_sinks = False
 
+    # Normalize to a non-negative int so it can be a kernel constexpr: None
+    # and 0 both mean "no window". Passing it as constexpr lets Triton fold
+    # the whole pruning/masking branch away on full-attention layers, so
+    # mixed models (Gemma 4: 50 sliding + 10 global layers) compile two
+    # specializations and neither pays for the other.
+    _swa = int(sliding_window) if sliding_window else 0
+
     if output is None:
         output = torch.empty_like(query)
 
@@ -1051,6 +1126,17 @@ def triton_turboquant_unified_attention(
         # large (B=64 Q=1k C=8k; 5.6x speedup vs BM=16). BLOCK_M must be a
         # multiple of kv_group_size so BLOCK_Q is an integer.
         BLOCK_M = max(128, triton.next_power_of_2(kv_group_size))
+        if D >= 256:
+            # head_dim=256 doubles every per-tile LDS buffer (Q, K_T, V, probs
+            # all scale with HEAD_SIZE_PADDED). At BLOCK_M=128/TILE=32 that
+            # lands at ~256 KiB > the 160 KiB (163840 B) per-workgroup LDS cap
+            # on gfx950/CDNA4 -> triton OutOfResources at launch. Halving
+            # BLOCK_M for the 256 specialization brings it back under the cap.
+            # BLOCK_M is a pure tiling knob (masking handles partial rows), so
+            # results are numerically identical -- only occupancy/perf changes.
+            # This branch is D>=256 only: the D=128 path keeps BLOCK_M=128 and
+            # therefore compiles to the exact same kernel as before.
+            BLOCK_M = max(64, triton.next_power_of_2(kv_group_size))
     else:
         # Decode: BLOCK_Q > 1 in decode just pads rows (at most 1 query
         # token per sequence), so there's little to amortize. Inherit
@@ -1066,6 +1152,11 @@ def triton_turboquant_unified_attention(
     #   decode  (max_query_len == 1): 16
     if tile_size is None:
         tile_size = 32 if is_prefill_like else 16
+        if D >= 256 and is_prefill_like:
+            # Extra LDS headroom for the 256-wide head (K_T/V tiles scale with
+            # TILE_SIZE * HEAD_SIZE_PADDED). Scoped to D>=256 so the D=128
+            # prefill config (TILE_SIZE=32) is unchanged.
+            tile_size = 16
 
     # Pair-LUT fast path for 4-bit MSE keys. Skipped for FP8 and non-4-bit.
     # When USE_PAIR_LUT==0 the kernel never dereferences pair_lut, but Triton
@@ -1172,6 +1263,7 @@ def triton_turboquant_unified_attention(
             FP8_E4B15=fp8_e4b15,
             FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
             USE_SINKS=1 if use_sinks else 0,
+        SLIDING_WINDOW=_swa,
             num_warps=4,
             num_stages=num_stages,
         )
@@ -1252,6 +1344,7 @@ def triton_turboquant_unified_attention(
         FP8_E4B15=fp8_e4b15,
         FUSE_Q_ROT=1 if apply_fuse_q_rot else 0,
         USE_SINKS=1 if use_sinks else 0,
+        SLIDING_WINDOW=_swa,
         num_warps=4,
         num_stages=num_stages,
     )
@@ -1311,6 +1404,7 @@ def triton_turboquant_decode_attention_v3(
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,
     sinks: torch.Tensor | None = None,
+    sliding_window: int | None = None,
 ) -> torch.Tensor:
     """Decode-only convenience wrapper around ``triton_turboquant_unified_attention``.
 
@@ -1346,5 +1440,6 @@ def triton_turboquant_decode_attention_v3(
         max_seq_len=max_seq_len if max_seq_len > 0 else None,
         num_kv_splits=max_num_kv_splits,
         sinks=sinks,
+        sliding_window=sliding_window,
     )
     return out

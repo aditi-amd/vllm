@@ -261,7 +261,33 @@ class TurboQuantConfig:
         For dense models, skips first N and last N attention layers.
         Empirically required for aggressive presets (k3v4_nc, 3bit_nc)
         — without it GSM8K drops ~30 points on Qwen3-4B.
+
+        Models with per-layer-type head dims (Gemma 4: head_dim=256 on
+        sliding layers, global_head_dim=512 on full-attention layers) also
+        disable boundary protection. Leaving boundary layers unquantized
+        would add bf16 pages to a spec set that already holds two TQ page
+        sizes, and the TQ aligned slots at those two head dims share no
+        useful common factor (262 B vs 518 B). Page-size unification then
+        falls back to an LCM in the gigabytes, so the engine boot-fails
+        with an absurd KV requirement instead of padding.
         """
+        hf_text_config = model_config.hf_text_config
+        _head_dim = getattr(hf_text_config, "head_dim", None)
+        _global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+        if (
+            _head_dim is not None
+            and _global_head_dim is not None
+            and _head_dim != _global_head_dim
+        ):
+            logger.info(
+                "TQ: boundary protection disabled — heterogeneous head dims "
+                "(head_dim=%d, global_head_dim=%d) make bf16 boundary layers "
+                "incompatible with TQ page-size unification.",
+                _head_dim,
+                _global_head_dim,
+            )
+            return []
+
         if model_config.is_hybrid:
             attn_indices = _get_full_attention_layer_indices(model_config)
             if not attn_indices:

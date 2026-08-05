@@ -130,6 +130,26 @@ CENTROID_LDS_BYTES = N_CENTROIDS * 4  # 64
 Q_LDS_BYTES = 16 * HEAD_SIZE * 2
 KV_TILE_LDS_BYTES = TILE_SIZE * HEAD_SIZE * 2  # 8192 for HEAD_SIZE=256
 
+# --- KV-tile LDS bank-conflict padding (HW_TR / K path) ---------------------
+# The KV tile is laid out ``[token][head_dim]`` in LDS. With an unpadded row
+# stride of HEAD_SIZE=256 bf16 = 512 B = an exact multiple of the 32-bank LDS
+# width, EVERY token-row starts on the same bank, so the QK MFMA read (lane
+# ``t`` reads K[token=mfma_row, ...]) hits a 16-way bank conflict. rocprofv3
+# measured this at 57.9% of this GQA-6 kernel's LDS index cycles. Padding each
+# token row by KV_ROW_PAD_ELEMS=8 bf16 (16 B, preserves ds_write_b128 /
+# ds_read_tr16_b64 alignment) shifts consecutive rows onto different banks,
+# turning the 16-way conflict into a 2-way one. This is a pure addressing
+# change: the per-token base multiplier grows 64 -> 66 i64 while WITHIN-token
+# offsets (the real 256 head-dims) are unchanged, so the dequant math and MFMA
+# operands are bit-identical. Mirrors the canonical tq_decode_hd256.py fix.
+import os as _os  # noqa: E402  (kernel-tuning knob only)
+# Env-overridable for A/B profiling of the LDS bank-conflict fix.
+KV_ROW_PAD_ELEMS = int(_os.environ.get("TQ_KV_ROW_PAD", "8"))  # bf16 padding per token row
+KV_ROW_ELEMS = HEAD_SIZE + KV_ROW_PAD_ELEMS           # 264
+KV_ROW_I64 = KV_ROW_ELEMS // 4                        # 66 (i64 per padded row)
+KV_ROW_BYTES = KV_ROW_ELEMS * 2                       # 528
+KV_TILE_LDS_BYTES_PADDED = TILE_SIZE * KV_ROW_BYTES   # 8448
+
 LOG2E = 1.4426950408889634
 NEG_INF_VAL = float("-inf")
 
@@ -238,6 +258,24 @@ def build_tq_decode_gqa6_hd256_module(
     QG_LOAD_ITERS = (QG * Q_GROUPS_PER_ROW + WARP_SIZE - 1) // WARP_SIZE
     OOB_OFFSET = 0x7FFFFFF0  # noqa: F841  ~2GB byte offset; > any plausible buffer
 
+    # STEP B writes only QG rows, but STEP C reads all 16 (the QK MFMA's B
+    # operand spans the full tile; rows >= QG are discarded by the
+    # mfma_row < QG store gate). Only the written rows get dedicated LDS: the
+    # read-only tail is aliased onto the KV tile, which STEP C consumes before
+    # the tile loop first writes it. The tail is zero-filled in STEP B so the
+    # discarded lanes never read uninitialized LDS -- that is what the
+    # "multi-shape JIT NaN" note above the full-footprint Q_LDS_BYTES refers
+    # to. At QG=6 this returns 5120 B/CTA, taking 16448 -> 11328 and
+    # LDS-limited residency from 9 to 14 CTAs/CU.
+    Q_LDS_ACTIVE_BYTES = QG * HEAD_SIZE * 2
+    _Q_PAD_BYTES = Q_LDS_BYTES - Q_LDS_ACTIVE_BYTES
+    _Q_PAD_STRIDE = WARP_SIZE * 16                     # 64 lanes x 16 B/store
+    Q_LDS_PAD_ITERS = _Q_PAD_BYTES // _Q_PAD_STRIDE
+    assert Q_LDS_PAD_ITERS * _Q_PAD_STRIDE == _Q_PAD_BYTES, (
+        f"Q_LDS tail {_Q_PAD_BYTES} B not a multiple of {_Q_PAD_STRIDE}; "
+        f"query_group_size={QG} needs a different zero-fill tiling"
+    )
+
     _BS = int(kv_block_size)
     _TILES_PER_BLOCK = _BS // TILE_SIZE  # 1 for BS=16, 2 for BS=32
 
@@ -270,9 +308,16 @@ def build_tq_decode_gqa6_hd256_module(
     centroid_off = 0
     allocator.ptr = CENTROID_LDS_BYTES
     q_off = allocator.ptr
-    allocator.ptr += Q_LDS_BYTES
+    allocator.ptr += Q_LDS_ACTIVE_BYTES
     kv_off = allocator.ptr
-    allocator.ptr += KV_TILE_LDS_BYTES
+    allocator.ptr += KV_TILE_LDS_BYTES_PADDED
+    # STEP C reads the full 16-row Q view, whose tail aliases the region(s)
+    # allocated after it. Those must exist for the read to stay inside the
+    # kernel's LDS block.
+    assert allocator.ptr >= q_off + Q_LDS_BYTES, (
+        f"LDS total {allocator.ptr} B does not cover the aliased Q tail "
+        f"(needs {q_off + Q_LDS_BYTES} B)"
+    )
 
     @flyc.kernel
     def tq_decode_gqa6_hd256_kernel(
@@ -297,7 +342,6 @@ def build_tq_decode_gqa6_hd256_module(
 
         # ---- Buffer resources -------------------------------------------
         q_rsrc = buffer_ops.create_buffer_resource(query_ptr, max_size=True)
-        kv_rsrc = buffer_ops.create_buffer_resource(kv_cache_ptr, max_size=True)
         bt_rsrc = buffer_ops.create_buffer_resource(block_tables_ptr, max_size=True)
         sl_rsrc = buffer_ops.create_buffer_resource(seq_lens_ptr, max_size=True)
         cent_rsrc = buffer_ops.create_buffer_resource(centroids_ptr, max_size=True)
@@ -310,9 +354,9 @@ def build_tq_decode_gqa6_hd256_module(
         cent_lds = SmemPtr(base, centroid_off, T.f32, shape=(N_CENTROIDS,))
         q_lds_i32 = SmemPtr(base, q_off, T.i32, shape=(Q_LDS_BYTES // 4,)).get()
         q_lds_i64 = SmemPtr(base, q_off, T.i64, shape=(Q_LDS_BYTES // 8,)).get()
-        kv_lds_i32 = SmemPtr(base, kv_off, T.i32, shape=(KV_TILE_LDS_BYTES // 4,)).get()  # noqa: F841
-        kv_lds_i64 = SmemPtr(base, kv_off, T.i64, shape=(KV_TILE_LDS_BYTES // 8,)).get()
-        kv_lds_i16 = SmemPtr(base, kv_off, T.i16, shape=(KV_TILE_LDS_BYTES // 2,)).get()
+        kv_lds_i32 = SmemPtr(base, kv_off, T.i32, shape=(KV_TILE_LDS_BYTES_PADDED // 4,)).get()  # noqa: F841
+        kv_lds_i64 = SmemPtr(base, kv_off, T.i64, shape=(KV_TILE_LDS_BYTES_PADDED // 8,)).get()
+        kv_lds_i16 = SmemPtr(base, kv_off, T.i16, shape=(KV_TILE_LDS_BYTES_PADDED // 2,)).get()
 
         # ---- Constants ---------------------------------------------------
         c_sq = fx.Int32(_stride_q_seq)
@@ -456,6 +500,19 @@ def build_tq_decode_gqa6_hd256_module(
                     _packed,
                     [arith.index_cast(T.index, _ival(_lds_i32_idx))],
                 )
+        # Zero the read-only Q tail (rows QG..15) that aliases the KV tile.
+        # Both STEP B and STEP B' write only rows 0..QG-1, so this runs for
+        # either path.
+        _q_pad_zero = arith.constant_vector(0, T.vec(4, T.i32))
+        for z in range_constexpr(Q_LDS_PAD_ITERS):
+            _q_pad_i32 = (
+                fx.Int32(Q_LDS_ACTIVE_BYTES // 4 + z * (WARP_SIZE * 4))
+                + lane * fx.Int32(4)
+            )
+            vector.store(
+                _q_pad_zero, q_lds_i32,
+                [arith.index_cast(T.index, _q_pad_i32)],
+            )
         gpu.barrier()
 
         # ===== STEP C: Pre-load Q operands for QK_K_CHUNKS = 4 K-chunks ===
@@ -616,9 +673,21 @@ def build_tq_decode_gqa6_hd256_module(
                     vec_width=1,
                     dtype=T.i32,
                 )
-                block_base = phys_block * c_block
-                data_region = block_base
-                meta_region = block_base + c_meta_off
+                # ``phys_block * c_block`` is a byte offset into the whole
+                # paged cache. A buffer descriptor addresses with a 32-bit
+                # voffset, so that product silently wraps once the cache view
+                # exceeds 4 GiB and the row reads garbage (every partition
+                # then scores -inf and the reducer emits exact zeros). Fold
+                # the block base into the descriptor's 64-bit base pointer
+                # instead and keep only small in-block offsets below.
+                blk_off_i64 = (
+                    arith.extui(T.i64, phys_block) * fx.Int64(_stride_cache_block)
+                )
+                blk_rsrc = buffer_ops.create_block_buffer_resource(
+                    kv_cache_ptr, blk_off_i64
+                )
+                data_region = fx.Int32(0)
+                meta_region = c_meta_off
 
                 # ``slot`` is the absolute slot index within the cache block
                 # (range 0.._BS-1). For BS=16 it equals tok_in_tile; for BS=32
@@ -640,7 +709,7 @@ def build_tq_decode_gqa6_hd256_module(
                 for hf in range_constexpr(HALVES):
                     k_packed_list.append(
                         buffer_ops.buffer_load(
-                            kv_rsrc,
+                            blk_rsrc,
                             (k_byte0 + fx.Int32(hf * 16)) // fx.Int32(4),
                             vec_width=4,
                             dtype=T.i32,
@@ -658,7 +727,7 @@ def build_tq_decode_gqa6_hd256_module(
                 for hf in range_constexpr(HALVES):
                     v_packed_list.append(
                         buffer_ops.buffer_load(
-                            kv_rsrc,
+                            blk_rsrc,
                             (v_byte0 + fx.Int32(hf * 16)) // fx.Int32(4),
                             vec_width=4,
                             dtype=T.i32,
@@ -677,13 +746,13 @@ def build_tq_decode_gqa6_hd256_module(
                     + slot
                 )
                 vscale_raw = buffer_ops.buffer_load(
-                    kv_rsrc,
+                    blk_rsrc,
                     vscale_u16,
                     vec_width=1,
                     dtype=T.i16,
                 )
                 vzero_raw = buffer_ops.buffer_load(
-                    kv_rsrc,
+                    blk_rsrc,
                     vzero_u16,
                     vec_width=1,
                     dtype=T.i16,
@@ -696,7 +765,7 @@ def build_tq_decode_gqa6_hd256_module(
                     + slot
                 )
                 knorm_raw = buffer_ops.buffer_load(
-                    kv_rsrc,
+                    blk_rsrc,
                     knorm_u16,
                     vec_width=1,
                     dtype=T.i16,
@@ -708,7 +777,10 @@ def build_tq_decode_gqa6_hd256_module(
                 # Lane writes SUBCHUNK_HDIMS bf16 for token=tok_in_tile,
                 # head_dims chunk_in_tok*SUBCHUNK_HDIMS..+ (HALVES halves of
                 # 32 head-dims each, 4 words × 8 nibbles per half).
-                tok_kreg = tok_in_tile * fx.Int32(I64_PER_TOKEN)
+                # Padded per-token base (KV_ROW_I64=66 vs natural 64) to break
+                # the 16-way QK-read bank conflict; within-token SUBCHUNK_I64
+                # stride is unchanged so the 256 head-dim layout is identical.
+                tok_kreg = tok_in_tile * fx.Int32(KV_ROW_I64)
                 chunk_kreg = tok_kreg + chunk_in_tok * fx.Int32(SUBCHUNK_I64)
                 for hf in range_constexpr(HALVES):
                     k_packed = k_packed_list[hf]
@@ -740,8 +812,9 @@ def build_tq_decode_gqa6_hd256_module(
                 # Same i64×2 indexing as Q.
                 qk_acc = zero_v4
                 for chk in range_constexpr(QK_K_CHUNKS):
+                    # Padded token-row stride (KV_ROW_I64=66) matches the K write.
                     k_idx_i64 = (
-                        mfma_row * fx.Int32(HEAD_SIZE * 2 // 8)
+                        mfma_row * fx.Int32(KV_ROW_I64)
                         + fx.Int32(chk * 8)
                         + mfma_col_grp * fx.Int32(2)
                     )
@@ -825,8 +898,10 @@ def build_tq_decode_gqa6_hd256_module(
                     # head_dims chunk_in_tok*SUBCHUNK_HDIMS..+) as ds_write_b128s.
                     # HALVES=2 for HEAD_SIZE=256 (each half = 32 head-dims);
                     # HALVES=1 for HEAD_SIZE=128 → identical to canonical kernel.
+                    # Padded per-token element stride (KV_ROW_ELEMS=264) so the
+                    # row-major V matches the padded K/V-read layout.
                     v_lds_elem_base = tok_in_tile * fx.Int32(
-                        HEAD_SIZE
+                        KV_ROW_ELEMS
                     ) + chunk_in_tok * fx.Int32(SUBCHUNK_HDIMS)
                     for hf in range_constexpr(HALVES):
                         v_packed = v_packed_list[hf]
@@ -924,13 +999,15 @@ def build_tq_decode_gqa6_hd256_module(
                     # Per-lane address: token_idx = lane // 4 (covers 0..15 across
                     # all four 16-lane MFMA blocks), hd_sub = (lane % 4)*4 selects
                     # the 4-element column window inside the h*16 chunk.
-                    # Total LDS byte offset = kv_off + token_idx*HEAD_SIZE*2
+                    # Total LDS byte offset = kv_off + token_idx*KV_ROW_BYTES
                     #                        + (h*16 + hd_sub)*2
                     token_idx = lane >> fx.Int32(2)
                     hd_sub = (lane & fx.Int32(3)) * fx.Int32(4)
+                    # Padded token-row byte stride (KV_ROW_BYTES=528) matches the
+                    # padded V write above.
                     v_lane_byte = (
                         fx.Int32(kv_off)
-                        + token_idx * fx.Int32(HEAD_SIZE * 2)
+                        + token_idx * fx.Int32(KV_ROW_BYTES)
                         + hd_sub * fx.Int32(2)
                     )
                     for h in range_constexpr(PV_N_CHUNKS):

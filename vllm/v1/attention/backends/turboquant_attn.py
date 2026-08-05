@@ -170,6 +170,7 @@ from vllm.v1.attention.ops.flydsl_fp8_g32_decode_v4 import (
     flydsl_fp8_g32_decode_attention_v4,
     is_flydsl_available as _flydsl_fp8_v4_available,
     is_flydsl_fp8_gqa6_available as _flydsl_fp8_v4_gqa6_available,
+    is_flydsl_fp8_hd256_available as _flydsl_fp8_v4_hd256_available,
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.worker.workspace import (
@@ -217,6 +218,281 @@ _USE_FP8_G32_V3 = os.environ.get("VLLM_FP8_G32_V3", "0") == "1"
 # continuation-prefill fall back to the fp8_g32 Triton path (V3 if also set,
 # else V1). Independent of VLLM_FP8_G32_V3.
 _USE_FP8_G32_V4 = os.environ.get("VLLM_FP8_G32_DECODE_V4", "0") == "1"
+# Diagnostic: shadow-compare the FlyDSL fp8_g32 v4 decode against the Triton v3
+# unified decode on IDENTICAL inputs every decode step, logging the first/each
+# step where they diverge (cos < threshold). Localizes the D=256 autoregressive
+# break that single-step offline parity misses. FlyDSL output is still returned
+# (behavior unchanged) so the real trajectory is preserved.
+_FP8_SHADOW_CMP = os.environ.get("VLLM_FP8_SHADOW_CMP", "0") == "1"
+_FP8_SHADOW_LOG = os.environ.get(
+    "VLLM_FP8_SHADOW_LOG", "/shareddata/adrana/workspace/reports/fp8_shadow.log")
+_FP8_SHADOW_THRESH = float(os.environ.get("VLLM_FP8_SHADOW_THRESH", "0.999"))
+_FP8_SHADOW_STATE: dict = {"calls": 0, "diverged": 0, "fh": None}
+
+
+def _shadow_compare_fp8(layer_self, query, kv_cache, attn_metadata, PiT,
+                        fly_out):
+    """Run Triton v3 fp8_g32 decode on the SAME inputs and log divergence.
+
+    Compares per-sequence cosine similarity between the FlyDSL output (already
+    computed, ``fly_out``) and the Triton v3 golden output. Logs any step where
+    min per-seq cos < threshold, with seq_lens/batch, to localize the D=256
+    autoregressive break. Read-only w.r.t. the returned FlyDSL result.
+    """
+    import torch as _t
+    from vllm.v1.attention.ops.fp8_g32.triton_unified_attention import (
+        fp8_g32_unified_attention as _tri_v3,
+    )
+    st = _FP8_SHADOW_STATE
+    st["calls"] += 1
+    q = query
+    if q.dim() == 3:
+        B = q.shape[0]
+    else:  # [num_tokens, Hq*D] or flattened — assume [B, Hq, D]
+        B = q.shape[0]
+    dev = q.device
+    qsl = _t.arange(B + 1, dtype=_t.int32, device=dev)
+    tri = _tri_v3(
+        query=q, kv_cache=kv_cache, block_table=attn_metadata.block_table,
+        seq_lens=attn_metadata.seq_lens, query_start_loc=qsl,
+        scale=layer_self.scale, PiT=PiT, max_query_len=1,
+        max_seq_len=int(attn_metadata.max_seq_len),
+        sinks=getattr(layer_self, "sinks", None), sliding_window=None,
+    )
+    f = fly_out.reshape(B, -1).float()
+    t = tri.reshape(B, -1).float()
+    c = _t.nn.functional.cosine_similarity(f, t, dim=1)  # [B]
+    seq_lens = attn_metadata.seq_lens[:B].tolist()
+    cmin = float(c.min()); cmean = float(c.mean())
+    worst = int(c.argmin())
+    if st["fh"] is None:
+        st["fh"] = open(_FP8_SHADOW_LOG, "w")
+        st["fh"].write("call\tB\tcos_min\tcos_mean\tworst_seq\tworst_seqlen\t"
+                       "maxerr\tall_seqlens\n")
+    if cmin < _FP8_SHADOW_THRESH:
+        st["diverged"] += 1
+        me = float((f - t).abs().max())
+        st["fh"].write(
+            f"{st['calls']}\t{B}\t{cmin:.5f}\t{cmean:.5f}\t{worst}\t"
+            f"{seq_lens[worst]}\t{me:.4f}\t{seq_lens}\n")
+        st["fh"].flush()
+        logger.warning_once(
+            "fp8 SHADOW DIVERGE: cos_min=%.5f at seqlen=%d (B=%d) — see %s",
+            cmin, seq_lens[worst], B, _FP8_SHADOW_LOG)
+
+
+# Diagnostic: shadow-compare the FlyDSL v4 TQ decode against the Triton v3
+# unified TQ decode on IDENTICAL inputs (same kv_cache/centroids/Pi), logging
+# per-seq cosine divergence. Localizes the D=256 tq_decode_gqa6_hd256 kernel
+# bug (broken in eager at ALL seqlens). FlyDSL output is still returned.
+_TQ_SHADOW_CMP = os.environ.get("VLLM_TQ_SHADOW_CMP", "0") == "1"
+_V4_SWA_OFF = os.environ.get("VLLM_TQ_V4_SWA_OFF", "0") == "1"
+# Diagnostic: force the FlyDSL v4 decode to allocate its own scratch buffers
+# (mid_o/output/lse) instead of the shared WorkspaceManager arena + the
+# per-layer _SegmBufPool. If E2E accuracy recovers only with this set, the v4
+# kernel is writing out of bounds into neighbouring shared state (the returned
+# output_buf stays correct, so the shadow-compare — which uses fresh None
+# buffers — cannot see the corruption).
+_V4_FRESH_BUFS = os.environ.get("VLLM_TQ_V4_FRESH_BUFS", "0") == "1"
+_TQ_SHADOW_LOG = os.environ.get(
+    "VLLM_TQ_SHADOW_LOG", "/shareddata/adrana/workspace/reports/tq_shadow.log")
+_TQ_SHADOW_THRESH = float(os.environ.get("VLLM_TQ_SHADOW_THRESH", "0.999"))
+_TQ_SHADOW_STATE: dict = {"calls": 0, "diverged": 0, "fh": None}
+_TQ_SHADOW_DUMP = os.environ.get("VLLM_TQ_SHADOW_DUMP", "")
+_TQ_SHADOW_REINVOKE = os.environ.get("VLLM_TQ_SHADOW_REINVOKE", "0") == "1"
+
+
+def _reinvoke_probe(st, impl, query, kv_cache, attn_metadata, Pi, PiT,
+                    centroids, f_ref, t_ref, worst):
+    """Re-run the identical FlyDSL v4 call in-process on a fresh output buffer.
+
+    Distinguishes "the kernel computed nothing for this row" from "the reduce
+    wrote somewhere other than the caller's output buffer": the offline replay
+    of these very inputs is always correct, so the divergence has to come from
+    live process state rather than the data.
+    """
+    import torch as _t
+    try:
+        from vllm.v1.attention.ops.flydsl_turboquant_decode_v4 import (
+            flydsl_turboquant_decode_attention_v4 as _v4,
+        )
+        B = int(query.shape[0])
+        again = _v4(
+            query=query, kv_cache=kv_cache,
+            block_table=attn_metadata.block_table,
+            seq_lens=attn_metadata.seq_lens,
+            Pi=Pi, centroids=centroids, scale=impl.scale,
+            mse_bits=impl.tq_config.key_mse_bits,
+            key_packed_size=impl.tq_config.key_packed_size,
+            value_quant_bits=impl.tq_config.effective_value_quant_bits,
+            value_packed_size=impl.tq_config.value_packed_size,
+            max_seq_len=int(attn_metadata.max_seq_len),
+            key_fp8=impl.tq_config.key_fp8,
+            norm_correction=impl.tq_config.norm_correction,
+            PiT=PiT, mid_o_buf=None, output_buf=None, lse_buf=None,
+            buf_holder=None, max_num_kv_splits=impl.max_num_kv_splits,
+            sinks=None,
+        )
+        a = again.reshape(B, -1).float()
+        nz_first = [int((f_ref[b] != 0).sum()) for b in range(B)]
+        nz_again = [int((a[b] != 0).sum()) for b in range(B)]
+        cos_again = _t.nn.functional.cosine_similarity(a, t_ref, dim=1)
+        logger.warning(
+            "tq REINVOKE probe #%d (call=%d worst=%d): "
+            "orig_nonzero=%s reinvoke_nonzero=%s reinvoke_cos=%s",
+            st["reinvokes"], st["calls"], worst, nz_first, nz_again,
+            [round(float(c), 5) for c in cos_again],
+        )
+    except Exception as e:  # diagnostics must never kill the server
+        logger.warning("tq REINVOKE probe failed: %r", e)
+
+
+def _dump_tq_divergence(st, impl, query, kv_cache, attn_metadata, Pi, PiT,
+                        centroids, fly_out, tri, worst):
+    """Snapshot the exact kernel inputs for the first diverging decode call.
+
+    Only the KV blocks reachable from the worst sequence's block table are
+    saved, with the block table remapped onto that dense subset, so the dump
+    stays a few hundred MB instead of the full cache.
+    """
+    import torch as _t
+    try:
+        B = int(query.shape[0])
+        blk_sz = _infer_tq_block_size(kv_cache)
+        seq_lens = attn_metadata.seq_lens[:B]
+        bt_full = attn_metadata.block_table[:B]
+        seq_len = int(seq_lens[worst])
+
+        # Union of every block reachable from the whole batch, so the batch
+        # context (not just the failing row) can be replayed offline.
+        per_row = [bt_full[b, :((int(seq_lens[b]) + blk_sz - 1) // blk_sz)]
+                   for b in range(B)]
+        blk_ids = _t.unique(_t.cat(per_row).to(_t.long))
+        remap = _t.full((int(blk_ids.max()) + 1,), -1, dtype=_t.long,
+                        device=blk_ids.device)
+        remap[blk_ids] = _t.arange(blk_ids.numel(), device=blk_ids.device)
+        bt_remap = _t.zeros_like(bt_full, dtype=_t.int32)
+        for b in range(B):
+            n = per_row[b].numel()
+            bt_remap[b, :n] = remap[per_row[b].to(_t.long)].to(_t.int32)
+
+        def _gather(c):
+            if isinstance(c, (tuple, list)):
+                return [_gather(x) for x in c]
+            return c.index_select(0, blk_ids.to(c.device)).clone().cpu()
+
+        payload = {
+            "call": st["calls"], "seq_len": seq_len, "block_size": blk_sz,
+            "B": B, "worst": worst,
+            "seq_lens": seq_lens.clone().cpu(),
+            "max_seq_len": int(attn_metadata.max_seq_len),
+            "query": query[:B].clone().cpu(),
+            "kv_blocks": _gather(kv_cache),
+            "block_table": bt_remap.cpu(),
+            "orig_block_ids": blk_ids.cpu(),
+            "Pi": None if Pi is None else Pi.clone().cpu(),
+            "PiT": None if PiT is None else PiT.clone().cpu(),
+            "centroids": (None if centroids is None
+                          else centroids.clone().cpu()),
+            "fly_out": fly_out[:B].clone().cpu(),
+            "tri_out": tri.reshape(query.shape[0], -1)[:B].clone().cpu(),
+            "scale": impl.scale,
+            "max_num_kv_splits": impl.max_num_kv_splits,
+            "cfg": {
+                "key_mse_bits": impl.tq_config.key_mse_bits,
+                "key_packed_size": impl.tq_config.key_packed_size,
+                "value_quant_bits":
+                    impl.tq_config.effective_value_quant_bits,
+                "value_packed_size": impl.tq_config.value_packed_size,
+                "key_fp8": impl.tq_config.key_fp8,
+                "norm_correction": impl.tq_config.norm_correction,
+            },
+        }
+        _t.save(payload, _TQ_SHADOW_DUMP)
+        logger.warning("tq SHADOW DUMP written to %s (call=%d seq_len=%d)",
+                       _TQ_SHADOW_DUMP, st["calls"], seq_len)
+    except Exception as e:  # diagnostics must never kill the server
+        logger.warning("tq SHADOW DUMP failed: %r", e)
+
+
+def _infer_tq_block_size(kv_cache):
+    c = kv_cache
+    while isinstance(c, (tuple, list)):
+        c = c[0]
+    return int(c.shape[1]) if c.dim() >= 2 else 1
+
+
+def _shadow_compare_tq(impl, query, kv_cache, attn_metadata, Pi, PiT,
+                       centroids, fly_out):
+    """Run Triton v3 TQ decode on the SAME inputs and log divergence vs FlyDSL.
+
+    Read-only w.r.t. the returned FlyDSL result. Golden = Triton v3
+    (triton_turboquant_unified_attention), the bf16-parity reference.
+    """
+    import torch as _t
+    st = _TQ_SHADOW_STATE
+    st["calls"] += 1
+    q = query
+    B = q.shape[0]
+    dev = q.device
+    tri = impl._dispatch_decode_v3(
+        query=q, kv_cache=kv_cache, block_table=attn_metadata.block_table,
+        seq_lens=attn_metadata.seq_lens,
+        Pi=Pi, centroids=centroids, scale=impl.scale,
+        mse_bits=impl.tq_config.key_mse_bits,
+        key_packed_size=impl.tq_config.key_packed_size,
+        value_quant_bits=impl.tq_config.effective_value_quant_bits,
+        value_packed_size=impl.tq_config.value_packed_size,
+        max_seq_len=int(attn_metadata.max_seq_len),
+        key_fp8=impl.tq_config.key_fp8,
+        norm_correction=impl.tq_config.norm_correction,
+        PiT=PiT, mid_o_buf=None, output_buf=None, lse_buf=None,
+        buf_holder=None, max_num_kv_splits=impl.max_num_kv_splits,
+        sinks=getattr(impl, "sinks", None),
+        # CRITICAL: the golden v3 reference must window the decode exactly like
+        # the production V3 server does (see the _USE_TQ_V3 path, which passes
+        # sliding_window=self.sliding_window). Omitting it here made the oracle
+        # do FULL attention, so a full-attention (SWA-off/broken) v4 matched the
+        # reference at cos>=0.999 while both silently diverged from the correct
+        # windowed decode — masking the real seq_len>window SWA bug. Pass the
+        # layer's window so the shadow validates windowed-v4 vs windowed-v3.
+        sliding_window=getattr(impl, "sliding_window", None),
+    )
+    f = fly_out.reshape(B, -1).float()
+    t = tri.reshape(B, -1).float()
+    c = _t.nn.functional.cosine_similarity(f, t, dim=1)  # [B]
+    seq_lens = attn_metadata.seq_lens[:B].tolist()
+    cmin = float(c.min()); cmean = float(c.mean())
+    worst = int(c.argmin())
+    if st["fh"] is None:
+        st["fh"] = open(_TQ_SHADOW_LOG, "w")
+        st["fh"].write("call\tB\tcos_min\tcos_mean\tworst_seq\tworst_seqlen\t"
+                       "maxerr\tf_nan\tf_inf\tt_nan\tf_absmax\tall_seqlens\n")
+    if cmin < _TQ_SHADOW_THRESH:
+        st["diverged"] += 1
+        finite = _t.isfinite(f)
+        me = float((f - t)[finite & _t.isfinite(t)].abs().max()) if bool(
+            finite.any()) else float("nan")
+        f_nan = int(_t.isnan(f).sum())
+        f_inf = int(_t.isinf(f).sum())
+        t_nan = int(_t.isnan(t).sum())
+        f_absmax = float(f[finite].abs().max()) if bool(finite.any()) else 0.0
+        st["fh"].write(
+            f"{st['calls']}\t{B}\t{cmin:.5f}\t{cmean:.5f}\t{worst}\t"
+            f"{seq_lens[worst]}\t{me:.4f}\t{f_nan}\t{f_inf}\t{t_nan}\t"
+            f"{f_absmax:.4f}\t{seq_lens}\n")
+        st["fh"].flush()
+        if _TQ_SHADOW_DUMP and not st.get("dumped"):
+            st["dumped"] = True
+            _dump_tq_divergence(st, impl, query, kv_cache, attn_metadata,
+                                Pi, PiT, centroids, fly_out, tri, worst)
+        if _TQ_SHADOW_REINVOKE and st.get("reinvokes", 0) < 5:
+            st["reinvokes"] = st.get("reinvokes", 0) + 1
+            _reinvoke_probe(st, impl, query, kv_cache, attn_metadata,
+                            Pi, PiT, centroids, f, t, worst)
+        logger.warning_once(
+            "tq SHADOW DIVERGE: cos_min=%.5f at seqlen=%d (B=%d) — see %s",
+            cmin, seq_lens[worst], B, _TQ_SHADOW_LOG)
 if _USE_TQ_V4 and not _flydsl_v4_available():
     logger.warning(
         "VLLM_TQ_DECODE_V4 requested but FlyDSL is unavailable; "
@@ -234,6 +510,47 @@ _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
+# ROCm's CK flash-attention kernel rejects head dims above 256 with
+# "CK only supports head dimension at most 256". Gemma 4's full-attention
+# layers use global_head_dim=512, so prefill on those layers must route to
+# the Triton unified kernel, which is generic over head size.
+_CK_MAX_HEAD_DIM = 256
+
+# Continuation-prefill scratch buffers, shared across all layers and grown on
+# demand. Flat, so one allocation serves every (Hk, D) via a view.
+#
+# Continuation prefill needs two K/V-sized scratch pairs per layer: the dequant
+# target for the cached prefix, and the "full" concatenation of that prefix with
+# the current chunk. Both used to be cached per layer at max_model_len capacity.
+# On Gemma 4 at 145K each is 16 heads x 145408 x 256 x 2 B = 1.19 GiB, so
+# 50 sliding layers x 2 pairs x 2 tensors is ~230 GiB requested *outside* the
+# gpu_memory_utilization budget: the engine died with HIP OOM while PyTorch
+# held 283 of 288 GiB, and 60 layers x that footprint is what made 128K
+# unreachable even though the KV cache itself fit comfortably.
+#
+# Sharing is safe for the same reason the WorkspaceManager shares its own
+# buffers: layers run sequentially on a single stream and each buffer is fully
+# consumed within the call that fills it. Allocation still happens once and is
+# then reused, which preserves the stable-address property the per-layer cache
+# was introduced for (variable-size torch.empty per call collided with the
+# ROCm HIP graph pool). ``slot`` keeps the two purposes in separate buffers so
+# the dequant source can never alias the concatenation target.
+_shared_prefill_bufs: dict[Any, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_shared_prefill_bufs(
+    slot: str, numel: int, device: Any, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a (k, v) flat buffer pair of at least ``numel`` elements."""
+    key = (slot, device, dtype)
+    k, v = _shared_prefill_bufs.get(key, (None, None))
+    if k is None or k.numel() < numel:
+        # Grow-only: a request larger than any seen so far replaces the pair.
+        k = torch.empty(numel, dtype=dtype, device=device)
+        v = torch.empty(numel, dtype=dtype, device=device)
+        _shared_prefill_bufs[key] = (k, v)
+    return k, v
+
 logger.info_once(
     "TurboQuant has flash attn: %s, decode kernel: %s, fp4_g32_v3: %s, "
     "fp8_g32_v3: %s, fp8_g32_v4(flydsl): %s",
@@ -248,7 +565,12 @@ logger.info_once(
 # do_kv_cache_update already stored all tokens to TQ cache, so the decode
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
-_CONTINUATION_DECODE_THRESHOLD = 128
+# Set VLLM_TQ_CONTINUATION_DECODE_THRESHOLD=0 to force every continuation
+# through full-dequant + flash_attn instead of the v3 reader (slower, but the
+# v3 reader is layout-sensitive).
+_CONTINUATION_DECODE_THRESHOLD = int(
+    os.environ.get("VLLM_TQ_CONTINUATION_DECODE_THRESHOLD", "128")
+)
 
 
 def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
@@ -745,6 +1067,27 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         q = query[:N].view(N, self.num_heads, self.head_size)
 
+        # ── DEBUG: env-gated raw q/k/v capture for D=256 recipe analysis ──
+        import os as _os_dbg
+        _dump_dir = _os_dbg.environ.get("VLLM_FP8_DUMP_QKV")
+        if _dump_dir and self.head_size == 256:
+            _cnt = getattr(TurboQuantAttentionImpl, "_dbg_dump_cnt", 0)
+            if _cnt < 8:
+                try:
+                    _k = key[:N].view(N, self.num_kv_heads, self.head_size)
+                    _v = value[:N].view(N, self.num_kv_heads, self.head_size)
+                    torch.save(
+                        {"q": q.detach().float().cpu(),
+                         "k": _k.detach().float().cpu(),
+                         "v": _v.detach().float().cpu(),
+                         "is_prefill": bool(attn_metadata.is_prefill),
+                         "N": int(N)},
+                        f"{_dump_dir}/qkv_{_cnt:02d}.pt",
+                    )
+                    TurboQuantAttentionImpl._dbg_dump_cnt = _cnt + 1
+                except Exception:
+                    pass
+
         # Get TQ buffers, ensure on device (one-time migration).
         # Use Any-typed alias for dynamic _tq_* attrs set by _ensure_on_device.
         tq_layer: Any = layer
@@ -1000,8 +1343,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # When sinks are present, skip this fast path because the paged attention
         # block table setup is incorrect for batched sequences (all sequences
         # would incorrectly attend to concatenated K/V from all requests).
+        # This batched call passes causal=True with no window_size, so it is
+        # only valid for full-attention layers: a sliding-window layer would
+        # silently attend outside its window. That was unreachable while the
+        # only SWA model (gpt-oss) had sinks, which already skip this path;
+        # Gemma 4 is SWA *without* sinks, so gate on the window explicitly.
+        # D is also capped by CK (see _CK_MAX_HEAD_DIM).
         if (
             self.sinks is None
+            and not (self.sliding_window and self.sliding_window > 0)
+            and D <= _CK_MAX_HEAD_DIM
             and attn_metadata.max_query_len == attn_metadata.max_seq_len
             and _HAS_FLASH_ATTN
         ):
@@ -1062,8 +1413,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
             if q_len == seq_len:
                 # First-chunk prefill: all K/V are in the current batch.
-                if self.sinks is not None:
-                    # Use unified attention for sink support
+                if self.sinks is not None or D > _CK_MAX_HEAD_DIM:
+                    # Use unified attention for sink support, and for head
+                    # dims CK cannot handle (Gemma 4 global layers, D=512).
+                    # This kernel is generic over head size and honors
+                    # window_size, so it is correct for both cases.
                     out = torch.empty_like(q_seq)
                     k_cache = k_seq.unsqueeze(0)  # [1, q_len, Hk, D]
                     v_cache = v_seq.unsqueeze(0)  # [1, q_len, Hk, D]
@@ -1412,43 +1766,21 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     (buf_shape, torch.float16),
                 )
             except AssertionError:
-                # WorkspaceManager too small — fall back to layer-cached buffer
-                # (same grow-only pattern as FusionTurboQuantAttentionImpl).
-                # Never use a bare torch.empty here: that allocation can receive
-                # an address inside the captured HIP graph pool on ROCm.
-                _kbuf = getattr(layer, "_tq_k_dequant_buf", None)
-                _vbuf = getattr(layer, "_tq_v_dequant_buf", None)
-                if _kbuf is None or _kbuf.shape[2] < alloc_len:
-                    _kbuf = torch.empty(
-                        (1, Hk, block_table.shape[1] * block_size, D),
-                        dtype=torch.float16, device=device,
-                    )
-                    layer._tq_k_dequant_buf = _kbuf
-                if _vbuf is None or _vbuf.shape[2] < alloc_len:
-                    _vbuf = torch.empty(
-                        (1, Hk, block_table.shape[1] * block_size, D),
-                        dtype=torch.float16, device=device,
-                    )
-                    layer._tq_v_dequant_buf = _vbuf
-                k_buf = _kbuf
-                v_buf = _vbuf
+                # WorkspaceManager locked too small — use the shared fallback
+                # buffers rather than one pair per layer, which would allocate
+                # ~60x more outside the memory budget. Sized to this call's
+                # alloc_len, not to max_model_len.
+                _n = Hk * alloc_len * D
+                _kf, _vf = _get_shared_prefill_bufs(
+                    "dequant", _n, device, torch.float16
+                )
+                k_buf = _kf[:_n].view(buf_shape)
+                v_buf = _vf[:_n].view(buf_shape)
         else:
-            _kbuf = getattr(layer, "_tq_k_dequant_buf", None)
-            _vbuf = getattr(layer, "_tq_v_dequant_buf", None)
-            if _kbuf is None or _kbuf.shape[2] < alloc_len:
-                _kbuf = torch.empty(
-                    (1, Hk, block_table.shape[1] * block_size, D),
-                    dtype=torch.float16, device=device,
-                )
-                layer._tq_k_dequant_buf = _kbuf
-            if _vbuf is None or _vbuf.shape[2] < alloc_len:
-                _vbuf = torch.empty(
-                    (1, Hk, block_table.shape[1] * block_size, D),
-                    dtype=torch.float16, device=device,
-                )
-                layer._tq_v_dequant_buf = _vbuf
-            k_buf = _kbuf
-            v_buf = _vbuf
+            _n = Hk * alloc_len * D
+            _kf, _vf = _get_shared_prefill_bufs("dequant", _n, device, torch.float16)
+            k_buf = _kf[:_n].view(buf_shape)
+            v_buf = _vf[:_n].view(buf_shape)
         # Skip .zero_() — kernel writes all positions up to cached_len,
         # and we only read [:cached_len] afterwards.
         k_cached = k_buf[:, :, :alloc_len, :]
@@ -1572,18 +1904,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # eliminates the variable-size torch.empty() calls that cause ROCm HIP
         # graph pool address collisions (→ garbage outputs at 32K, GPU fault at
         # 128K).  Worst-case capacity = all KV blocks × block_size.
+        # Shared across layers rather than cached per layer: at 145K the
+        # per-layer version wanted 1.19 GiB x 2 x 60 layers outside the memory
+        # budget (see _get_shared_prefill_bufs). Capacity tracks seq_len, not
+        # max_model_len, so short requests do not reserve the worst case.
         qdtype = query.dtype
-        _kfull_cap = block_table.shape[1] * block_size
-        _kfull_buf: torch.Tensor | None = getattr(layer, "_tq_kfull_buf", None)
-        if _kfull_buf is None or _kfull_buf.shape[0] < _kfull_cap or _kfull_buf.dtype != qdtype:
-            _kfull_buf = torch.empty(_kfull_cap, Hk, D, dtype=qdtype, device=device)
-            layer._tq_kfull_buf = _kfull_buf
-        _vfull_buf: torch.Tensor | None = getattr(layer, "_tq_vfull_buf", None)
-        if _vfull_buf is None or _vfull_buf.shape[0] < _kfull_cap or _vfull_buf.dtype != qdtype:
-            _vfull_buf = torch.empty(_kfull_cap, Hk, D, dtype=qdtype, device=device)
-            layer._tq_vfull_buf = _vfull_buf
-        k_full = _kfull_buf[:seq_len]
-        v_full = _vfull_buf[:seq_len]
+        _n = seq_len * Hk * D
+        _kfull_buf, _vfull_buf = _get_shared_prefill_bufs(
+            "kvfull", _n, device, qdtype
+        )
+        k_full = _kfull_buf[:_n].view(seq_len, Hk, D)
+        v_full = _vfull_buf[:_n].view(seq_len, Hk, D)
         k_full[:cached_len] = k_cached_trim.to(qdtype)
         k_full[cached_len:] = key_chunk
         v_full[:cached_len] = v_cached_trim.to(qdtype)
@@ -1603,7 +1934,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # supports sinks and handles cu_seqlens_q != cu_seqlens_k as a
         # lower-right causal mask (q at absolute position cached_len+i
         # attends K[0..cached_len+i]).
-        if self.sinks is not None:
+        # D > _CK_MAX_HEAD_DIM joins the sinks case here for the same reason as
+        # in _prefill_attention: CK's flash kernel below cannot handle it,
+        # while this Triton kernel is generic over head size.
+        if self.sinks is not None or D > _CK_MAX_HEAD_DIM:
             out = torch.empty_like(query)
             cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
             seqused_k = torch.tensor([seq_len], dtype=torch.int32, device=device)
@@ -1803,7 +2137,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # RocmAttentionImpl uses on ROCm for sinks. Q/K are already in
         # Hadamard-rotated space (q_rot, k_full) so the dot products match
         # the original-space attention scores.
-        if self.sinks is not None:
+        if self.sinks is not None or D > _CK_MAX_HEAD_DIM:
             out = torch.empty_like(q_rot)
             cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
             seqused_k = torch.tensor([seq_len], dtype=torch.int32, device=device)
@@ -1961,17 +2295,28 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 # FlyDSL kernel adapted to FP4 E2M1 codes + UE8M0 per-group-32
                 # scales (Arch A/B read from fp8_levels).
                 _g = self.num_kv_groups
-                fp8_v4_gqa_ok = (_g in (8, 16)) or (
-                    _g == 6 and _flydsl_fp8_v4_gqa6_available()
-                )
-                fp8_v4_eligible = (
-                    self.head_size == 128
-                    and fp8_v4_gqa_ok
-                    and self.sinks is None
-                    and not (self.sliding_window and self.sliding_window > 0)
-                )
+                if self.head_size == 256:
+                    # HEAD_SIZE=256 (Qwen3.6-class) routes to the fp8_g32 hd256
+                    # siblings (base bf16-QK path): GQA-6 -> gqa6 hd256,
+                    # GQA-{8,16} -> canonical hd256.
+                    fp8_v4_eligible = (
+                        _g in (6, 8, 16)
+                        and _flydsl_fp8_v4_hd256_available(_g)
+                        and self.sinks is None
+                        and not (self.sliding_window and self.sliding_window > 0)
+                    )
+                else:
+                    fp8_v4_gqa_ok = (_g in (8, 16)) or (
+                        _g == 6 and _flydsl_fp8_v4_gqa6_available()
+                    )
+                    fp8_v4_eligible = (
+                        self.head_size == 128
+                        and fp8_v4_gqa_ok
+                        and self.sinks is None
+                        and not (self.sliding_window and self.sliding_window > 0)
+                    )
                 if fp8_v4_eligible:
-                    return flydsl_fp8_g32_decode_attention_v4(
+                    _fly_out = flydsl_fp8_g32_decode_attention_v4(
                         query=query,
                         kv_cache=kv_cache,
                         block_table=attn_metadata.block_table,
@@ -1984,6 +2329,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         max_num_kv_splits=self.max_num_kv_splits,
                         sinks=self.sinks,
                     )
+                    if _FP8_SHADOW_CMP:
+                        try:
+                            _shadow_compare_fp8(
+                                self, query, kv_cache, attn_metadata,
+                                PiT, _fly_out)
+                        except Exception as _sce:  # noqa: BLE001
+                            logger.warning_once(
+                                "fp8 shadow-compare failed: %s", _sce)
+                    return _fly_out
                 logger.warning_once(
                     "fp8_g32 v4 eligibility failed (head_size=%s "
                     "num_kv_groups=%s sinks=%s swa=%s) — falling back to the "
@@ -2063,7 +2417,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             #     v3 rather than erroring at launch.
             _gqa = self.num_kv_groups
             if self.head_size == 256:
-                if _gqa in (8, 16):
+                if _gqa in (2, 8, 16):
+                    # QG=2 (Gemma 4 sliding layers) reuses the canonical hd256
+                    # module's MFMA half-fill + mfma_row<QG store gate, which
+                    # already generalize below GQA-8. Validated numerically vs
+                    # exact fp32 attention (bench_hd256_gqa2_sliding.py).
                     v4_hs_ok = _flydsl_v4_hd256_available()
                     v4_gqa_ok = True
                 elif _gqa == 6:
@@ -2077,6 +2435,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 v4_gqa_ok = (_gqa in (8, 16)) or (
                     _gqa == 6 and _flydsl_v4_gqa6_available()
                 )
+            # SWA routing. The canonical HEAD_SIZE=256 kernel (QG in 2/8/16)
+            # now implements decode sliding-window (base-shift to the aligned
+            # window start + per-token window mask; validated in
+            # tests/kernels/turboquant_v4/test_hd256_swa.py). Every other v4
+            # path (hd128, gqa6_hd256, and any future hd512) still lacks a
+            # window mask, so a SWA layer there would silently attend outside
+            # its window and diverge once context exceeds the window — those
+            # must stay on V3.
+            _swa_active = bool(self.sliding_window and self.sliding_window > 0)
+            _swa_ok_on_v4 = self.head_size == 256 and _gqa in (2, 8, 16)
             v4_eligible = (
                 not self.tq_config.key_fp8
                 and self.tq_config.key_mse_bits == 4
@@ -2084,13 +2452,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 and v4_hs_ok
                 and v4_gqa_ok
                 and self.sinks is None
-                # SWA layers must route to V3 unified — V4 has no
-                # tile-pruning / per-tile SWA mask path, so it would
-                # silently produce wrong outputs at long context for
-                # gpt-oss-style hybrid SWA / full-attention models.
-                and not (self.sliding_window and self.sliding_window > 0)
+                and (not _swa_active or _swa_ok_on_v4)
             )
             if v4_eligible:
+                _v4_mid = None if _V4_FRESH_BUFS else mid_o_buf
+                _v4_out = None if _V4_FRESH_BUFS else output_buf
+                _v4_lse = None if _V4_FRESH_BUFS else lse_buf
+                _v4_holder = None if _V4_FRESH_BUFS else layer
                 result = flydsl_turboquant_decode_attention_v4(
                     query=query,
                     kv_cache=kv_cache,
@@ -2107,12 +2475,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     key_fp8=self.tq_config.key_fp8,
                     norm_correction=self.tq_config.norm_correction,
                     PiT=PiT,
-                    mid_o_buf=mid_o_buf,
-                    output_buf=output_buf,
-                    lse_buf=lse_buf,
-                    buf_holder=layer,
+                    mid_o_buf=_v4_mid,
+                    output_buf=_v4_out,
+                    lse_buf=_v4_lse,
+                    buf_holder=_v4_holder,
                     max_num_kv_splits=self.max_num_kv_splits,
                     sinks=self.sinks,
+                    # VLLM_TQ_V4_SWA_OFF=1 forces full-attention decode on the
+                    # v4 sliding layers (diagnostic: matches the SoA-v3 decode
+                    # baseline, which itself does not window during decode).
+                    sliding_window=(
+                        int(self.sliding_window)
+                        if (_swa_active and not _V4_SWA_OFF)
+                        else 0
+                    ),
                 )
             else:
                 # Per-config gate failed — route to v3.
@@ -2152,7 +2528,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     sliding_window=self.sliding_window,
                 )
         elif _USE_TQ_V3:
-            result = triton_turboquant_decode_attention_v3(
+            result = self._dispatch_decode_v3(
                 query=query,
                 kv_cache=kv_cache,
                 block_table=attn_metadata.block_table,
@@ -2223,4 +2599,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_num_kv_splits=self.max_num_kv_splits,
                 sinks=self.sinks,
             )
+        if _TQ_SHADOW_CMP and _USE_TQ_V4 and not self.tq_config.key_fp8:
+            try:
+                _shadow_compare_tq(
+                    self, query, kv_cache, attn_metadata, Pi, PiT,
+                    centroids, result)
+            except Exception as _sce:  # noqa: BLE001
+                logger.warning_once("tq shadow-compare failed: %s", _sce)
         return result

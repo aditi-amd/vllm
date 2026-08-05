@@ -443,6 +443,19 @@ def triton_turboquant_store(
     # (MSE_BYTES, VAL_DATA_BYTES, meta_region_offset are all even).
     kv_cache_u16 = kv_cache.view(torch.uint16)
 
+    # Both kernels address the cache as a flat byte (resp. u16) array, deriving
+    # every offset from stride_cache_block, so they only need a base pointer.
+    # Flattening with .view(-1) additionally demands full contiguity, which the
+    # cache loses when pages are padded: models with per-layer-type head dims
+    # (Gemma 4 — D=256 sliding at 134,144 B/page, D=512 global at 66,304 B/page)
+    # have no common integer page size, so the allocator as_strided()s the block
+    # dim over a 198,912 B padded page. stride(0) already reports the padded
+    # stride, so passing the tensor unflattened is correct in both cases.
+    kv_cache_arg = kv_cache.view(-1) if kv_cache.is_contiguous() else kv_cache
+    kv_cache_u16_arg = (
+        kv_cache_u16.view(-1) if kv_cache_u16.is_contiguous() else kv_cache_u16
+    )
+
     # ── FP8 PATH: in-kernel FP8 cast + scatter via fp8 kernel ──
     if key_fp8:
         k_flat = key.reshape(NH, D).contiguous()
@@ -454,8 +467,8 @@ def triton_turboquant_store(
         _tq_fused_store_fp8[grid](
             k_flat,
             v_flat,
-            kv_cache.view(-1),
-            kv_cache_u16.view(-1),
+            kv_cache_arg,
+            kv_cache_u16_arg,
             slot_mapping,
             stride_cache_block=stride_block,
             D=D,
@@ -498,8 +511,8 @@ def triton_turboquant_store(
         v_flat,
         midpoints,
         centroids_ptr,
-        kv_cache.view(-1),
-        kv_cache_u16.view(-1),
+        kv_cache_arg,
+        kv_cache_u16_arg,
         slot_mapping,
         stride_cache_block=stride_block,
         D=D,

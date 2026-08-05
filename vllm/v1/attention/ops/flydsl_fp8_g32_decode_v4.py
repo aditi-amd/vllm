@@ -57,6 +57,10 @@ _FLYDSL_AVAILABLE: bool | None = None
 _FP8_MOD = None      # kernels.fp8_g32_decode_v4 module (Qwen GQA-{8,16})
 _FP8_MOD_GQA6 = None  # kernels.fp8_g32_decode_v4_gqa6 module (MiniMax GQA-6); may stay None
 _GQA6_AVAILABLE: bool | None = None
+_FP8_MOD_HD256 = None  # flydsl_kernels.fp8_g32_decode_hd256 module (D=256, GQA-8/16); may stay None
+_HD256_AVAILABLE: bool | None = None
+_FP8_MOD_GQA6_HD256 = None  # flydsl_kernels.fp8_g32_decode_gqa6_hd256 (D=256, GQA-6); may stay None
+_GQA6_HD256_AVAILABLE: bool | None = None
 _FLYC = None    # flydsl.compiler
 _FX = None      # flydsl.expr
 _TYPING_T = None
@@ -77,7 +81,9 @@ def is_flydsl_available() -> bool:
         from flydsl.expr.typing import T  # noqa: F401
         from flydsl.compiler.kernel_function import CompilationContext
         from flydsl._mlir import ir
-        import kernels.fp8_g32_decode_v4 as fp8_mod
+        from vllm.v1.attention.ops.flydsl_kernels import (
+            fp8_g32_decode_v4 as fp8_mod,
+        )
         _FLYC = flyc
         _FX = fx
         _TYPING_T = T
@@ -91,7 +97,9 @@ def is_flydsl_available() -> bool:
         # separately and only flip the gqa6 flag on success.
         global _FP8_MOD_GQA6, _GQA6_AVAILABLE
         try:
-            import kernels.fp8_g32_decode_v4_gqa6 as fp8_mod_gqa6
+            from vllm.v1.attention.ops.flydsl_kernels import (
+                fp8_g32_decode_v4_gqa6 as fp8_mod_gqa6,
+            )
             _FP8_MOD_GQA6 = fp8_mod_gqa6
             _GQA6_AVAILABLE = True
             logger.info_once(
@@ -102,6 +110,42 @@ def is_flydsl_available() -> bool:
                 "FlyDSL fp8_g32 decode v4 GQA-6 sibling: unavailable (%s). "
                 "MiniMax-class (QG=6) will fall back to Triton fp8_g32 v3.",
                 ex_gqa6,
+            )
+        # Best-effort load of the HEAD_SIZE=256 sibling (Qwen3.6-class). Its
+        # absence must NOT disable the D=128 path, so import separately and
+        # only flip the hd256 flag on success.
+        global _FP8_MOD_HD256, _HD256_AVAILABLE
+        try:
+            from vllm.v1.attention.ops.flydsl_kernels import (
+                fp8_g32_decode_hd256 as fp8_mod_hd256,
+            )
+            _FP8_MOD_HD256 = fp8_mod_hd256
+            _HD256_AVAILABLE = True
+            logger.info_once(
+                "FlyDSL fp8_g32 decode hd256 sibling: available")
+        except Exception as ex_hd256:  # noqa: BLE001
+            _HD256_AVAILABLE = False
+            logger.warning_once(
+                "FlyDSL fp8_g32 decode hd256 sibling: unavailable (%s). "
+                "D=256 (GQA-8/16) will fall back to Triton fp8_g32 v3.",
+                ex_hd256,
+            )
+        # Best-effort load of the GQA-6 HEAD_SIZE=256 sibling (Qwen3.6-27B).
+        global _FP8_MOD_GQA6_HD256, _GQA6_HD256_AVAILABLE
+        try:
+            from vllm.v1.attention.ops.flydsl_kernels import (
+                fp8_g32_decode_gqa6_hd256 as fp8_mod_gqa6_hd256,
+            )
+            _FP8_MOD_GQA6_HD256 = fp8_mod_gqa6_hd256
+            _GQA6_HD256_AVAILABLE = True
+            logger.info_once(
+                "FlyDSL fp8_g32 decode gqa6-hd256 sibling: available")
+        except Exception as ex_gqa6_hd256:  # noqa: BLE001
+            _GQA6_HD256_AVAILABLE = False
+            logger.warning_once(
+                "FlyDSL fp8_g32 decode gqa6-hd256 sibling: unavailable (%s). "
+                "D=256 (GQA-6) will fall back to Triton fp8_g32 v3.",
+                ex_gqa6_hd256,
             )
     except Exception as ex:  # noqa: BLE001
         _FLYDSL_AVAILABLE = False
@@ -122,6 +166,22 @@ def is_flydsl_fp8_gqa6_available() -> bool:
     if not is_flydsl_available():
         return False
     return bool(_GQA6_AVAILABLE)
+
+
+def is_flydsl_fp8_hd256_available(query_group_size: int = 16) -> bool:
+    """True iff FlyDSL is available AND the relevant HEAD_SIZE=256 sibling
+    loaded for the given GQA factor.
+
+    ``query_group_size==6`` requires the GQA-6 hd256 sibling; 8/16 require the
+    canonical hd256 sibling. Used by the backend eligibility gate to allow
+    D=256 only when the matching kernel module is importable; otherwise D=256
+    falls back to the Triton fp8_g32 v3 path.
+    """
+    if not is_flydsl_available():
+        return False
+    if int(query_group_size) == 6:
+        return bool(_GQA6_HD256_AVAILABLE)
+    return bool(_HD256_AVAILABLE)
 
 
 # -- Kernel module cache -------------------------------------------------------
@@ -172,14 +232,27 @@ def _kmap_phys(group: int, s: int) -> int:
 
 def _qperm_index(device: torch.device, D: int = 128,
                  group_size: int = 32) -> torch.Tensor:
-    key = str(device)
+    # _kmap_phys describes ONE K=128 contraction (4 groups of 32). A head dim
+    # wider than 128 is covered by ceil(D/128) back-to-back MFMA issues, each
+    # contracting its own independent 128-wide slice, so the same map repeats
+    # per slice: qperm = [qperm128, qperm128 + 128, ...]. Applying _kmap_phys
+    # with group >= 4 instead yields positions outside the slice and is not a
+    # permutation at all.
+    key = f"{device}:{D}:{group_size}"
     t = _QPERM_CACHE.get(key)
     if t is None:
-        n_groups = D // group_size
+        k_per_mfma = 128
+        assert D % k_per_mfma == 0, (
+            f"qk_scaled needs D to be a multiple of {k_per_mfma}, got {D}"
+        )
+        groups_per_mfma = k_per_mfma // group_size
         qperm = [0] * D
-        for g in range(n_groups):
-            for s in range(group_size):
-                qperm[_kmap_phys(g, s)] = g * group_size + s
+        for half in range(D // k_per_mfma):
+            base = half * k_per_mfma
+            for g in range(groups_per_mfma):
+                for s in range(group_size):
+                    qperm[base + _kmap_phys(g, s)] = base + g * group_size + s
+        assert sorted(qperm) == list(range(D)), "qperm is not a permutation"
         t = torch.tensor(qperm, dtype=torch.long, device=device).contiguous()
         _QPERM_CACHE[key] = t
     return t
@@ -343,13 +416,14 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
                 qk_fp8: bool = False,
                 qk_scaled: bool = False,
                 v_cvt: bool = False,
-                q_hoist: bool = False):
+                q_hoist: bool = False,
+                head_size: int = 128):
     key = (num_kv_heads, int(num_partitions), int(max_blocks_per_seq),
            round(float(scale), 8), int(query_group_size), int(kv_block_size),
            int(padded_slot), bool(use_hw_v_transpose),
            int(tile_groups_per_partition), bool(arch_b),
            round(float(scale_c), 8), bool(qk_fp8), bool(qk_scaled),
-           bool(v_cvt), bool(q_hoist))
+           bool(v_cvt), bool(q_hoist), int(head_size))
     cached = _KERN_CACHE.get(key)
     if cached is not None:
         _GET_KERNEL_STATS["hits"] += 1
@@ -361,7 +435,50 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
     # GQA-6 (MiniMax) dispatches to the sibling module/build fn; Qwen
     # GQA-{8,16} use the canonical kernel. The two modules expose distinct
     # MLIR smem symbols + kernel names so both can be JIT-resident at once.
-    if int(query_group_size) == 6:
+    if int(head_size) == 256:
+        # HEAD_SIZE=256 (Qwen3.6-class) routes to the hd256 sibling modules.
+        # Fast paths ported to 256: qk_fp8 (native fp8 QK MFMA), HW V-transpose,
+        # native V CVT, and qk_scaled (GQA-6 sibling only; the GQA-8/16 sibling
+        # still rejects it).
+        # GQA-6 (Qwen3.6-27B) uses the gqa6 sibling; GQA-8/16 the canonical.
+        if int(query_group_size) == 6:
+            assert _FP8_MOD_GQA6_HD256 is not None, (
+                "head_size=256 GQA-6 requires the fp8_g32_decode_gqa6_hd256 "
+                "sibling, which failed to import; check "
+                "is_flydsl_fp8_hd256_available(6)."
+            )
+            kmod = _FP8_MOD_GQA6_HD256
+            _hd256_build = kmod.build_fp8_g32_decode_gqa6_hd256_module
+        else:
+            assert _FP8_MOD_HD256 is not None, (
+                "head_size=256 requires the fp8_g32_decode_hd256 sibling, "
+                "which failed to import; check is_flydsl_fp8_hd256_available()."
+            )
+            assert int(query_group_size) in (8, 16), (
+                f"fp8_g32 hd256 supports GQA 6, 8 or 16, got {query_group_size}"
+            )
+            kmod = _FP8_MOD_HD256
+            _hd256_build = kmod.build_fp8_g32_decode_hd256_module
+        kfn = _hd256_build(
+            num_seqs=int(num_seqs_hint),
+            num_kv_heads=num_kv_heads,
+            num_partitions=num_partitions,
+            padded_slot=int(padded_slot),
+            max_blocks_per_seq=max_blocks_per_seq,
+            softmax_scale=float(scale),
+            query_group_size=int(query_group_size),
+            kv_block_size=int(kv_block_size),
+            use_hw_v_transpose=bool(use_hw_v_transpose),
+            tile_groups_per_partition=int(tile_groups_per_partition),
+            use_wht_butterfly=False,
+            arch_b=bool(arch_b),
+            scale_c=float(scale_c),
+            qk_fp8=bool(qk_fp8),
+            qk_scaled=bool(qk_scaled),
+            v_cvt=bool(v_cvt),
+            q_hoist=bool(q_hoist),
+        )
+    elif int(query_group_size) == 6:
         assert _FP8_MOD_GQA6 is not None, (
             "query_group_size=6 requires the fp8_g32_decode_v4_gqa6 sibling, "
             "which failed to import; check is_flydsl_fp8_gqa6_available()."
@@ -553,22 +670,30 @@ def flydsl_fp8_g32_decode_attention_v4(
     block_size = kv_cache.shape[1]
     padded_slot = int(kv_cache.shape[3])
     QG = Hq // Hk
-    assert D == _FP8_MOD.HEAD_SIZE, (
-        f"fp8_g32 v4 expects D={_FP8_MOD.HEAD_SIZE}, got {D}"
+    assert D in (_FP8_MOD.HEAD_SIZE, 256), (
+        f"fp8_g32 v4 expects D={_FP8_MOD.HEAD_SIZE} or 256, got {D}"
     )
     assert block_size in (16, 32), (
         f"fp8_g32 v4 supports kv_block_size 16 or 32, got {block_size}"
     )
-    if QG == 6:
-        # MiniMax-class GQA-6 routes to the sibling kernel; require it loaded.
+    assert QG in (6, 8, 16), (
+        f"fp8_g32 v4 supports GQA factor 6, 8 or 16, got {QG}"
+    )
+    if D == 256:
+        # D=256 (Qwen3.6-class): GQA-6 -> gqa6 hd256 sibling; GQA-8/16 ->
+        # canonical hd256 sibling. Require the matching module loaded.
+        assert is_flydsl_fp8_hd256_available(QG), (
+            "fp8_g32 v4 D=256 requires the fp8_g32_decode_"
+            f"{'gqa6_' if QG == 6 else ''}hd256 sibling, which is unavailable; "
+            "caller should not have dispatched here "
+            "(see is_flydsl_fp8_hd256_available())."
+        )
+    elif QG == 6:
+        # MiniMax-class GQA-6 @ D=128 routes to the 128 sibling kernel.
         assert is_flydsl_fp8_gqa6_available(), (
             "fp8_g32 v4 GQA-6 (QG=6) requires the fp8_g32_decode_v4_gqa6 "
             "sibling, which is unavailable; caller should not have dispatched "
             "here (see is_flydsl_fp8_gqa6_available())."
-        )
-    else:
-        assert QG in (8, 16), (
-            f"fp8_g32 v4 supports GQA factor 6, 8 or 16, got {QG}"
         )
 
     arch_b = bool(is_arch_b())
@@ -649,6 +774,38 @@ def flydsl_fp8_g32_decode_attention_v4(
     assert not (qk_fp8 and qk_scaled), (
         "VLLM_FP8_G32_DECODE_V4_QK_FP8 and _QK_SCALED are mutually exclusive"
     )
+    if D == 256:
+        # hd256 ports the HW V-transpose + native V CVT fast paths (the primary
+        # bf16-parity win, shared with TQ44v4) as the DEFAULT, plus qk_scaled
+        # (2 chained K=128 scaled MFMA issues, qperm applied per 128-dim slice),
+        # which inherits the ON default above. qk_scaled has the same sign-off
+        # qk_fp8 has: offline parity cos 1.000000, GSM8K 0.9704 vs 0.9727 and
+        # LCB-128K 66.30% vs 67.39% (both within noise), and it cuts decode
+        # kernel time 322.98 -> 214.70 us/call with VGPR 112 -> 92. Set
+        # VLLM_FP8_G32_DECODE_V4_QK_SCALED=0 to fall back to qk_fp8, which then
+        # becomes the default per the expression below.
+        #
+        # The native fp8 QK MFMA (qk_fp8) is bit-exact in eager (cos>=0.99999)
+        # but exhibits a cudagraph-specific accuracy regression, so it is not
+        # the first choice; reach for it via _QK_SCALED=0, or force it with
+        # VLLM_FP8_G32_DECODE_V4_QK_FP8=1 (which also needs _QK_SCALED=0).
+        #
+        # Fallback for qk_fp8: the native fp8xfp8 scaled QK MFMA. This matches
+        # the proven-correct Triton v3 decode EXACTLY (cos 1.0 offline vs cos
+        # 0.996 for the bf16-QK-dequant path). The bf16-QK path — despite
+        # correct indexing and equal single-step cos-vs-bf16 — has an error
+        # profile (full bf16 Q + bf16-rounded cent*scale K) that compounds over
+        # long autoregressive generations (GSM8K 0.48 vs 0.97). The fp8 path
+        # (exact FP4 codes + per-group UE8M0 scale folded post-MFMA, E4M3 Q)
+        # mirrors Triton's dot_scaled and does not compound. Override with
+        # VLLM_FP8_G32_DECODE_V4_QK_FP8=0 to restore the (buggy) bf16-QK path.
+        qk_fp8 = os.environ.get(
+            "VLLM_FP8_G32_DECODE_V4_QK_FP8", "0" if qk_scaled else "1"
+        ) == "1"
+        assert not (qk_fp8 and qk_scaled), (
+            "VLLM_FP8_G32_DECODE_V4_QK_FP8 and _QK_SCALED are mutually "
+            "exclusive; unset one of them"
+        )
     # ---- V dequant path selection ----------------------------------------
     # Default ON: native CDNA4 scaled FP4->bf16 CVT for V dequant (gfx950);
     # requires the HW V-transpose LDS layout. Set
@@ -687,8 +844,19 @@ def flydsl_fp8_g32_decode_attention_v4(
         _q_float.view(B * Hq, D), PiT_used,
         out=_q_rot_f32.view(B * Hq, D),
     )
-    _q_fp8.copy_(_q_rot_f32)       # fp32 -> e4m3 (saturating round)
-    _q_rot_out.copy_(_q_fp8)       # e4m3 -> bf16 (exact: e4m3 ⊂ bf16)
+    # The E4M3 haircut is ONLY correct for the native fp8-consuming QK MFMA
+    # paths (qk_scaled's scaled FP4xE4M3 MFMA, or qk_fp8's fp8xfp8 MFMA), which
+    # take Q as E4M3 by construction. The bf16 QK MFMA path (the D=256 default,
+    # where both are OFF) reads bf16 Q directly, so round-tripping through E4M3
+    # there only strips ~3 mantissa bits of Q every decode step — a per-step
+    # cos~0.99 error that passes single-step parity but compounds over long
+    # autoregressive generations (short GSM8K answers fine, long ones collapse).
+    # TQ44v4 (bf16 Q, no haircut) and the Triton v3 fp8_g32 path both avoid it.
+    if qk_fp8 or qk_scaled:
+        _q_fp8.copy_(_q_rot_f32)       # fp32 -> e4m3 (saturating round)
+        _q_rot_out.copy_(_q_fp8)       # e4m3 -> bf16 (exact: e4m3 ⊂ bf16)
+    else:
+        _q_rot_out.copy_(_q_rot_f32)   # fp32 -> bf16 directly (bf16 QK MFMA)
     q_for_kernel = _q_rot_out
 
     # ---- FlyDSL kernel launch --------------------------------------------
@@ -705,6 +873,7 @@ def flydsl_fp8_g32_decode_attention_v4(
         qk_scaled=qk_scaled,
         v_cvt=v_cvt,
         q_hoist=q_hoist,
+        head_size=int(D),
     )
     global _LOG_INVOKED_ONCE, _LOG_SINKS_WARNED
     if not _LOG_INVOKED_ONCE:
