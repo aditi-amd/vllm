@@ -417,13 +417,14 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
                 qk_scaled: bool = False,
                 v_cvt: bool = False,
                 q_hoist: bool = False,
-                head_size: int = 128):
+                head_size: int = 128,
+                num_warps: int = 1):
     key = (num_kv_heads, int(num_partitions), int(max_blocks_per_seq),
            round(float(scale), 8), int(query_group_size), int(kv_block_size),
            int(padded_slot), bool(use_hw_v_transpose),
            int(tile_groups_per_partition), bool(arch_b),
            round(float(scale_c), 8), bool(qk_fp8), bool(qk_scaled),
-           bool(v_cvt), bool(q_hoist), int(head_size))
+           bool(v_cvt), bool(q_hoist), int(head_size), int(num_warps))
     cached = _KERN_CACHE.get(key)
     if cached is not None:
         _GET_KERNEL_STATS["hits"] += 1
@@ -449,6 +450,7 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
             )
             kmod = _FP8_MOD_GQA6_HD256
             _hd256_build = kmod.build_fp8_g32_decode_gqa6_hd256_module
+            _hd256_extra = {}
         else:
             assert _FP8_MOD_HD256 is not None, (
                 "head_size=256 requires the fp8_g32_decode_hd256 sibling, "
@@ -459,6 +461,9 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
             )
             kmod = _FP8_MOD_HD256
             _hd256_build = kmod.build_fp8_g32_decode_hd256_module
+            # Only the canonical GQA-{8,16} hd256 build accepts the occupancy
+            # (num_warps) knob; the gqa6 sibling does not.
+            _hd256_extra = {"num_warps": int(num_warps)}
         kfn = _hd256_build(
             num_seqs=int(num_seqs_hint),
             num_kv_heads=num_kv_heads,
@@ -477,6 +482,7 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
             qk_scaled=bool(qk_scaled),
             v_cvt=bool(v_cvt),
             q_hoist=bool(q_hoist),
+            **_hd256_extra,
         )
     elif int(query_group_size) == 6:
         assert _FP8_MOD_GQA6 is not None, (
@@ -529,7 +535,13 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
             q_hoist=bool(q_hoist),
         )
     al = kmod.allocator
-    block_threads = kmod.BLOCK_THREADS
+    # Canonical hd256 supports a per-build num_warps (occupancy knob); its block
+    # dim is num_warps*WARP_SIZE. All other modules use their module constant.
+    if int(head_size) == 256 and int(query_group_size) in (8, 16) \
+            and int(num_warps) != 1:
+        block_threads = int(num_warps) * 64
+    else:
+        block_threads = kmod.BLOCK_THREADS
 
     flyc = _FLYC
     fx = _FX
@@ -628,6 +640,83 @@ def _reduce_partitions_v4(
     tl.store(output_ptr + out_off, acc.to(output_ptr.dtype.element_ty))
 
 
+# -- Fused Q rotation + E4M3 haircut (Triton) ---------------------------------
+# Replaces the 4-op torch prologue (copy bf16->fp32, mm by PiT, copy fp32->e4m3,
+# copy e4m3->bf16) with ONE kernel. The win is kernel COUNT, not bytes: each of
+# those small ops costs ~2-4us of fixed GPU-side cost here largely independent of
+# element count (verified: sweeping the pool's B_bucket 512->1, i.e. 512x fewer
+# elements in the copies, moved the floor 0%). Under CUDA graphs the host launch
+# cost is already gone, so only per-kernel GPU cost remains and collapsing 4
+# kernels into 1 is the lever that is left.
+@triton.jit
+def _fused_q_rot_haircut_v4(
+    q_ptr,                   # [B, Hq, D] query dtype (bf16/fp16), strided
+    pit_ptr,                 # [D, D] fp32 contiguous (already qperm-permuted)
+    out_ptr,                 # [B_bucket, Hq, D] out dtype, contiguous
+    M,                       # B * Hq (runtime)
+    q_stride_n: tl.int64,
+    q_stride_h: tl.int64,
+    HQ: tl.constexpr,
+    D: tl.constexpr,
+    HAIRCUT: tl.constexpr,   # round through E4M3 (fp8-consuming QK MFMA paths)
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    m_off = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m_off < M
+    n = m_off // HQ
+    h = m_off % HQ
+
+    # Splitting the OUTPUT columns across programs (not just the rows) is what
+    # gives this kernel parallelism at small batch: M = B*Hq is only 8 at B=1,
+    # so a row-only grid launches ONE workgroup and serializes the whole
+    # 256x256 rotation on a single CU. The K reduction is untouched by the
+    # split, so the result stays bit-identical.
+    d_off = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+    for k0 in range(0, D, BLOCK_K):
+        k_off = k0 + tl.arange(0, BLOCK_K)
+        q_idx = (n[:, None] * q_stride_n + h[:, None] * q_stride_h
+                 + k_off[None, :])
+        q_blk = tl.load(q_ptr + q_idx, mask=m_mask[:, None], other=0.0)
+        p_blk = tl.load(pit_ptr + k_off[:, None] * D + d_off[None, :])
+        acc = tl.dot(q_blk.to(tl.float32), p_blk, acc)
+
+    if HAIRCUT:
+        # fp32 -> E4M3 -> fp32. Mirrors the torch path's
+        # q_rot_fp32 -> float8_e4m3fn -> bf16 round trip (e4m3 is a subset of
+        # bf16, so the second hop is exact and folds away here).
+        acc = acc.to(tl.float8e4nv).to(tl.float32)
+
+    out_idx = m_off[:, None] * D + d_off[None, :]
+    tl.store(out_ptr + out_idx, acc.to(out_ptr.dtype.element_ty),
+             mask=m_mask[:, None])
+
+
+# Opt-in until the accuracy ladder (offline parity -> autoregressive drift ->
+# paired GSM8K) clears it. Default OFF keeps the shipped path bit-unchanged.
+_FUSE_Q_ROT = os.environ.get(
+    "VLLM_FP8_G32_DECODE_V4_FUSE_Q_ROT", "0") == "1"
+
+
+def _run_fused_q_rot(query, PiT_used, out, B, Hq, D, haircut):
+    """Launch the fused prologue. ``out`` is the pooled [B_bucket, Hq, D] buf."""
+    M = B * Hq
+    BLOCK_M = 16
+    BLOCK_K = 32
+    BLOCK_D = int(os.environ.get("VLLM_FP8_G32_DECODE_V4_FUSE_BLOCK_D", "64"))
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D, BLOCK_D))
+    _fused_q_rot_haircut_v4[grid](
+        query, PiT_used, out, M,
+        query.stride(0), query.stride(1),
+        HQ=int(Hq), D=int(D), HAIRCUT=bool(haircut),
+        BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K, BLOCK_D=BLOCK_D,
+    )
+
+
 # -- Public launcher ----------------------------------------------------------
 def flydsl_fp8_g32_decode_attention_v4(
     query: torch.Tensor,            # [B, Hq, D] bf16/fp16 (raw, unrotated)
@@ -673,9 +762,18 @@ def flydsl_fp8_g32_decode_attention_v4(
     assert D in (_FP8_MOD.HEAD_SIZE, 256), (
         f"fp8_g32 v4 expects D={_FP8_MOD.HEAD_SIZE} or 256, got {D}"
     )
-    assert block_size in (16, 32), (
-        f"fp8_g32 v4 supports kv_block_size 16 or 32, got {block_size}"
-    )
+    # head_dim=128 kernels support {16,32}; head_dim=256 (incl. hybrid models
+    # like Qwen3.6/3.8, which force a larger mamba-aligned block) also accept
+    # 64/128/256, mirroring the TQ v4 launcher (its HD256 sibling).
+    if D == 256:
+        assert block_size in (16, 32, 64, 128, 256), (
+            f"fp8_g32 v4 head_dim=256 supports kv_block_size 16/32/64/128/256, "
+            f"got {block_size}"
+        )
+    else:
+        assert block_size in (16, 32), (
+            f"fp8_g32 v4 supports kv_block_size 16 or 32, got {block_size}"
+        )
     assert QG in (6, 8, 16), (
         f"fp8_g32 v4 supports GQA factor 6, 8 or 16, got {QG}"
     )
@@ -737,8 +835,18 @@ def flydsl_fp8_g32_decode_attention_v4(
     else:
         sizing_max_seq_len = worst_case_max_seq_len
 
+    # Split-KV parallelism cap. The old default (32) silently serialized long
+    # contexts: once required_num_partitions exceeds the cap, TGPP grows and each
+    # workgroup walks MORE tile-groups instead of the grid getting wider. The
+    # decode kernel is latency-bound at ~1-2 waves/CU (grid = B*Hk*P workgroups
+    # of a single wavefront), so that serialization dominated long-context decode.
+    # Raising the cap to 256 keeps TGPP ~1 and measured (B=16, rocprof, per step
+    # decode+reduce+store): 16k 82.7->40.0us, 32k 152.0->55.1us, 64k 339.4->95.7us,
+    # 131k 671.3->179.0us (2.1x - 3.8x, growing with context). 512 regresses
+    # because _reduce_partitions cost grows with partition count.
+    # Cost: the segm pool scales with P (~8x vs P=32).
     MAX_PARTITIONS = int(os.environ.get(
-        "VLLM_FP8_G32_DECODE_V4_MAX_PARTITIONS", "32"))
+        "VLLM_FP8_G32_DECODE_V4_MAX_PARTITIONS", "256"))
     MAX_PARTITIONS = max(2, MAX_PARTITIONS)
     required_num_partitions = (
         sizing_max_seq_len + kv_compute_block - 1) // kv_compute_block
@@ -815,6 +923,16 @@ def flydsl_fp8_g32_decode_attention_v4(
     # K-tile loop (build fp8 Q once in STEP C, reuse). No-op unless qk_scaled.
     # Set VLLM_FP8_G32_DECODE_V4_Q_HOIST=0 to disable.
     q_hoist = os.environ.get("VLLM_FP8_G32_DECODE_V4_Q_HOIST", "1") == "1"
+    # Occupancy knob (HIOCC): number of wavefronts per workgroup for the
+    # hd256 GQA-{8,16} decode kernel. Default 1 = canonical single-warp path
+    # (bit-identical). 2/4 split the K-tile loop across warps with a cross-warp
+    # online-softmax reduction to raise waves/CU. Only affects head_size=256.
+    try:
+        num_warps = int(os.environ.get("VLLM_FP8_G32_DECODE_V4_NUM_WARPS", "1"))
+    except ValueError:
+        num_warps = 1
+    if num_warps not in (1, 2, 4):
+        num_warps = 1
 
     # ---- Q rotation + FP8 E4M3 haircut -----------------------------------
     # q_rot = query.float() @ PiT  -> cast to FP8 E4M3 (precision haircut the
@@ -839,11 +957,7 @@ def flydsl_fp8_g32_decode_attention_v4(
     _q_rot_f32 = pool_bufs["q_rot_fp32"]
     _q_fp8 = pool_bufs["q_fp8"]
     _q_rot_out = pool_bufs["q_rot"]
-    _q_float.copy_(query)
-    torch.mm(
-        _q_float.view(B * Hq, D), PiT_used,
-        out=_q_rot_f32.view(B * Hq, D),
-    )
+
     # The E4M3 haircut is ONLY correct for the native fp8-consuming QK MFMA
     # paths (qk_scaled's scaled FP4xE4M3 MFMA, or qk_fp8's fp8xfp8 MFMA), which
     # take Q as E4M3 by construction. The bf16 QK MFMA path (the D=256 default,
@@ -852,11 +966,30 @@ def flydsl_fp8_g32_decode_attention_v4(
     # cos~0.99 error that passes single-step parity but compounds over long
     # autoregressive generations (short GSM8K answers fine, long ones collapse).
     # TQ44v4 (bf16 Q, no haircut) and the Triton v3 fp8_g32 path both avoid it.
-    if qk_fp8 or qk_scaled:
-        _q_fp8.copy_(_q_rot_f32)       # fp32 -> e4m3 (saturating round)
-        _q_rot_out.copy_(_q_fp8)       # e4m3 -> bf16 (exact: e4m3 ⊂ bf16)
+    _haircut = bool(qk_fp8 or qk_scaled)
+    # The fused kernel indexes the head-dim contiguously; fall back if not.
+    if _FUSE_Q_ROT and query.stride(-1) == 1:
+        # One kernel for the whole prologue instead of four ops. It differs from
+        # the torch path only in the GEMM reduction order (tl.dot vs rocBLAS).
+        # Measured: with the E4M3 haircut ON (every fp8-consuming QK path, i.e.
+        # the production default) the round trip through 3 mantissa bits absorbs
+        # that difference and the result is BIT-IDENTICAL across D={128,256},
+        # Hq={8,16,64} and batch incl. non-powers-of-2. With the haircut OFF
+        # (bf16-QK path) it is equivalent but not bit-exact at D=128: max|Δ| up
+        # to 3.9e-03, with error vs an fp64 reference matching the torch path's
+        # to 4 significant digits.
+        _run_fused_q_rot(query, PiT_used, _q_rot_out, B, Hq, D, _haircut)
     else:
-        _q_rot_out.copy_(_q_rot_f32)   # fp32 -> bf16 directly (bf16 QK MFMA)
+        _q_float.copy_(query)
+        torch.mm(
+            _q_float.view(B * Hq, D), PiT_used,
+            out=_q_rot_f32.view(B * Hq, D),
+        )
+        if _haircut:
+            _q_fp8.copy_(_q_rot_f32)       # fp32 -> e4m3 (saturating round)
+            _q_rot_out.copy_(_q_fp8)       # e4m3 -> bf16 (exact: e4m3 ⊂ bf16)
+        else:
+            _q_rot_out.copy_(_q_rot_f32)   # fp32 -> bf16 (bf16 QK MFMA)
     q_for_kernel = _q_rot_out
 
     # ---- FlyDSL kernel launch --------------------------------------------
@@ -874,6 +1007,7 @@ def flydsl_fp8_g32_decode_attention_v4(
         v_cvt=v_cvt,
         q_hoist=q_hoist,
         head_size=int(D),
+        num_warps=num_warps,
     )
     global _LOG_INVOKED_ONCE, _LOG_SINKS_WARNED
     if not _LOG_INVOKED_ONCE:

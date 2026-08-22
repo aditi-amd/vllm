@@ -8,16 +8,20 @@
 # geometry constants below, and each token's now-128-byte K/V code payload is
 # loaded in ``HALVES``=2 x 16-byte buffer_load issues (AMD dwordx4 max).
 #
-# Dispatched only when D == 256. This module implements the CANONICAL base
-# path only:
-#   * QK: bf16 wide-K MFMA (mfma_f32_16x16x32_bf16), QK_K_CHUNKS=8
-#   * V : software FP4-centroid LUT dequant into transposed V LDS
-#   * Q : pre-rotated q_rot load (STEP B)
-# The 128-kernel's optional fast paths (qk_fp8 / qk_scaled native scaled-MFMA,
-# v_cvt native convert, use_hw_v_transpose, use_wht_butterfly) are NOT ported
-# to 256 and are ignored if requested (the launcher forces them off for D=256).
-# Correctness is identical to the bf16-QK reference the 128 fast paths validate
-# against; the 256 fast paths are a follow-up optimization.
+# Dispatched only when D == 256. Paths (selected via build() flags):
+#   * QK: qk_scaled native scaled FP4xE4M3 MFMA (2x mfma_scale_f32_16x16x128_
+#         f8f6f4, K=128/issue) when QK_SCALED — the scale is applied by the
+#         instruction, no post-MFMA fold; else qk_fp8 native fp8 MFMA (8x
+#         mfma_f32_16x16x32_fp8_fp8) when QK_FP8; else bf16 wide-K MFMA
+#         (mfma_f32_16x16x32_bf16); QK_K_CHUNKS=8.
+#   * V : native cvt_scalef32_pk_bf16_fp4 dequant (V_CVT) into row-major V LDS
+#         read back via ds_read_tr16_b64 HW transpose (USE_HW_TR); else software
+#         FP4-centroid LUT dequant.
+#   * Q : pre-rotated q_rot load (STEP B).
+# qk_scaled (ported from the GQA-6 sibling) is the fewest-issue QK path: 2 K=128
+# scaled MFMAs vs qk_fp8's 8 K=32 issues + 32 post-MFMA scale FMAs. The KV LDS
+# tile is bank-conflict padded (see KV_ROW_*/KFP4_ROW_I32 below) so those native
+# MFMA reads run unstalled. Correctness is bit-identical to the bf16-QK reference.
 #
 # fp8_g32 AoS slot layout (per (slot, head), D=256, group_size=32 => 8 groups):
 #   [0        : 128)  K FP4 codes    (KEY_CODE_BYTES = 128, 2 nibbles/byte)
@@ -30,6 +34,8 @@
 #   PV:  mfma(A=V_T, B=P, C=acc_pv)  ->  C[m=head_dim, n=query], 4 fp32/lane
 
 from __future__ import annotations
+
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -94,7 +100,32 @@ Q_COL_MASK = Q_GROUPS_PER_ROW - 1           # 31 for 256
 # LDS regions
 CENTROID_LDS_BYTES = N_CENTROIDS * 4                       # 64
 Q_LDS_BYTES = QUERY_GROUP_SIZE * HEAD_SIZE * 2             # 8192 for 256
-KV_TILE_LDS_BYTES = TILE_SIZE * HEAD_SIZE * 2             # 8192 for 256
+KV_TILE_LDS_BYTES = TILE_SIZE * HEAD_SIZE * 2             # 8192 for 256 (unpadded ref)
+
+# --- KV-tile LDS bank-conflict padding (mirrors tq_decode_hd256) ------------
+# The KV tile is laid out [token][head_dim] in LDS and time-multiplexed: K for
+# QK, then V for PV. With an unpadded row stride EVERY token-row starts on the
+# same LDS banks, so the MFMA operand reads (lane t -> row=token) all hit the
+# same banks -> a 16-way bank conflict (rocprof measured ~64% of the decode
+# kernel's LDS cycles on the bf16 layout in tq_decode_hd256). Padding each
+# token row shifts consecutive rows onto different banks. Two strides are
+# needed because qk_fp8 stores K as E4M3 (1 B/elem) while V is bf16 (2 B/elem):
+#   * V (and the bf16-K fallback): pad 8 bf16 (16 B) -> 264 elems / 528 B
+#     (row bank offset (264/2)%32 = 4 -> 16-way becomes 2-way).
+#   * qk_fp8 E4M3-K: HEAD_SIZE bytes = 256 B = exact banks; pad 2 i64 (16 B)
+#     -> 34 i64 / 272 B (dword stride 68, %32 = 4 -> 16-way becomes 2-way).
+# Both pads keep ds_read/ds_write_b64 (and b128) alignment. This is a pure
+# addressing change: within-token head-dim offsets and every dequant/MFMA
+# operand are bit-identical to the unpadded kernel.
+KV_ROW_PAD_ELEMS = 8                                       # bf16 padding / token row
+KV_ROW_ELEMS = HEAD_SIZE + KV_ROW_PAD_ELEMS               # 264 (V + bf16-K rows)
+KV_ROW_I64 = KV_ROW_ELEMS // 4                            # 66
+KV_ROW_BYTES = KV_ROW_ELEMS * 2                           # 528
+KFP8_ROW_I64 = HEAD_SIZE // 8 + 2                         # 34 (qk_fp8 E4M3 K row)
+#   * qk_scaled FP4-K: HEAD_SIZE//8 = 32 i32 = 128 B = exact banks; pad 4 i32
+#     (16 B) -> 36 i32 / 144 B (row bank offset 36 % 32 = 4 -> 16-way -> 2-way).
+KFP4_ROW_I32 = HEAD_SIZE // 8 + 4                          # 36 (qk_scaled FP4 K row)
+KV_TILE_LDS_BYTES_PADDED = TILE_SIZE * KV_ROW_BYTES       # 8448 (V dominates)
 # qk_fp8 only: per-(token, group) K UE8M0 scale staged for the post-MFMA fold.
 SCALE_LDS_BYTES = TILE_SIZE * N_GROUPS * 4                 # 16*8*4 = 512 for 256
 
@@ -128,6 +159,7 @@ def build_fp8_g32_decode_hd256_module(
     qk_scaled: bool = False,
     v_cvt: bool = False,
     q_hoist: bool = False,
+    num_warps: int = 1,
 ):
     """Build an fp8_g32 HEAD_SIZE=256 decode kernel module (base path only).
 
@@ -139,16 +171,23 @@ def build_fp8_g32_decode_hd256_module(
     ``arch_b`` (default False): when True the dequant multiplies the UE8M0
     scale by the extra constant ``scale_c`` (the c-baked-codebook recipe).
 
-    The fast-path flags (``qk_fp8``, ``qk_scaled``, ``v_cvt``,
-    ``use_hw_v_transpose``, ``use_wht_butterfly``, ``q_hoist``) are accepted for
-    launcher signature compatibility but IGNORED at 256 — the canonical bf16-QK
-    + software-LUT-V + q_rot path is always used.
+    QK path selection (mutually exclusive): ``qk_fp8`` uses 8 K=32
+    ``mfma_f32_16x16x32_fp8_fp8`` issues with the UE8M0 scale folded in
+    afterwards; ``qk_scaled`` uses 2 K=128 ``mfma_scale_f32_16x16x128_f8f6f4``
+    issues with the scale applied by the instruction; with neither set the
+    canonical bf16 wide-K MFMA path runs. ``v_cvt`` + ``use_hw_v_transpose``
+    (native FP4->bf16 V convert via HW transpose) are also implemented and used
+    by the production D=256 config. ``q_hoist`` only affects ``qk_scaled``
+    (loop-invariant Q operands); ``use_wht_butterfly`` is ignored at 256.
     """
     assert query_group_size in (8, 16), (
         f"query_group_size must be 8 or 16; got {query_group_size}"
     )
-    assert kv_block_size in (16, 32), (
-        f"kv_block_size must be 16 or 32; got {kv_block_size}"
+    # head_dim=256 hybrid models (Qwen3.6/3.8) force a larger mamba-aligned KV
+    # block; the tiled inner loop (_TILES_PER_BLOCK = kv_block_size // TILE_SIZE)
+    # handles any multiple of TILE_SIZE, so accept 16/32/64/128/256 like TQ v4.
+    assert kv_block_size in (16, 32, 64, 128, 256), (
+        f"kv_block_size must be 16/32/64/128/256; got {kv_block_size}"
     )
     assert kv_block_size % TILE_SIZE == 0
     assert int(tile_groups_per_partition) >= 1
@@ -162,14 +201,27 @@ def build_fp8_g32_decode_hd256_module(
     #             bf16-beating win; identical mechanism to tq_decode_hd256).
     # QK_FP8    : native fp8 QK MFMA (8× mfma_f32_16x16x32_fp8_fp8, one per
     #             UE8M0 group of 32 head-dims) + per-token post-MFMA scale fold.
+    # QK_SCALED : native scaled FP4xE4M3 MFMA. mfma_scale_f32_16x16x128_f8f6f4
+    #             contracts a fixed K=128, so a 256-wide head is covered by
+    #             MFMA_ISSUES=2 back-to-back issues chained through the f32x4
+    #             accumulator, each consuming a 128-dim slice (4 UE8M0 groups)
+    #             with the UE8M0 scale applied by the instruction. Replaces
+    #             qk_fp8's 8 issues + 32 post-MFMA scale FMAs (ported from the
+    #             GQA-6 sibling). q_hoist builds the loop-invariant Q operands.
     # V_CVT     : native cvt_scalef32_pk_bf16_fp4 V dequant (requires USE_HW_TR).
-    # qk_scaled is NOT ported to 256 (its single K=128 scaled MFMA + qperm are
-    # 128-specific); qk_fp8 delivers the native-fp8 QK win without qperm.
     USE_HW_TR = bool(use_hw_v_transpose)
     QK_FP8 = bool(qk_fp8)
     V_CVT = bool(v_cvt)
-    assert not bool(qk_scaled), (
-        "qk_scaled is not ported to HEAD_SIZE=256; use qk_fp8 instead"
+    QK_SCALED = bool(qk_scaled)
+    Q_HOIST = bool(q_hoist)
+    MFMA_SCALED_K = 128
+    MFMA_ISSUES = HEAD_SIZE // MFMA_SCALED_K          # 2 for HEAD_SIZE=256
+    GRPS_PER_ISSUE = MFMA_SCALED_K // FP8_GROUP_SIZE  # 4
+    assert not (QK_FP8 and QK_SCALED), (
+        "qk_fp8 and qk_scaled are mutually exclusive QK MFMA paths"
+    )
+    assert not (QK_SCALED and HEAD_SIZE % MFMA_SCALED_K != 0), (
+        f"qk_scaled needs HEAD_SIZE % {MFMA_SCALED_K} == 0; got {HEAD_SIZE}"
     )
     assert not (V_CVT and not USE_HW_TR), (
         "v_cvt requires use_hw_v_transpose at HEAD_SIZE=256"
@@ -178,6 +230,27 @@ def build_fp8_g32_decode_hd256_module(
     QG = int(query_group_size)
     QG_LOAD_ITERS = (QG * Q_GROUPS_PER_ROW) // WARP_SIZE   # 8 for QG=16, 4 for QG=8
     OOB_OFFSET = 0x7FFFFFF0
+
+    # --- Occupancy: optional multi-warp (HIOCC) --------------------------------
+    # num_warps=1 is the canonical single-wavefront path (bit-identical to the
+    # historical kernel). num_warps>1 launches BLOCK_THREADS = num_warps*64 and
+    # splits the partition's K-tile loop across warps with a cross-warp
+    # online-softmax reduction in LDS (raises waves/CU from ~3). The body guards
+    # every multi-warp-only code path on ``const_expr(_NUM_WARPS > 1)`` so the
+    # nw=1 emission is unchanged.
+    _NUM_WARPS = int(num_warps)
+    assert _NUM_WARPS in (1, 2, 4), f"num_warps must be 1/2/4; got {_NUM_WARPS}"
+    _BLOCK_THREADS = _NUM_WARPS * WARP_SIZE
+
+    # --- Occupancy: size the Q LDS to the ACTUAL query group -------------------
+    # The module-level Q_LDS_BYTES is sized for the QG=16 test default (8192 B),
+    # but STEP B only writes rows [0, QG) and STEP C/F only read those rows. For
+    # QG=8 the upper 4 KB is allocated-but-never-touched, so shrinking it to
+    # QG*HEAD_SIZE*2 is bitwise identical and frees LDS/workgroup (17 KB -> 13 KB
+    # at QG=8), lifting waves/CU (~3 -> ~5) since the kernel is LDS-occupancy
+    # bound. The launcher pads segm pools to QG=16 regardless, so this is purely
+    # an in-kernel LDS footprint reduction.
+    _Q_LDS_BYTES = QG * HEAD_SIZE * 2
 
     _BS = int(kv_block_size)
     _TILES_PER_BLOCK = _BS // TILE_SIZE
@@ -218,11 +291,11 @@ def build_fp8_g32_decode_hd256_module(
     centroid_off = 0
     allocator.ptr = CENTROID_LDS_BYTES
     q_off = allocator.ptr
-    allocator.ptr += Q_LDS_BYTES
+    allocator.ptr += _Q_LDS_BYTES
     kv_off = allocator.ptr
-    allocator.ptr += KV_TILE_LDS_BYTES
+    allocator.ptr += KV_TILE_LDS_BYTES_PADDED
     scale_off = allocator.ptr
-    if QK_FP8:
+    if QK_FP8 or QK_SCALED:
         allocator.ptr += SCALE_LDS_BYTES
 
     @flyc.kernel
@@ -241,7 +314,15 @@ def build_fp8_g32_decode_hd256_module(
         seq = gpu.block_idx.x
         kv_h = gpu.block_idx.y
         part = gpu.block_idx.z
-        lane = tid                                      # 0..63
+        # For nw=1, warp_id is a compile-time 0 and lane == tid (bit-identical
+        # to the historical single-warp kernel). For nw>1 each warp owns a
+        # disjoint slice of the K-tile loop and reduces across warps in LDS.
+        if const_expr(_NUM_WARPS > 1):
+            warp_id = tid >> fx.Int32(6)                # 0.._NUM_WARPS-1
+            lane = tid & fx.Int32(63)                   # 0..63 within warp
+        else:
+            warp_id = fx.Int32(0)
+            lane = tid                                  # 0..63
         mfma_row = lane & fx.Int32(15)
         mfma_col_grp = lane >> fx.Int32(4)              # 0..3, K-group dim
 
@@ -257,13 +338,19 @@ def build_fp8_g32_decode_hd256_module(
         # ---- LDS pointers -----------------------------------------------
         base = allocator.get_base()
         cent_lds = SmemPtr(base, centroid_off, T.f32, shape=(N_CENTROIDS,))
-        q_lds_i32 = SmemPtr(base, q_off, T.i32, shape=(Q_LDS_BYTES // 4,)).get()
-        q_lds_i64 = SmemPtr(base, q_off, T.i64, shape=(Q_LDS_BYTES // 8,)).get()
-        kv_lds_i64 = SmemPtr(base, kv_off, T.i64, shape=(KV_TILE_LDS_BYTES // 8,)).get()
-        kv_lds_i16 = SmemPtr(base, kv_off, T.i16, shape=(KV_TILE_LDS_BYTES // 2,)).get()
+        q_lds_i32 = SmemPtr(base, q_off, T.i32, shape=(_Q_LDS_BYTES // 4,)).get()
+        q_lds_i64 = SmemPtr(base, q_off, T.i64, shape=(_Q_LDS_BYTES // 8,)).get()
+        kv_lds_i32 = SmemPtr(base, kv_off, T.i32, shape=(KV_TILE_LDS_BYTES_PADDED // 4,)).get()
+        kv_lds_i64 = SmemPtr(base, kv_off, T.i64, shape=(KV_TILE_LDS_BYTES_PADDED // 8,)).get()
+        kv_lds_i16 = SmemPtr(base, kv_off, T.i16, shape=(KV_TILE_LDS_BYTES_PADDED // 2,)).get()
         if const_expr(QK_FP8):
             scale_lds = SmemPtr(
                 base, scale_off, T.f32, shape=(TILE_SIZE * N_GROUPS,)
+            )
+        if const_expr(QK_SCALED):
+            # qk_scaled stages raw UE8M0 bytes (0..255) for the scaleA word.
+            scale_lds_i32 = SmemPtr(
+                base, scale_off, T.i32, shape=(TILE_SIZE * N_GROUPS,)
             )
 
         # ---- Constants ---------------------------------------------------
@@ -288,7 +375,7 @@ def build_fp8_g32_decode_hd256_module(
         def _ival(v):
             return v.ir_value() if hasattr(v, 'ir_value') else v
 
-        if const_expr(QK_FP8):
+        if const_expr(QK_FP8 or QK_SCALED):
             c_zero_i32 = arith.constant(0, type=T.i32)
 
             def _f32x8_to_fp8_i64(f):
@@ -358,6 +445,36 @@ def build_fp8_g32_decode_hd256_module(
         if const_expr(QK_FP8):
             for chk in range_constexpr(QK_K_CHUNKS):
                 q_fp8_chunks.append(_bf16x8_to_fp8_i64(q_chunks[chk]))
+
+        # qk_scaled + Q_HOIST: build the loop-invariant scaled-MFMA Q operands
+        # once (one per MFMA issue). For issue h, lane t holds all 32 head-dims
+        # of group h*GRPS_PER_ISSUE + mfma_col_grp at query row mfma_row: 4
+        # sub-chunks of 8 bf16, each repacked to E4M3 i64, assembled to vec8 i32.
+        q_op_hoisted = []
+        if const_expr(QK_SCALED and Q_HOIST):
+            for h in range_constexpr(MFMA_ISSUES):
+                _q_hoist_words = []
+                for j in range_constexpr(4):
+                    _q_hoist_idx = (
+                        mfma_row * fx.Int32(HEAD_SIZE * 2 // 8)
+                        + (fx.Int32(h * GRPS_PER_ISSUE) + mfma_col_grp)
+                        * fx.Int32(8)
+                        + fx.Int32(j * 2)
+                    )
+                    _q_hoist_v = vector.load_op(
+                        T.vec(2, T.i64), q_lds_i64,
+                        [arith.index_cast(T.index, _q_hoist_idx)],
+                    )
+                    _q_hoist_words.append(
+                        _bf16x8_to_fp8_i64(
+                            vector.bitcast(T.vec(8, T.bf16), _q_hoist_v))
+                    )
+                q_op_hoisted.append(
+                    vector.bitcast(
+                        T.vec(8, T.i32),
+                        vector.from_elements(T.vec(4, T.i64), _q_hoist_words),
+                    )
+                )
 
         # ===== STEP D: Online softmax + PV state =========================
         running_max = NEG_INF
@@ -514,7 +631,7 @@ def build_fp8_g32_decode_hd256_module(
                                 cents.append(cent_lds.load([nibble_idx]))
                             k_i64 = _f32x8_to_fp8_i64(cents)
                             k_i64_idx = (
-                                tok_in_tile * fx.Int32(HEAD_SIZE // 8)
+                                tok_in_tile * fx.Int32(KFP8_ROW_I64)
                                 + chunk_in_tok * fx.Int32(8)
                                 + fx.Int32(hf * 4 + w)
                             )
@@ -531,6 +648,32 @@ def build_fp8_g32_decode_hd256_module(
                                 T.index,
                                 tok_in_tile * fx.Int32(N_GROUPS)
                                 + chunk_in_tok * fx.Int32(2) + fx.Int32(hf),
+                            )],
+                        )
+                elif const_expr(QK_SCALED):
+                    # qk_scaled: store raw FP4 codes (natural contiguous order,
+                    # 16 B = 32 nibbles per UE8M0 group) straight to KV LDS as
+                    # the scaled-MFMA A operand — no dequant here. ARCH_B's
+                    # SCALE_C cannot ride on the raw UE8M0 byte, so it is
+                    # applied once post-MFMA instead.
+                    for hf in range_constexpr(HALVES):
+                        k_packed = k_packed_list[hf]
+                        grp = chunk_in_tok * fx.Int32(2) + fx.Int32(hf)
+                        grp_shift = (grp & fx.Int32(3)) * fx.Int32(8)
+                        kscale_byte = (kscale_word >> grp_shift) & fx.Int32(0xFF)
+                        vector.store(
+                            k_packed, kv_lds_i32,
+                            [arith.index_cast(
+                                T.index,
+                                tok_in_tile * fx.Int32(KFP4_ROW_I32)
+                                + grp * fx.Int32(4),
+                            )],
+                        )
+                        scale_lds_i32.store(
+                            kscale_byte,
+                            [arith.index_cast(
+                                T.index,
+                                tok_in_tile * fx.Int32(N_GROUPS) + grp,
                             )],
                         )
                 else:
@@ -578,7 +721,7 @@ def build_fp8_g32_decode_hd256_module(
                     qk_acc = zero_v4
                     for chk in range_constexpr(QK_K_CHUNKS):
                         k_idx_i64 = (
-                            mfma_row * fx.Int32(HEAD_SIZE // 8)
+                            mfma_row * fx.Int32(KFP8_ROW_I64)
                             + fx.Int32(chk * 4)
                             + mfma_col_grp
                         )
@@ -605,6 +748,64 @@ def build_fp8_g32_decode_hd256_module(
                                 cur + pe * se, qk_acc,
                                 static_position=[elem], dynamic_position=[],
                             )
+                elif const_expr(QK_SCALED):
+                    # qk_scaled QK: MFMA_ISSUES native scaled MFMAs over K=128,
+                    # chained through the accumulator.
+                    #   A = K raw FP4 codes (vec4 i32 = 16 B) per (token, group)
+                    #   B = Q E4M3 (vec8 i32 = 32 B) for the same group
+                    #   scaleA = per-(token,group) UE8M0 byte at op_sel byte 0
+                    #   scaleB = 0x7F identity (Q carries no scale)
+                    BLGP_E2M1 = 4   # A operand type code = fp4 e2m1
+                    CBSZ_E4M3 = 0   # B operand type code = fp8 e4m3
+                    IDENT = fx.Int32(0x7F)
+                    qk_acc = zero_v4
+                    for h in range_constexpr(MFMA_ISSUES):
+                        grp = fx.Int32(h * GRPS_PER_ISSUE) + mfma_col_grp
+                        k_op = vector.load_op(
+                            T.vec(4, T.i32), kv_lds_i32,
+                            [arith.index_cast(
+                                T.index,
+                                mfma_row * fx.Int32(KFP4_ROW_I32)
+                                + grp * fx.Int32(4),
+                            )],
+                        )
+                        if const_expr(Q_HOIST):
+                            q_op = q_op_hoisted[h]
+                        else:
+                            q_fp8_words = []
+                            for j in range_constexpr(4):
+                                qv = vector.load_op(
+                                    T.vec(2, T.i64), q_lds_i64,
+                                    [arith.index_cast(
+                                        T.index,
+                                        mfma_row * fx.Int32(HEAD_SIZE * 2 // 8)
+                                        + grp * fx.Int32(8)
+                                        + fx.Int32(j * 2),
+                                    )],
+                                )
+                                q_fp8_words.append(
+                                    _bf16x8_to_fp8_i64(
+                                        vector.bitcast(T.vec(8, T.bf16), qv))
+                                )
+                            q_op = vector.bitcast(
+                                T.vec(8, T.i32),
+                                vector.from_elements(
+                                    T.vec(4, T.i64), q_fp8_words),
+                            )
+                        scbyte = fx.Int32(scale_lds_i32.load(
+                            [arith.index_cast(
+                                T.index,
+                                mfma_row * fx.Int32(N_GROUPS) + grp)]
+                        ))
+                        kscale = fx.Int32(0x7F7F7F00) | scbyte
+                        qk_acc = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                            T.vec(4, T.f32),
+                            [k_op, q_op, qk_acc,
+                             BLGP_E2M1, CBSZ_E4M3, 0, kscale, 0, IDENT],
+                        )
+                    if ARCH_B:
+                        qk_acc = _vsplat_mul(
+                            qk_acc, arith.constant(SCALE_C, type=T.f32))
                 else:
                     # ---- QK MFMA (CDNA4 wide-K): A=K[token, head_dim], B=Q ----
                     qk_acc = zero_v4
@@ -678,7 +879,7 @@ def build_fp8_g32_decode_hd256_module(
                     # written as ds_write_b128 (vec(2,i64)); read back via the
                     # ds_read_tr16_b64 HW transpose in the PV block below.
                     v_lds_elem_base = (
-                        tok_in_tile * fx.Int32(HEAD_SIZE)
+                        tok_in_tile * fx.Int32(KV_ROW_ELEMS)
                         + chunk_in_tok * fx.Int32(SUBCHUNK_HDIMS)
                     )
                     for hf in range_constexpr(HALVES):
@@ -774,7 +975,7 @@ def build_fp8_g32_decode_hd256_module(
                     hd_sub = (lane & fx.Int32(3)) * fx.Int32(4)
                     v_lane_byte = (
                         fx.Int32(kv_off)
-                        + token_idx * fx.Int32(HEAD_SIZE * 2)
+                        + token_idx * fx.Int32(KV_ROW_BYTES)
                         + hd_sub * fx.Int32(2)
                     )
                     for h in range_constexpr(PV_N_CHUNKS):

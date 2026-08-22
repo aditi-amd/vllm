@@ -585,6 +585,23 @@ class Qwen3_5ForCausalLMBase(
     def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list["MultiModalFeatureSpec"],
+    ) -> tuple[torch.Tensor, int]:
+        # Text-only Qwen3.5 checkpoints still carry an ``mrope_section`` in their
+        # rope config (inherited from the Qwen3-VL lineage), which marks the
+        # model M-RoPE-capable, but they never receive vision tokens. With no
+        # multimodal grid every one of the three M-RoPE sections advances
+        # sequentially, so positions collapse to standard 1-D RoPE: a
+        # ``[3, seq_len]`` arange with a zero position delta.
+        seq_len = len(input_tokens)
+        positions = (
+            torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(3, -1).clone()
+        )
+        return positions, 0
+
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
     pass
