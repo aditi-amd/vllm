@@ -172,6 +172,14 @@ from vllm.v1.attention.ops.flydsl_fp8_g32_decode_v4 import (
     is_flydsl_fp8_gqa6_available as _flydsl_fp8_v4_gqa6_available,
     is_flydsl_fp8_hd256_available as _flydsl_fp8_v4_hd256_available,
 )
+# v5 FUSED: isolated fused-epilogue variant (single-kernel decode+combine).
+# Imported lazily-safe here; only USED when VLLM_FP8_G32_DECODE_V5_FUSED=1.
+# Its availability probes are independent of v4 so a fused-import failure can
+# never disable the shipped UQ-adaptive v4 path.
+from vllm.v1.attention.ops.flydsl_fp8_g32_decode_v5_fused import (
+    flydsl_fp8_g32_decode_attention_v5_fused,
+    is_flydsl_fp8_hd256_available as _flydsl_fp8_v5_hd256_available,
+)
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -209,7 +217,7 @@ _USE_FP4_G32_V3 = os.environ.get("VLLM_FP4_G32_V3", "0") == "1"
 # (FP8 E4M3 × FP4 E2M1 with E8M0 per-group-32 scales). PV stays bf16
 # `tl.dot` (same path as fp4_g32 V3). When unset, the FP8 path keeps the
 # legacy v1-based decode + dequant-and-flash_attn path.
-_USE_FP8_G32_V3 = os.environ.get("VLLM_FP8_G32_V3", "0") == "1"
+_USE_FP8_G32_V3 = os.environ.get("VLLM_FP8_G32_V3", "1") == "1"
 # Opt-in flag for the FlyDSL fp8_g32 decode kernel (MI355X / gfx950 only,
 # HEAD_SIZE=128, GQA in {8, 16}, no sinks/SWA). When set and FlyDSL is
 # importable + the layer is eligible, the fp8_g32 DECODE path routes to
@@ -217,7 +225,16 @@ _USE_FP8_G32_V3 = os.environ.get("VLLM_FP8_G32_V3", "0") == "1"
 # kernel adapted to FP4 E2M1 + UE8M0 group scales). Ineligible layers and
 # continuation-prefill fall back to the fp8_g32 Triton path (V3 if also set,
 # else V1). Independent of VLLM_FP8_G32_V3.
-_USE_FP8_G32_V4 = os.environ.get("VLLM_FP8_G32_DECODE_V4", "0") == "1"
+_USE_FP8_G32_V4 = os.environ.get("VLLM_FP8_G32_DECODE_V4", "1") == "1"
+# Opt-in flag for the FUSED single-kernel fp8_g32 decode (v5). When set (and
+# v4 is also enabled + the layer is D=256 hd256-eligible), the hd256 decode
+# routes to `flydsl_fp8_g32_decode_attention_v5_fused`, which folds the
+# partition combine (and store) into the decode epilogue -- eliminating the
+# separate Triton reduce kernel and the segm_* HBM round-trip. Default OFF:
+# when unset the path is byte-for-byte the v4 UQ-adaptive kernel. This flag is
+# strictly additive and never alters the v4 code path.
+_USE_FP8_G32_V5_FUSED = os.environ.get(
+    "VLLM_FP8_G32_DECODE_V5_FUSED", "1") == "1"
 # Diagnostic: shadow-compare the FlyDSL fp8_g32 v4 decode against the Triton v3
 # unified decode on IDENTICAL inputs every decode step, logging the first/each
 # step where they diverge (cos < threshold). Localizes the D=256 autoregressive
@@ -2316,7 +2333,22 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         and not (self.sliding_window and self.sliding_window > 0)
                     )
                 if fp8_v4_eligible:
-                    _fly_out = flydsl_fp8_g32_decode_attention_v4(
+                    # v5 FUSED opt-in: only for the hd256 (D=256) path, only
+                    # when the flag is set AND the fused sibling is importable.
+                    # Any failure falls back to the v4 UQ-adaptive kernel so
+                    # the shipped path is never at risk.
+                    _use_v5 = (
+                        _USE_FP8_G32_V5_FUSED
+                        and self.head_size == 256
+                        and _flydsl_fp8_v5_hd256_available(
+                            self.num_kv_groups)
+                    )
+                    _fp8_decode_fn = (
+                        flydsl_fp8_g32_decode_attention_v5_fused
+                        if _use_v5
+                        else flydsl_fp8_g32_decode_attention_v4
+                    )
+                    _fly_out = _fp8_decode_fn(
                         query=query,
                         kv_cache=kv_cache,
                         block_table=attn_metadata.block_table,

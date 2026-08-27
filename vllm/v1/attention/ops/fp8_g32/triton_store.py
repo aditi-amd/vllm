@@ -68,6 +68,30 @@ from vllm.v1.attention.ops.fp8_g32.fp8_levels import (
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 
+# Triton only lets a @jit body reach a module global if it is a `constexpr`
+# instance, so the midpoint table is wrapped here and indexed via `.value`
+# inside the unrolled `static_range` (the index is a Python int at trace time,
+# so each comparison lowers to an immediate).
+_MIDPOINTS_C = tl.constexpr(tuple(float(m) for m in MIDPOINTS_SORTED))
+
+
+def _const_tables_enabled() -> bool:
+    """Materialise the FP4 tables as immediates (default on; set 0 to A/B).
+
+    Resolved once: the store runs per layer per decode step, so an `os.environ`
+    read here would land on the same hot path this file is trying to shorten.
+    """
+    global _CONST_TABLES
+    if _CONST_TABLES is None:
+        import os
+
+        _CONST_TABLES = os.environ.get(
+            "VLLM_FP8_G32_STORE_CONST_TABLES", "1") == "1"
+    return _CONST_TABLES
+
+
+_CONST_TABLES: bool | None = None
+
 
 # ── Cached per-device constant tensors ─────────────────────────────────────
 _MIDPOINTS_CACHE: dict[torch.device, torch.Tensor] = {}
@@ -153,6 +177,14 @@ def _fp8_g32_store_kernel(
     SOA_V_CODES_REGION: tl.constexpr = 0,
     SOA_V_SCALES_REGION: tl.constexpr = 0,
     KC_BYTES: tl.constexpr = 0,          # head_dim // 2 (K/V code bytes per token)
+    # When 1, the FP4 midpoints and the sorted->bits remap are materialised as
+    # immediates instead of being read from `Midpoints_ptr`/`SortedToBits_ptr`.
+    # That removes 28 scalar global loads and two 256-lane divergent gathers
+    # from the critical path of a kernel whose runtime is pure latency (flat at
+    # ~22 us from batch 1 to batch 64). Numerically identical: the immediates
+    # are the same fp32 values, and the remap formula is exact (asserted in
+    # `fp8_levels`, verified for all 15 entries).
+    CONST_TABLES: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
     token_idx = pid // H
@@ -249,12 +281,18 @@ def _fp8_g32_store_kernel(
     k_norm = k_g / k_s_div[:, None]
     k_sorted = tl.zeros([N_GROUPS_C, GROUP_SIZE_C], dtype=tl.int32)
     for i in tl.static_range(14):
-        mid = tl.load(Midpoints_ptr + i)
+        if CONST_TABLES:
+            mid = _MIDPOINTS_C.value[i]
+        else:
+            mid = tl.load(Midpoints_ptr + i)
         k_sorted += tl.where(k_norm > mid, 1, 0)
     k_sorted = tl.where(k_is_zero[:, None], 7, k_sorted)
 
     # 5. Remap sorted idx → FP4 E2M1 bit pattern.
-    k_bits = tl.load(SortedToBits_ptr + k_sorted)
+    if CONST_TABLES:
+        k_bits = tl.where(k_sorted < 7, 15 - k_sorted, k_sorted - 7)
+    else:
+        k_bits = tl.load(SortedToBits_ptr + k_sorted)
 
     # 6. Pack pairs of 4-bit codes into uint8 bytes.
     k_bits_flat = tl.reshape(k_bits, [HEAD_DIM])
@@ -296,11 +334,17 @@ def _fp8_g32_store_kernel(
     v_norm = v_g / v_s_div[:, None]
     v_sorted = tl.zeros([N_GROUPS_C, GROUP_SIZE_C], dtype=tl.int32)
     for i in tl.static_range(14):
-        mid = tl.load(Midpoints_ptr + i)
+        if CONST_TABLES:
+            mid = _MIDPOINTS_C.value[i]
+        else:
+            mid = tl.load(Midpoints_ptr + i)
         v_sorted += tl.where(v_norm > mid, 1, 0)
     v_sorted = tl.where(v_is_zero[:, None], 7, v_sorted)
 
-    v_bits = tl.load(SortedToBits_ptr + v_sorted)
+    if CONST_TABLES:
+        v_bits = tl.where(v_sorted < 7, 15 - v_sorted, v_sorted - 7)
+    else:
+        v_bits = tl.load(SortedToBits_ptr + v_sorted)
     v_bits_flat = tl.reshape(v_bits, [HEAD_DIM])
     v_pairs = tl.reshape(v_bits_flat, [HEAD_DIM // 2, 2])
     v_packed = tl.sum((v_pairs & 0xF) << shifts_4[None, :], axis=1).to(tl.uint8)
@@ -416,6 +460,7 @@ def fp8_g32_store(
         SOA_V_CODES_REGION=SOA_V_CODES_REGION,
         SOA_V_SCALES_REGION=SOA_V_SCALES_REGION,
         KC_BYTES=KC_BYTES,
+        CONST_TABLES=1 if _const_tables_enabled() else 0,
         num_warps=4,
         num_stages=1,
     )

@@ -36,12 +36,32 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+
+# -- env snapshot -------------------------------------------------------------
+# The launcher reads ~33 env vars on *every* decode call. At 23 attention layers
+# that is ~10 us/token of pure `os.environ` traffic (each lookup encodes the key
+# and walks os.environ's ABC `get`), against ~39 us of actual GPU work per call.
+# None of these can change after start-up, so every distinct (name, default) is
+# resolved once and served from a plain dict afterwards.
+_ENV_SNAPSHOT: dict[tuple[str, str | None], str | None] = {}
+
+
+def _env(name: str, default: str | None = None) -> str | None:
+    key = (name, default)
+    try:
+        return _ENV_SNAPSHOT[key]
+    except KeyError:
+        val = os.environ.get(name, default)
+        _ENV_SNAPSHOT[key] = val
+        return val
+
+
 # -- FlyDSL import bootstrap --------------------------------------------------
 # FlyDSL lives outside the vLLM package tree. Add both the source and the
 # built python_packages dir to sys.path lazily on first use, so import-time
 # failures don't break vLLM startup on non-MI355X hosts.
-_FLYDSL_ROOT = os.environ.get("VLLM_FLYDSL_ROOT", "/root/FlyDSL")
-_FLYDSL_PKGS = os.environ.get(
+_FLYDSL_ROOT = _env("VLLM_FLYDSL_ROOT", "/root/FlyDSL")
+_FLYDSL_PKGS = _env(
     "VLLM_FLYDSL_PKGS", "/root/FlyDSL/build-fly/python_packages"
 )
 
@@ -116,13 +136,16 @@ def is_flydsl_available() -> bool:
         # only flip the hd256 flag on success.
         global _FP8_MOD_HD256, _HD256_AVAILABLE
         try:
+            # v5 FUSED: isolated fused-epilogue sibling. Distinct module +
+            # distinct LDS symbol prefix so it never collides with the v4
+            # (UQ-adaptive) hd256 kernel. Default OFF via the backend gate.
             from vllm.v1.attention.ops.flydsl_kernels import (
-                fp8_g32_decode_hd256 as fp8_mod_hd256,
+                fp8_g32_decode_hd256_fused as fp8_mod_hd256,
             )
             _FP8_MOD_HD256 = fp8_mod_hd256
             _HD256_AVAILABLE = True
             logger.info_once(
-                "FlyDSL fp8_g32 decode hd256 sibling: available")
+                "FlyDSL fp8_g32 decode hd256 FUSED sibling: available")
         except Exception as ex_hd256:  # noqa: BLE001
             _HD256_AVAILABLE = False
             logger.warning_once(
@@ -259,7 +282,7 @@ def _qperm_index(device: torch.device, D: int = 128,
 
 
 def _detect_max_capture_B() -> int:
-    env = os.environ.get("VLLM_FP8_G32_DECODE_V4_B_BUCKET")
+    env = _env("VLLM_FP8_G32_DECODE_V4_B_BUCKET")
     if env is not None:
         try:
             return max(1, int(env))
@@ -382,7 +405,7 @@ def _hw_tr_enabled() -> bool:
     global _HW_TR_CACHED
     if _HW_TR_CACHED is not None:
         return _HW_TR_CACHED
-    env = os.environ.get("VLLM_FP8_G32_DECODE_V4_HW_TR")
+    env = _env("VLLM_FP8_G32_DECODE_V4_HW_TR")
     if env is not None:
         _HW_TR_CACHED = env == "1"
         return _HW_TR_CACHED
@@ -418,13 +441,17 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
                 v_cvt: bool = False,
                 q_hoist: bool = False,
                 head_size: int = 128,
-                num_warps: int = 1):
+                num_warps: int = 1,
+                stride_q_seq: int | None = None,
+                stride_q_head: int | None = None):
     key = (num_kv_heads, int(num_partitions), int(max_blocks_per_seq),
            round(float(scale), 8), int(query_group_size), int(kv_block_size),
            int(padded_slot), bool(use_hw_v_transpose),
            int(tile_groups_per_partition), bool(arch_b),
            round(float(scale_c), 8), bool(qk_fp8), bool(qk_scaled),
-           bool(v_cvt), bool(q_hoist), int(head_size), int(num_warps))
+           bool(v_cvt), bool(q_hoist), int(head_size), int(num_warps),
+           _env("VLLM_FP8_G32_DECODE_V5_STRIDED_TG", "1"),
+           stride_q_seq, stride_q_head)
     cached = _KERN_CACHE.get(key)
     if cached is not None:
         _GET_KERNEL_STATS["hits"] += 1
@@ -462,8 +489,17 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
             kmod = _FP8_MOD_HD256
             _hd256_build = kmod.build_fp8_g32_decode_hd256_module
             # Only the canonical GQA-{8,16} hd256 build accepts the occupancy
-            # (num_warps) knob; the gqa6 sibling does not.
-            _hd256_extra = {"num_warps": int(num_warps)}
+            # (num_warps) knob and the strided tile-group mapping; the gqa6
+            # sibling does not.
+            # strided_tg defaults ON: it beat the blocked mapping at every
+            # context (8k-262k) and batch (4-32) measured at the server's
+            # sizing, 1.2x-2.7x on the decode kernel, with no crossover.
+            # Set VLLM_FP8_G32_DECODE_V5_STRIDED_TG=0 to get the old mapping.
+            _hd256_extra = {
+                "num_warps": int(num_warps),
+                "strided_tg": _env(
+                    "VLLM_FP8_G32_DECODE_V5_STRIDED_TG", "1") == "1",
+            }
         kfn = _hd256_build(
             num_seqs=int(num_seqs_hint),
             num_kv_heads=num_kv_heads,
@@ -482,6 +518,8 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
             qk_scaled=bool(qk_scaled),
             v_cvt=bool(v_cvt),
             q_hoist=bool(q_hoist),
+            stride_q_seq=stride_q_seq,
+            stride_q_head=stride_q_head,
             **_hd256_extra,
         )
     elif int(query_group_size) == 6:
@@ -595,11 +633,20 @@ def _reduce_partitions_v4(
     QG: tl.constexpr,
     NUM_PARTS: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     n = tl.program_id(0)
     hq = tl.program_id(1)
     kv_h = hq // QG
     qg = hq % QG
+    # Splitting the head-dim across programs is what gives this kernel enough
+    # parallelism to use the GPU: the reduction runs over PARTITIONS, so every
+    # head-dim column is independent. A (B, Hq) grid is only 32 workgroups at
+    # B=4 -- ~12% of a 256-CU part -- which is why it moved 8.4 MB at just
+    # ~995 GB/s. The partition reduction itself is untouched (same values, same
+    # order), so the result is bit-identical; only the columns each program
+    # owns change. The [P] max/sum vectors get re-read per D-block, which is
+    # 4 KB of duplicated traffic against a 262 KB tile.
 
     msum_base = (
         n * (NUM_KV_HEADS * NUM_PARTS * QG)
@@ -613,7 +660,7 @@ def _reduce_partitions_v4(
     )
 
     p_off = tl.arange(0, NUM_PARTS)
-    d_off = tl.arange(0, HEAD_SIZE)
+    d_off = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
 
     m_idx = msum_base + p_off * QG
     seg_max = tl.load(segm_max_ptr + m_idx)
@@ -696,10 +743,19 @@ def _fused_q_rot_haircut_v4(
              mask=m_mask[:, None])
 
 
-# Opt-in until the accuracy ladder (offline parity -> autoregressive drift ->
-# paired GSM8K) clears it. Default OFF keeps the shipped path bit-unchanged.
-_FUSE_Q_ROT = os.environ.get(
-    "VLLM_FP8_G32_DECODE_V4_FUSE_Q_ROT", "1") == "1"
+# Prologue Q-rotation fusion (fallback for non-hd256 / in-kernel-WHT-off paths).
+# Cleared the accuracy ladder (offline parity -> autoregressive drift -> paired
+# GSM8K); pinned ON as part of the validated v7 config.
+_FUSE_Q_ROT = True
+
+# Stronger form: do the rotation INSIDE the decode kernel as a Walsh-Hadamard
+# butterfly and drop the prologue dispatch entirely. The prologue is ~7us at
+# B=4 and that is almost all fixed per-dispatch cost (sweeping its grid 4x moves
+# it 0%), so deleting the launch -- not optimizing it -- is the win.
+# Pinned ON: verified bit-exact (torch.equal) against the prologue path across
+# B={1,2,3,4,8,16} x seq={4k,8k,16k,32k,50021,75k}, including non-power-of-2
+# batch and seq.
+_FUSE_QROT_INKERNEL = True
 
 
 def _run_fused_q_rot(query, PiT_used, out, B, Hq, D, haircut):
@@ -707,7 +763,7 @@ def _run_fused_q_rot(query, PiT_used, out, B, Hq, D, haircut):
     M = B * Hq
     BLOCK_M = 16
     BLOCK_K = 32
-    BLOCK_D = int(os.environ.get("VLLM_FP8_G32_DECODE_V4_FUSE_BLOCK_D", "64"))
+    BLOCK_D = 64
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D, BLOCK_D))
     _fused_q_rot_haircut_v4[grid](
         query, PiT_used, out, M,
@@ -718,7 +774,7 @@ def _run_fused_q_rot(query, PiT_used, out, B, Hq, D, haircut):
 
 
 # -- Public launcher ----------------------------------------------------------
-def flydsl_fp8_g32_decode_attention_v4(
+def flydsl_fp8_g32_decode_attention_v5_fused(
     query: torch.Tensor,            # [B, Hq, D] bf16/fp16 (raw, unrotated)
     kv_cache: torch.Tensor,         # [num_blocks, BS, Hk, padded_slot] uint8
     block_table: torch.Tensor,      # [B, max_blocks_per_seq] int32
@@ -830,7 +886,7 @@ def flydsl_fp8_g32_decode_attention_v4(
     worst_case_max_seq_len = int(block_table.shape[1]) * int(block_size)
     if max_seq_len <= 0:
         max_seq_len = worst_case_max_seq_len
-    if os.environ.get("VLLM_FP8_G32_DECODE_V4_DYNAMIC_PARTS", "0") == "1":
+    if _env("VLLM_FP8_G32_DECODE_V4_DYNAMIC_PARTS", "0") == "1":
         sizing_max_seq_len = int(max_seq_len)
     else:
         sizing_max_seq_len = worst_case_max_seq_len
@@ -862,15 +918,15 @@ def flydsl_fp8_g32_decode_attention_v4(
     # "global 'allocator' changed since first compile" drift crash.
     # Explicitly setting the env var forces a fixed cap (disables adaptivity) for
     # A/B testing; unset uses the adaptive policy.
-    _env_cap = os.environ.get("VLLM_FP8_G32_DECODE_V4_MAX_PARTITIONS")
+    _env_cap = _env("VLLM_FP8_G32_DECODE_V4_MAX_PARTITIONS")
     if _env_cap is not None:
         MAX_PARTITIONS = max(2, int(_env_cap))
     else:
-        _lowb_cap = int(os.environ.get(
+        _lowb_cap = int(_env(
             "VLLM_FP8_G32_DECODE_V4_LOWB_CAP", "512"))
-        _hib_cap = int(os.environ.get(
+        _hib_cap = int(_env(
             "VLLM_FP8_G32_DECODE_V4_HIB_CAP", "256"))
-        _b_thr = int(os.environ.get(
+        _b_thr = int(_env(
             "VLLM_FP8_G32_DECODE_V4_LOWB_THRESHOLD", "8"))
         MAX_PARTITIONS = _lowb_cap if int(B) <= _b_thr else _hib_cap
         MAX_PARTITIONS = max(2, MAX_PARTITIONS)
@@ -881,6 +937,21 @@ def flydsl_fp8_g32_decode_attention_v4(
         parallelism_floor,
         min(MAX_PARTITIONS, required_num_partitions),
     )
+    # Cap partitions by how much work there actually IS to split. Nothing above
+    # forces a partition to hold a useful number of tokens -- max_num_kv_splits
+    # sets a parallelism FLOOR -- so a short context gets split into partitions
+    # of a handful of tokens each, where every partition is almost entirely
+    # fixed cost (and each one still writes a full QG x D partial for the
+    # reduce to read back). Measured sweet spot is ~130-147 tokens/partition,
+    # roughly flat in between; next_power_of_2 below rounds this target up, so
+    # the effective range lands at ~96-192 tokens. At B=4 this is worth 27.9 ->
+    # 24.4 us at seq=2048 and 27.0 -> 24.8 us at seq=16384, and is inert once
+    # the context is long enough to want every partition (seq >= ~64k).
+    _tok_per_part = 192
+    if _tok_per_part > 0:
+        _useful_parts = max(
+            1, (int(sizing_max_seq_len) + _tok_per_part - 1) // _tok_per_part)
+        num_partitions_actual = min(num_partitions_actual, _useful_parts)
     num_partitions = max(2, triton.next_power_of_2(num_partitions_actual))
     _tgpp_required = max(
         1,
@@ -901,64 +972,29 @@ def flydsl_fp8_g32_decode_attention_v4(
         output = output_buf[:B] if output_buf.shape[0] != B else output_buf
 
     # ---- QK MFMA path selection ------------------------------------------
-    # Default ON: native CDNA4 scaled FP4xFP8 MFMA QK path (gfx950). Set
-    # VLLM_FP8_G32_DECODE_V4_QK_SCALED=0 to fall back to the bf16 MFMA path.
-    qk_fp8 = os.environ.get("VLLM_FP8_G32_DECODE_V4_QK_FP8", "0") == "1"
-    qk_scaled = os.environ.get("VLLM_FP8_G32_DECODE_V4_QK_SCALED", "1") == "1"
-    assert not (qk_fp8 and qk_scaled), (
-        "VLLM_FP8_G32_DECODE_V4_QK_FP8 and _QK_SCALED are mutually exclusive"
-    )
+    # Pinned to the native CDNA4 scaled FP4xFP8 MFMA QK path (gfx950): it
+    # matches Triton v3 dot_scaled exactly and does not compound error over
+    # long autoregressive generations (the bf16-QK/qk_fp8 fallbacks do).
+    qk_fp8 = False
+    qk_scaled = True
     if D == 256:
-        # hd256 ports the HW V-transpose + native V CVT fast paths (the primary
-        # bf16-parity win, shared with TQ44v4) as the DEFAULT, plus qk_scaled
-        # (2 chained K=128 scaled MFMA issues, qperm applied per 128-dim slice),
-        # which inherits the ON default above. qk_scaled has the same sign-off
-        # qk_fp8 has: offline parity cos 1.000000, GSM8K 0.9704 vs 0.9727 and
-        # LCB-128K 66.30% vs 67.39% (both within noise), and it cuts decode
-        # kernel time 322.98 -> 214.70 us/call with VGPR 112 -> 92. Set
-        # VLLM_FP8_G32_DECODE_V4_QK_SCALED=0 to fall back to qk_fp8, which then
-        # becomes the default per the expression below.
-        #
-        # The native fp8 QK MFMA (qk_fp8) is bit-exact in eager (cos>=0.99999)
-        # but exhibits a cudagraph-specific accuracy regression, so it is not
-        # the first choice; reach for it via _QK_SCALED=0, or force it with
-        # VLLM_FP8_G32_DECODE_V4_QK_FP8=1 (which also needs _QK_SCALED=0).
-        #
-        # Fallback for qk_fp8: the native fp8xfp8 scaled QK MFMA. This matches
-        # the proven-correct Triton v3 decode EXACTLY (cos 1.0 offline vs cos
-        # 0.996 for the bf16-QK-dequant path). The bf16-QK path — despite
-        # correct indexing and equal single-step cos-vs-bf16 — has an error
-        # profile (full bf16 Q + bf16-rounded cent*scale K) that compounds over
-        # long autoregressive generations (GSM8K 0.48 vs 0.97). The fp8 path
-        # (exact FP4 codes + per-group UE8M0 scale folded post-MFMA, E4M3 Q)
-        # mirrors Triton's dot_scaled and does not compound. Override with
-        # VLLM_FP8_G32_DECODE_V4_QK_FP8=0 to restore the (buggy) bf16-QK path.
-        qk_fp8 = os.environ.get(
-            "VLLM_FP8_G32_DECODE_V4_QK_FP8", "0" if qk_scaled else "1"
-        ) == "1"
-        assert not (qk_fp8 and qk_scaled), (
-            "VLLM_FP8_G32_DECODE_V4_QK_FP8 and _QK_SCALED are mutually "
-            "exclusive; unset one of them"
-        )
+        # hd256 uses HW V-transpose + native V CVT plus the scaled FP4xFP8 QK
+        # MFMA (2 chained K=128 issues, qperm per 128-dim slice). Signed off at
+        # offline parity cos 1.000000, GSM8K 0.9704 vs 0.9727 and LCB-128K
+        # 66.30% vs 67.39% (both within noise), cutting decode kernel time
+        # 322.98 -> 214.70 us/call with VGPR 112 -> 92. It mirrors Triton v3
+        # dot_scaled exactly and, unlike the bf16-QK path, does not compound
+        # error over long autoregressive generations (GSM8K 0.48 vs 0.97).
+        qk_fp8 = False
     # ---- V dequant path selection ----------------------------------------
-    # Default ON: native CDNA4 scaled FP4->bf16 CVT for V dequant (gfx950);
-    # requires the HW V-transpose LDS layout. Set
-    # VLLM_FP8_G32_DECODE_V4_V_CVT=0 to fall back to the software LUT path.
-    v_cvt = os.environ.get("VLLM_FP8_G32_DECODE_V4_V_CVT", "1") == "1"
-    # Default ON: hoist the loop-invariant scaled-MFMA Q operand out of the
-    # K-tile loop (build fp8 Q once in STEP C, reuse). No-op unless qk_scaled.
-    # Set VLLM_FP8_G32_DECODE_V4_Q_HOIST=0 to disable.
-    q_hoist = os.environ.get("VLLM_FP8_G32_DECODE_V4_Q_HOIST", "1") == "1"
-    # Occupancy knob (HIOCC): number of wavefronts per workgroup for the
-    # hd256 GQA-{8,16} decode kernel. Default 1 = canonical single-warp path
-    # (bit-identical). 2/4 split the K-tile loop across warps with a cross-warp
-    # online-softmax reduction to raise waves/CU. Only affects head_size=256.
-    try:
-        num_warps = int(os.environ.get("VLLM_FP8_G32_DECODE_V4_NUM_WARPS", "1"))
-    except ValueError:
-        num_warps = 1
-    if num_warps not in (1, 2, 4):
-        num_warps = 1
+    # Pinned ON: native CDNA4 scaled FP4->bf16 CVT for V dequant (gfx950),
+    # using the HW V-transpose LDS layout (the primary bf16-parity win).
+    v_cvt = True
+    # Pinned ON: hoist the loop-invariant scaled-MFMA Q operand out of the
+    # K-tile loop (build fp8 Q once in STEP C, reuse).
+    q_hoist = True
+    # Canonical single-warp hd256 GQA-{8,16} decode path (bit-identical).
+    num_warps = 1
 
     # ---- Q rotation + FP8 E4M3 haircut -----------------------------------
     # q_rot = query.float() @ PiT  -> cast to FP8 E4M3 (precision haircut the
@@ -993,8 +1029,23 @@ def flydsl_fp8_g32_decode_attention_v4(
     # autoregressive generations (short GSM8K answers fine, long ones collapse).
     # TQ44v4 (bf16 Q, no haircut) and the Triton v3 fp8_g32 path both avoid it.
     _haircut = bool(qk_fp8 or qk_scaled)
+    # In-kernel WHT: no prologue at all. The decode kernel bakes in
+    # stride_q_seq = Hq*D / stride_q_head = D (the pooled q_rot layout), so the
+    # raw query must already be laid out that way; otherwise fall through to a
+    # prologue that materializes it.
+    # The row stride is NOT required to be Hq*D: in a real server `query` is a
+    # split of the fused QKV projection, so its row stride is (Hq + 2*Hk)*D.
+    # Both strides are baked into the kernel build (and its cache key) instead
+    # of being assumed, so any 3-D layout with a contiguous head-dim works.
+    _inkernel_qrot = (
+        _FUSE_QROT_INKERNEL and _haircut and int(D) == 256 and QG % 8 == 0
+        and query.dim() == 3 and query.stride(2) == 1
+        and query.stride(1) == int(D)
+    )
+    if _inkernel_qrot:
+        q_for_kernel = query
     # The fused kernel indexes the head-dim contiguously; fall back if not.
-    if _FUSE_Q_ROT and query.stride(-1) == 1:
+    elif _FUSE_Q_ROT and query.stride(-1) == 1:
         # One kernel for the whole prologue instead of four ops. It differs from
         # the torch path only in the GEMM reduction order (tl.dot vs rocBLAS).
         # Measured: with the E4M3 haircut ON (every fp8-consuming QK path, i.e.
@@ -1016,7 +1067,8 @@ def flydsl_fp8_g32_decode_attention_v4(
             _q_rot_out.copy_(_q_fp8)       # e4m3 -> bf16 (exact: e4m3 ⊂ bf16)
         else:
             _q_rot_out.copy_(_q_rot_f32)   # fp32 -> bf16 (bf16 QK MFMA)
-    q_for_kernel = _q_rot_out
+    if not _inkernel_qrot:
+        q_for_kernel = _q_rot_out
 
     # ---- FlyDSL kernel launch --------------------------------------------
     max_bps = int(block_table.shape[1])
@@ -1034,6 +1086,8 @@ def flydsl_fp8_g32_decode_attention_v4(
         q_hoist=q_hoist,
         head_size=int(D),
         num_warps=num_warps,
+        stride_q_seq=int(q_for_kernel.stride(0)),
+        stride_q_head=int(q_for_kernel.stride(1)),
     )
     global _LOG_INVOKED_ONCE, _LOG_SINKS_WARNED
     if not _LOG_INVOKED_ONCE:
@@ -1059,7 +1113,10 @@ def flydsl_fp8_g32_decode_attention_v4(
     )
 
     # ---- Reduce partitions -> [B, Hq, D] ---------------------------------
-    _reduce_partitions_v4[(B, Hq)](
+    # 64 splits the head-dim 4 ways, taking the grid from 32 to 128 workgroups.
+    # Bit-identical by construction (the partition reduction is per-column).
+    _red_block_d = min(int(D), 64)
+    _reduce_partitions_v4[(B, Hq, triton.cdiv(int(D), _red_block_d))](
         output_ptr=output,
         segm_out_ptr=segm_out,
         segm_max_ptr=segm_max,
@@ -1070,6 +1127,7 @@ def flydsl_fp8_g32_decode_attention_v4(
         QG=QG,
         NUM_PARTS=num_partitions,
         HEAD_SIZE=D,
+        BLOCK_D=_red_block_d,
     )
     if sinks is not None and not _LOG_SINKS_WARNED:
         _LOG_SINKS_WARNED = True

@@ -262,7 +262,6 @@ def build_fp8_g32_decode_hd256_module(
         f"padded_slot={_PADDED_SLOT} must be 4-byte aligned"
     )
 
-    global allocator
     arch = get_hip_arch()
 
     if softmax_scale is None:
@@ -287,7 +286,23 @@ def build_fp8_g32_decode_hd256_module(
     _stride_ml_seq = _stride_es_seq
 
     # --- LDS layout ---
-    allocator = SmemAllocator(None, arch=arch, global_sym_name="fp8_g32_hd256_smem")
+    # `allocator` is intentionally a BUILD-LOCAL captured by the kernel closure
+    # (a freevar), NOT a module global. The @flyc.jit drift guard
+    # (_check_globals_drift) snapshots every module global referenced by the JIT
+    # launcher's dependency tree (which includes this kernel) and ABORTS if one
+    # changes between compiles. When more than one partition variant is
+    # JIT-resident at once (e.g. a ragged/adaptive batch mixes num_partitions
+    # 256 and 512, or fixed cap=512 yields 294@75k and 512@131k), each build
+    # created a fresh SmemAllocator; as a reassigned MODULE GLOBAL that tripped
+    # "global 'allocator' changed since first compile" and crashed the worker.
+    # Keeping it local + a per-variant symbol name lets the variants coexist.
+    # The build-local is handed to the launcher via a module attribute set AFTER
+    # the kernel is built (see end of function); that assignment is safe because
+    # no @flyc.jit function references the module global anymore.
+    allocator = SmemAllocator(
+        None, arch=arch,
+        global_sym_name=f"fp8_g32_hd256_smem_p{int(num_partitions)}_w{int(num_warps)}",
+    )
     centroid_off = 0
     allocator.ptr = CENTROID_LDS_BYTES
     q_off = allocator.ptr
@@ -1061,4 +1076,11 @@ def build_fp8_g32_decode_hd256_module(
             buffer_ops.buffer_store(running_sum, es_rsrc, es_off)
             _scf.YieldOp([])
 
+    # Hand the build-local allocator to the launcher. `_get_kernel` reads
+    # `kmod.allocator` immediately after this returns (before the next build can
+    # run), so each launcher captures its own variant's allocator. This does NOT
+    # reintroduce the drift bug: the kernel above closes over the LOCAL
+    # `allocator`, so no @flyc.jit function references module-global `allocator`
+    # and it is never snapshotted by _check_globals_drift.
+    globals()["allocator"] = allocator
     return fp8_g32_decode_hd256_kernel
