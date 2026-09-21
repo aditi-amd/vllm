@@ -389,6 +389,7 @@ class AiterFlashAttentionMetadata:
     seq_lens: torch.Tensor
     slot_mapping: torch.Tensor
     block_table: torch.Tensor
+    causal: bool
 
     # prefill and decode split
     num_decodes: int
@@ -677,6 +678,7 @@ class AiterFlashAttentionMetadataBuilder(
             seq_lens=common_attn_metadata.seq_lens,
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            causal=common_attn_metadata.causal,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
@@ -725,6 +727,7 @@ class AiterFlashAttentionMetadataBuilder(
             seq_lens=common_attn_metadata.seq_lens,
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            causal=common_attn_metadata.causal,
             num_decodes=num_reqs,
             num_decode_tokens=num_tokens,
             num_prefills=0,
@@ -807,6 +810,10 @@ class AiterFlashAttentionBackend(AttentionBackend):
         # which is known to be buggy on rocm systems. on_mi3xx uses amd-smi which is
         # more reliable.
         return on_mi3xx()
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        return True
 
 
 class AiterFlashAttentionImpl(AttentionImpl):
@@ -1122,7 +1129,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     min_seqlen_q=1,
                     dropout_p=0.0,
                     softmax_scale=self.scale,
-                    causal=True,
+                    causal=attn_metadata.causal,
                     window_size=self.sliding_window,
                     alibi_slopes=self.alibi_slopes,
                     out=output_actual_tokens[num_decode_tokens + num_extend_tokens :],
@@ -1176,6 +1183,44 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         "Shuffle KV cache layout is not supported with "
                         "speculative decoding (multi-token decode)."
                     )
+                    if not attn_metadata.causal:
+                        # Bidirectional block draft (DFlash). unified_attention
+                        # only emits a causal mask, so route to the mha_v3
+                        # paged kernel, which takes the flag.
+                        from aiter.ops.triton.attention.mha_v3 import (
+                            flash_attn_with_kvcache,
+                        )
+
+                        descale_shape = (num_decodes, key_cache.shape[2])
+                        decode_query = query[:num_decode_tokens].reshape(
+                            num_decodes,
+                            decode_max_query_len,
+                            query.shape[1],
+                            query.shape[2],
+                        )
+                        decode_out = flash_attn_with_kvcache(
+                            q=decode_query,
+                            k_cache=key_cache,
+                            v_cache=value_cache,
+                            cache_seqlens=attn_metadata.seq_lens[:num_decodes],
+                            softmax_scale=self.scale,
+                            causal=attn_metadata.causal,
+                            window_size=self.sliding_window,
+                            softcap=self.logits_soft_cap,
+                            q_descale=None,
+                            k_descale=layer._k_scale.expand(descale_shape),
+                            v_descale=layer._v_scale.expand(descale_shape),
+                            page_table=attn_metadata.block_table[:num_decodes],
+                        )
+                        output[:num_decode_tokens].copy_(
+                            decode_out.reshape(
+                                num_decode_tokens,
+                                query.shape[1],
+                                query.shape[2],
+                            )
+                        )
+                        return
+
                     from aiter.ops.triton.unified_attention import (
                         unified_attention,
                     )
