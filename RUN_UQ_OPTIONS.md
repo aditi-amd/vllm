@@ -23,7 +23,7 @@ required to get it. The following in-tree defaults were flipped so that a plain
 | --- | --- | --- | --- |
 | `VLLM_FP8_G32_V3` | 0 | **1** | Triton fp8_g32 path (QK/PV via `tl.dot`) for fallback/prefill |
 | `VLLM_FP8_G32_DECODE_V4` | 0 | **1** | FlyDSL fp8_g32 v4 decode kernel (bug-free TQ v4 port) |
-| `VLLM_FP8_G32_DECODE_V5_FUSED` | 0 | **1** | Fused single-kernel decode: folds partition-combine into the epilogue (no separate reduce kernel / segm HBM round-trip) |
+| `VLLM_FP8_G32_DECODE_V5_FUSED` | 0 | **1** | Optimized D=256 module with strided tile-group scheduling and in-kernel Q rotation; split-K partials are still merged by the launcher’s Triton reducer |
 | `VLLM_FP8_G32_DECODE_V4_FUSE_Q_ROT` | 0 | **1** | Q rotation done in-kernel (Walsh–Hadamard butterfly); drops the separate q_rot dispatch |
 | `VLLM_FP8_G32_DECODE_V5_FUSE_QROT` | 0 | **1** | In-kernel Q-rot for the fused v5 path (requires qk_scaled, QG%8==0, hd256) |
 
@@ -35,9 +35,10 @@ Already at the v7 value before this change (unchanged):
 | `VLLM_FP8_G32_DECODE_V5_STRIDED_TG` | 1 | strided tile-group→partition mapping (hides HBM latency at server-sized worst-case grid) |
 | `VLLM_FP8_G32_DECODE_V4_MAX_PARTITIONS` | (unset) | unset → batch-adaptive cap (512 @ batch≤8, 256 above) |
 
-Inert in-repo (read by the external FlyDSL runtime, not by `vllm/`; set by the
-benchmark arm only for reproducibility): `VLLM_FP8_G32_DECODE_V5_REDUCE_BLOCK_D`,
-`VLLM_FP8_G32_DECODE_V5_TOK_PER_PART`, `FLYDSL_RUNTIME_ENABLE_CACHE`.
+Historical benchmark-only settings
+`VLLM_FP8_G32_DECODE_V5_REDUCE_BLOCK_D` and
+`VLLM_FP8_G32_DECODE_V5_TOK_PER_PART` are not runtime knobs in this tree; the
+launcher pins those values to 64 and 192 respectively.
 
 ### Opting out / pinning
 

@@ -322,8 +322,22 @@ class MultiTurnBenchmark:
             pbar = tqdm(total=total_requests, desc="Requests")
             start_time = time.perf_counter()
 
+            base_url = self.url.replace("/v1/chat/completions", "")
+            prof_start = (
+                self.args.profile_start_round
+                if getattr(self.args, "profile_start_round", None) is not None
+                else max(0, self.args.num_rounds - 2)
+            )
+
             for round_num in range(self.args.num_rounds):
                 self.round_metrics[round_num] = RoundMetrics()
+
+                # Start the profiler at the first warm round; earlier rounds
+                # (which fill the prefix cache) are deliberately excluded so the
+                # trace captures the warm-cache re-prefill dequant path only.
+                if getattr(self.args, "profile", False) and round_num == prof_start:
+                    print(f"\n[profile] starting capture at round {round_num}")
+                    await _toggle_profile(session, base_url, True)
 
                 # Send all requests for this round
                 results = await run_round(
@@ -378,6 +392,10 @@ class MultiTurnBenchmark:
                     f"Cache Hit Rate={metrics.cache_hit_rate:.2%}, "
                     f"Cached={sum(metrics.cached_tokens)}/{sum(metrics.prompt_tokens)} tokens"
                 )
+
+            if getattr(self.args, "profile", False):
+                print("\n[profile] stopping capture (flush may take minutes)...")
+                await _toggle_profile(session, base_url, False)
 
             pbar.close()
             total_time = time.perf_counter() - start_time
@@ -536,6 +554,25 @@ async def check_server(url: str) -> bool:
         return False
 
 
+async def _toggle_profile(
+    session: aiohttp.ClientSession, base_url: str, start: bool
+) -> bool:
+    """POST /start_profile or /stop_profile to a vLLM server launched with
+    --profiler-config. stop_profile blocks while the trace flushes, so a long
+    timeout is used."""
+    endpoint = "/start_profile" if start else "/stop_profile"
+    try:
+        async with session.post(
+            base_url + endpoint,
+            timeout=aiohttp.ClientTimeout(total=1800),
+        ) as resp:
+            print(f"[profile] {'START' if start else 'STOP'} {endpoint} -> HTTP {resp.status}")
+            return resp.status == 200
+    except Exception as e:  # noqa: BLE001
+        print(f"[profile] {endpoint} failed: {e}")
+        return False
+
+
 async def main():
     parser = argparse.ArgumentParser(
         description="Enhanced Multi-Turn Benchmark for KV Cache Compression"
@@ -600,6 +637,24 @@ async def main():
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
+
+    # Profiling: bracket the vLLM torch profiler around warm rounds only.
+    # The server must be launched with --profiler-config '{"profiler":"torch",...}'.
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Bracket the server-side torch profiler via /start_profile and "
+        "/stop_profile. Earlier rounds run as warmup (cache fill) and are "
+        "excluded from the trace.",
+    )
+    parser.add_argument(
+        "--profile-start-round",
+        type=int,
+        default=None,
+        help="Round index at which to start profiling (0-based). Rounds before "
+        "this are warmup and NOT profiled. Default: last 2 rounds "
+        "(max(0, num_rounds - 2)).",
     )
 
     args = parser.parse_args()

@@ -26,7 +26,6 @@ from vllm.v1.attention.ops.fp8_g32.fp8_levels import (
 from vllm.v1.attention.ops.fp8_g32.reference import fp8_g32_encode
 from vllm.v1.attention.ops.fp8_g32.triton_store import fp8_g32_store
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA/HIP device"
 )
@@ -91,7 +90,7 @@ def _read_codes_and_scales(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("num_tokens", [1, 16, 17])
 def test_store_matches_reference(dtype, head_dim, num_kv_heads, num_tokens):

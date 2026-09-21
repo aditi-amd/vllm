@@ -248,3 +248,10 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 
 # ROCm rocprofv3 scratch (local profiling cache; can be hundreds of MB)
 .rocprofv3/
+
+# UQ/TQ benchmark + test artifacts (regenerable, multi-GB)
+benchmarks/multi_turn_tq/logs/
+benchmarks/multi_turn_tq/results/
+benchmarks/multi_turn_tq/traces/
+benchmarks/multi_turn/pg1184.txt
+tests/kernels/turboquant_v4/omni_out/

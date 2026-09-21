@@ -7,7 +7,9 @@ import logging
 import multiprocessing as mp
 import os
 import random
+import threading
 import time
+import urllib.request
 from collections import Counter, deque
 from datetime import datetime
 from enum import Enum
@@ -1268,6 +1270,52 @@ async def get_server_info(url: str) -> None:
                 logger.info(f"{Color.RED}Failed to get models{Color.RESET}")
 
 
+def _post_profile(base_url: str, endpoint: str) -> None:
+    """Blocking POST to /start_profile or /stop_profile (no body needed)."""
+    url = base_url.rstrip("/") + endpoint
+    req = urllib.request.Request(url, data=b"", method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=1800) as resp:
+            logger.info(
+                "%s[profile] %s -> HTTP %d%s",
+                Color.PURPLE,
+                endpoint,
+                resp.status,
+                Color.RESET,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[profile] %s failed: %s", endpoint, e)
+
+
+def _timed_profile_thread(
+    base_url: str, delay_sec: float, duration_sec: float
+) -> threading.Thread:
+    """Background thread that brackets a fixed-duration torch-profiler window.
+
+    main_mp() blocks the event loop on a synchronous queue.get(), so the
+    profiler toggle cannot be an asyncio task; it runs in its own OS thread.
+    Waits `delay_sec` (to reach steady state), starts the profile, waits
+    `duration_sec`, then stops it (which triggers the trace dump on the server).
+    """
+
+    def _run() -> None:
+        logger.info(
+            "%s[profile] armed: start in %.1fs, capture %.1fs%s",
+            Color.PURPLE,
+            delay_sec,
+            duration_sec,
+            Color.RESET,
+        )
+        time.sleep(delay_sec)
+        _post_profile(base_url, "/start_profile")
+        time.sleep(duration_sec)
+        _post_profile(base_url, "/stop_profile")
+
+    t = threading.Thread(target=_run, name="timed_profile", daemon=True)
+    t.start()
+    return t
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(
         prog="Benchmark serving with multi-turn conversations",
@@ -1296,6 +1344,28 @@ async def main() -> None:
         type=int,
         default=0,
         help="Seed for random number generators (default: 0)",
+    )
+
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Bracket a fixed-duration torch-profiler window during the "
+        "measurement phase (server must be launched with --profiler-config). "
+        "Uses a background thread since main_mp blocks the event loop.",
+    )
+    parser.add_argument(
+        "--profile-delay-sec",
+        type=float,
+        default=20.0,
+        help="Seconds to wait after measurement start before /start_profile "
+        "(let the pipeline reach steady state). Default: 20",
+    )
+    parser.add_argument(
+        "--profile-duration-sec",
+        type=float,
+        default=8.0,
+        help="Seconds to capture between /start_profile and /stop_profile. "
+        "Keep small (5-10s) to bound trace size. Default: 8",
     )
 
     parser.add_argument(
@@ -1510,7 +1580,7 @@ async def main() -> None:
     np.random.seed(args.seed)
 
     logger.info("Loading tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     await get_server_info(args.url)
 
@@ -1595,11 +1665,23 @@ async def main() -> None:
         )
         logger.info("%sWarmup done%s", Color.PURPLE, Color.RESET)
 
+    # Arm the timed profiler window (runs concurrently in a background thread,
+    # because main_mp blocks the event loop on a synchronous queue.get()).
+    profile_thread = None
+    if args.profile:
+        profile_thread = _timed_profile_thread(
+            args.url, args.profile_delay_sec, args.profile_duration_sec
+        )
+
     # Run the benchmark
     benchmark_start_ns = time.perf_counter_ns()
     client_convs, client_metrics = await main_mp(
         client_args, req_args, bench_args, tokenizer, conversations
     )
+
+    # Ensure the profile window fully closed (trace dump completes on server).
+    if profile_thread is not None:
+        profile_thread.join(timeout=1800)
     benchmark_runtime_sec = nanosec_to_sec(time.perf_counter_ns() - benchmark_start_ns)
 
     # Calculate requests per second
