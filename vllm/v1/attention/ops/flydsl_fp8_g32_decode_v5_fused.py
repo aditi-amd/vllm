@@ -1039,7 +1039,7 @@ def flydsl_fp8_g32_decode_attention_v5_fused(
     # Both strides are baked into the kernel build (and its cache key) instead
     # of being assumed, so any 3-D layout with a contiguous head-dim works.
     _inkernel_qrot = (
-        _FUSE_QROT_INKERNEL and _haircut and int(D) == 256 and QG % 8 == 0
+        _FUSE_QROT_INKERNEL and _haircut and int(D) == 256 and QG in (6, 8, 16)
         and query.dim() == 3 and query.stride(2) == 1
         and query.stride(1) == int(D)
     )

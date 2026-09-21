@@ -318,10 +318,11 @@ def build_fp8_g32_decode_hd256_module(
     # Fuse the Q rotation (q_rot = Q @ PiT) into this kernel as an in-register
     # Walsh-Hadamard butterfly, deleting the separate ~7us prologue dispatch.
     # Requires the qk_scaled operand permutation (qperm), which is what the
-    # closed-form bit permutation in STEP B' encodes, and QG a multiple of 8.
+    # closed-form bit permutation in STEP B' encodes. The butterfly's lane map
+    # tiles 8 rows per wavefront; QG=6 runs one PARTIAL tile (see STEP B').
     _FUSE_QROT = (
         bool(fuse_qrot)
-        and int(query_group_size) % 8 == 0
+        and int(query_group_size) in (6, 8, 16)
         and HEAD_SIZE == 256
         and bool(qk_scaled)
     )
@@ -420,7 +421,13 @@ def build_fp8_g32_decode_hd256_module(
     # at QG=8), lifting waves/CU (~3 -> ~5) since the kernel is LDS-occupancy
     # bound. The launcher pads segm pools to QG=16 regardless, so this is purely
     # an in-kernel LDS footprint reduction.
-    _Q_LDS_BYTES = QG * HEAD_SIZE * 2
+    #
+    # The fused rotation writes a whole 8-row wavefront tile, so for a QG that
+    # is not a multiple of 8 (QG=6) the rows in [QG, roundup8(QG)) must land in
+    # padding rather than in the next allocation. Rounding up here keeps the
+    # store unpredicated; QG=8/16 are unchanged.
+    _Q_LDS_ROWS = ((QG + 7) // 8) * 8 if _FUSE_QROT else QG
+    _Q_LDS_BYTES = _Q_LDS_ROWS * HEAD_SIZE * 2
 
     _BS = int(kv_block_size)
     _TILES_PER_BLOCK = _BS // TILE_SIZE
@@ -712,6 +719,14 @@ def build_fp8_g32_decode_hd256_module(
         # d = (L&7)*32 + t. That puts butterfly stages 0..4 (strides 1..16)
         # entirely inside one lane's registers, and leaves only stages 5..7
         # (strides 32/64/128 == chunk XOR 1/2/4) needing a cross-lane exchange.
+        #
+        # QG=6 runs one PARTIAL 8-row tile. That is safe without predication
+        # because the stage 5..7 swizzles XOR the CHUNK index (lane ^ 1/2/4),
+        # which never changes row = lane>>3 -- so rows are independent and the
+        # junk rows 6..7 cannot contaminate rows 0..5. Their loads are bounds-
+        # checked by the buffer resource, and their stores land in the LDS
+        # padding reserved by _Q_LDS_ROWS. STEP C's mfma_row < QG gate then
+        # drops them from the output.
         if const_expr(_FUSE_QROT):
             _wrow = lane >> fx.Int32(3)              # 0..7  row within the group
             _wchk = lane & fx.Int32(7)               # 0..7  32-dim chunk
@@ -725,7 +740,7 @@ def build_fp8_g32_decode_hd256_module(
                           | ((_wchk & fx.Int32(1)) << fx.Int32(6))
                           | ((_wchk & fx.Int32(4)) << fx.Int32(5)))
             _inv_sqrtD = arith.constant(1.0 / math.sqrt(HEAD_SIZE), type=T.f32)
-            for _qit in range_constexpr(QG // 8):
+            for _qit in range_constexpr((QG + 7) // 8):
                 _qrow = _wrow + fx.Int32(_qit * 8)
                 _qb = (seq * c_sq + (kv_h * c_qg + _qrow) * c_qh
                        + _wchk * fx.Int32(32))

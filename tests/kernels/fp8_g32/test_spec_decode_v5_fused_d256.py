@@ -112,9 +112,14 @@ def _run_v5(query, kv_cache, block_table, seq_lens, scale, PiT, max_seq_len):
     )
 
 
-def test_fuse_qrot_opt_out_matches_in_kernel_path(monkeypatch):
-    """The documented V5_FUSE_QROT=0 escape hatch must pass pre-rotated Q."""
-    B, Hq, Hk, D, N = 4, 8, 1, 256, 4096
+@pytest.mark.parametrize("Hq", [6, 8])
+def test_fuse_qrot_opt_out_matches_in_kernel_path(monkeypatch, Hq):
+    """The documented V5_FUSE_QROT=0 escape hatch must pass pre-rotated Q.
+
+    Hq=6 (Qwen3.5-27B GQA-6) exercises the PARTIAL butterfly tile: the lane
+    map covers 8 rows, so rows 6..7 are computed and discarded.
+    """
+    B, Hk, D, N = 4, 1, 256, 4096
     _skip_if_unavailable(Hq // Hk)
     device = torch.device("cuda")
     torch.manual_seed(0xF053)
