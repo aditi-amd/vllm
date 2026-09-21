@@ -226,13 +226,12 @@ _USE_FP8_G32_V3 = os.environ.get("VLLM_FP8_G32_V3", "1") == "1"
 # continuation-prefill fall back to the fp8_g32 Triton path (V3 if also set,
 # else V1). Independent of VLLM_FP8_G32_V3.
 _USE_FP8_G32_V4 = os.environ.get("VLLM_FP8_G32_DECODE_V4", "1") == "1"
-# Opt-in flag for the FUSED single-kernel fp8_g32 decode (v5). When set (and
+# Flag for the optimized fp8_g32 decode module (v5). When set (and
 # v4 is also enabled + the layer is D=256 hd256-eligible), the hd256 decode
-# routes to `flydsl_fp8_g32_decode_attention_v5_fused`, which folds the
-# partition combine (and store) into the decode epilogue -- eliminating the
-# separate Triton reduce kernel and the segm_* HBM round-trip. Default OFF:
-# when unset the path is byte-for-byte the v4 UQ-adaptive kernel. This flag is
-# strictly additive and never alters the v4 code path.
+# routes to `flydsl_fp8_g32_decode_attention_v5_fused`, which adds the
+# strided tile-group mapping and in-kernel Q rotation. The launcher still
+# merges split-K partition partials with a Triton reduction. Default ON;
+# setting the flag to 0 restores the v4 UQ-adaptive kernel.
 _USE_FP8_G32_V5_FUSED = os.environ.get(
     "VLLM_FP8_G32_DECODE_V5_FUSED", "1") == "1"
 # Diagnostic: shadow-compare the FlyDSL fp8_g32 v4 decode against the Triton v3
@@ -451,7 +450,6 @@ def _shadow_compare_tq(impl, query, kv_cache, attn_metadata, Pi, PiT,
     st["calls"] += 1
     q = query
     B = q.shape[0]
-    dev = q.device
     tri = impl._dispatch_decode_v3(
         query=q, kv_cache=kv_cache, block_table=attn_metadata.block_table,
         seq_lens=attn_metadata.seq_lens,
@@ -745,6 +743,32 @@ class TurboQuantMetadata(AttentionMetadata):
     is_prefill: bool = False
     num_decodes: int = 0  # number of decode requests (first in batch)
     num_decode_tokens: int = 0  # tokens from decode requests
+    # Speculative-decode (MTP) verify length: query tokens per decode request.
+    # 1 for ordinary single-token decode; 1+num_speculative_tokens when the
+    # decode region carries speculative verify queries (spec-as-decode).
+    spec_query_len: int = 1
+
+
+def _uniform_decode_query_len(
+    num_decodes: int,
+    num_decode_tokens: int,
+) -> int:
+    """Return the uniform query length for a spec-as-decode region.
+
+    The single-query decode kernel cannot represent a ragged mixture of
+    ordinary decode and speculative verify requests with one repeated block
+    table. Fail before launch instead of silently constructing invalid metadata.
+    """
+    if num_decodes <= 0 or num_decode_tokens <= num_decodes:
+        return 1
+    if num_decode_tokens % num_decodes != 0:
+        raise RuntimeError(
+            "TurboQuant spec-as-decode requires a uniform query length "
+            f"in the decode region (got {num_decode_tokens} decode tokens "
+            f"across {num_decodes} requests). A ragged 1-and-K mix cannot "
+            "be expanded safely."
+        )
+    return num_decode_tokens // num_decodes
 
 
 class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
@@ -760,7 +784,13 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
+        # supports_spec_as_decode=True: when a speculative (MTP) config is
+        # present the base class raises reorder_batch_threshold to
+        # 1+num_speculative_tokens, so verify batches (query_len = K) are
+        # classified as decodes rather than prefills. The decode path expands
+        # each K-token verify request into K staggered single-token decodes
+        # (see _spec_decode_region), reusing the single-query decode kernel.
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -783,6 +813,16 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             cam, decode_threshold=self.reorder_batch_threshold
         )
 
+        # Uniform verify length of the decode region. With spec-as-decode the
+        # decode region holds num_decodes requests each of query_len = K, so
+        # num_decode_tokens == num_decodes * K. K == 1 is ordinary decode.
+        # Ragged 1-and-K mixes used to silently keep K=1 and feed the decode
+        # kernel more query rows than block-table rows; refuse that instead.
+        spec_query_len = _uniform_decode_query_len(
+            num_decodes,
+            num_decode_tokens,
+        )
+
         return TurboQuantMetadata(
             seq_lens=cam.seq_lens,
             slot_mapping=cam.slot_mapping,
@@ -794,6 +834,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             is_prefill=(cam.max_query_len > 1),
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            spec_query_len=spec_query_len,
         )
 
 
@@ -1019,7 +1060,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 candidates.append(int(max(sizes)))
             sched = getattr(cfg, "scheduler_config", None)
             if sched is not None and getattr(sched, "max_num_seqs", None):
-                candidates.append(int(sched.max_num_seqs))
+                # Under speculative (MTP) decode each request contributes
+                # K = 1+num_speculative_tokens query tokens to the decode
+                # region, so the expanded decode batch can reach
+                # max_num_seqs * K rows in the eager fallback path.
+                spec_k = 1
+                spec_cfg = getattr(cfg, "speculative_config", None)
+                if spec_cfg is not None and getattr(
+                    spec_cfg, "num_speculative_tokens", None
+                ):
+                    spec_k = 1 + int(spec_cfg.num_speculative_tokens)
+                candidates.append(int(sched.max_num_seqs) * spec_k)
             if candidates:
                 return max(candidates)
         except Exception:
@@ -1119,11 +1170,25 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # num_decodes/num_decode_tokens from metadata give the split point.
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
+        K = attn_metadata.spec_query_len
+
+        # A speculative (MTP) verify batch has K>1 query tokens per decode
+        # request. The max_query_len>1 rule flags it is_prefill=True, but it is
+        # a decode, not a prefill: route it through the spec-decode expansion,
+        # which turns each K-token request into K staggered single-token
+        # decodes and reuses the single-query decode kernel (capture-safe).
+        spec_decode = K > 1 and num_decodes > 0
 
         if not attn_metadata.is_prefill:
             # Pure decode batch — fast path
             attn_out = self._decode_attention(
                 q, kv_cache, attn_metadata, Pi, centroids, PiT, layer
+            )
+        elif spec_decode and num_decode_tokens == N:
+            # Pure speculative-verify batch: the whole batch is the decode
+            # region, every request carries K verify queries.
+            attn_out = self._spec_decode_region(
+                q, kv_cache, attn_metadata, K, Pi, centroids, PiT, layer
             )
         elif num_decodes == 0:
             # Pure prefill batch
@@ -1149,20 +1214,42 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # output buffer instead.
 
             # --- Decode portion (first num_decodes requests) ---
-            # Use full-batch max_seq_len as safe upper bound (no GPU sync).
-            decode_meta = TurboQuantMetadata(
-                seq_lens=attn_metadata.seq_lens[:num_decodes],
-                slot_mapping=attn_metadata.slot_mapping[:num_decode_tokens],
-                block_table=attn_metadata.block_table[:num_decodes],
-                query_start_loc=attn_metadata.query_start_loc[: num_decodes + 1],
-                num_actual_tokens=num_decode_tokens,
-                max_query_len=1,
-                max_seq_len=attn_metadata.max_seq_len,
-                is_prefill=False,
-            )
-            _decode_out = self._decode_attention(
-                q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
-            )
+            if spec_decode:
+                # Spec-verify decodes (K query tokens each): expand and reuse
+                # the single-query kernel via _spec_decode_region.
+                decode_region_meta = TurboQuantMetadata(
+                    seq_lens=attn_metadata.seq_lens[:num_decodes],
+                    slot_mapping=attn_metadata.slot_mapping[:num_decode_tokens],
+                    block_table=attn_metadata.block_table[:num_decodes],
+                    query_start_loc=attn_metadata.query_start_loc[: num_decodes + 1],
+                    num_actual_tokens=num_decode_tokens,
+                    max_query_len=K,
+                    max_seq_len=attn_metadata.max_seq_len,
+                    is_prefill=False,
+                    num_decodes=num_decodes,
+                    num_decode_tokens=num_decode_tokens,
+                    spec_query_len=K,
+                )
+                _decode_out = self._spec_decode_region(
+                    q[:num_decode_tokens], kv_cache, decode_region_meta, K,
+                    Pi, centroids, PiT, layer,
+                )
+            else:
+                # Use full-batch max_seq_len as safe upper bound (no GPU sync).
+                decode_meta = TurboQuantMetadata(
+                    seq_lens=attn_metadata.seq_lens[:num_decodes],
+                    slot_mapping=attn_metadata.slot_mapping[:num_decode_tokens],
+                    block_table=attn_metadata.block_table[:num_decodes],
+                    query_start_loc=attn_metadata.query_start_loc[: num_decodes + 1],
+                    num_actual_tokens=num_decode_tokens,
+                    max_query_len=1,
+                    max_seq_len=attn_metadata.max_seq_len,
+                    is_prefill=False,
+                )
+                _decode_out = self._decode_attention(
+                    q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids,
+                    PiT, layer,
+                )
             # Write decode result directly into output (no intermediate attn_out)
             if output.ndim == 3:
                 output[:num_decode_tokens] = _decode_out.to(output.dtype)
@@ -2223,6 +2310,76 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             ).squeeze(0).transpose(0, 1)
 
         return out.to(qdtype)
+
+    # ------------------------------------------------------------------ #
+    #  Speculative-decode (MTP) verify region                             #
+    # ------------------------------------------------------------------ #
+    def _spec_decode_region(
+        self,
+        query: torch.Tensor,  # (num_decodes * K, Hq, D), request-major
+        kv_cache: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        K: int,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None = None,
+        layer: torch.nn.Module | None = None,
+    ) -> torch.Tensor:
+        """Attention for a speculative (MTP) verify region.
+
+        Each of the ``B = num_decodes`` requests submits ``K = 1 +
+        num_speculative_tokens`` query tokens (request-major: the K tokens of
+        request b are rows ``b*K .. b*K+K-1`` of ``query``). All K tokens' K/V
+        were already written to the paged cache by ``do_kv_cache_update``, so
+        token k of request b must attend causally to context positions
+        ``[0 .. ctx_b - K + k]`` where ``ctx_b`` is the request's full context
+        length (``seq_lens[b]``, which already includes the K new tokens).
+
+        A causal K-token verify against a shared context is exactly K
+        independent single-token decodes with staggered context lengths.  We
+        therefore expand the batch to ``B*K`` single-query decodes with
+        per-query ``seq_lens = ctx_b - (K-1) + k`` and a block table repeated K
+        times, then call the ordinary single-query decode kernel.  Every op
+        here is vectorized (no host sync / Python loop), so the path is CUDA
+        graph capture-safe.
+        """
+        Bd = attn_metadata.num_decodes
+        device = query.device
+        if query.shape[0] != Bd * K:
+            raise RuntimeError(
+                "TurboQuant spec-as-decode expansion size mismatch: "
+                f"query rows={query.shape[0]} vs num_decodes*K={Bd}*{K}."
+            )
+        seq_lens_dec = attn_metadata.seq_lens[:Bd]                 # (Bd,)
+        bt_dec = attn_metadata.block_table[:Bd]                    # (Bd, maxblk)
+
+        # Staggered causal lengths: row (b, k) -> seq_lens_dec[b] - (K-1) + k.
+        offs = torch.arange(
+            K, device=device, dtype=seq_lens_dec.dtype
+        ) - (K - 1)                                                # (K,) = [-(K-1)..0]
+        synth_seq_lens = (seq_lens_dec[:, None] + offs[None, :]).reshape(-1)
+        # During cudagraph capture seq_lens are dummy (==1); clamp so the
+        # expanded lengths stay valid (>=1). Real replay lengths are large.
+        synth_seq_lens = synth_seq_lens.clamp_(min=1)
+        synth_bt = bt_dec.repeat_interleave(K, dim=0)              # (Bd*K, maxblk)
+
+        BK = Bd * K
+        synth_meta = TurboQuantMetadata(
+            seq_lens=synth_seq_lens,
+            slot_mapping=attn_metadata.slot_mapping[:BK],
+            block_table=synth_bt,
+            query_start_loc=attn_metadata.query_start_loc,
+            num_actual_tokens=BK,
+            max_query_len=1,
+            max_seq_len=int(attn_metadata.max_seq_len),
+            is_prefill=False,
+            num_decodes=BK,
+            num_decode_tokens=BK,
+            spec_query_len=1,
+        )
+        return self._decode_attention(
+            query, kv_cache, synth_meta, Pi, centroids, PiT, layer
+        )
 
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #

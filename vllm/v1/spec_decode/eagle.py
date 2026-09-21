@@ -267,6 +267,13 @@ class SpecDecodeBaseProposer:
 
             rocm_types.append(FlexAttentionMetadata)
 
+            # UltraQuant / TurboQuant (fp8_kv_g32): verify uses spec-as-decode
+            # expansion in turboquant_attn; the draft loop still needs this
+            # metadata type on the ROCm allow-list for num_speculative_tokens>1.
+            from vllm.v1.attention.backends.turboquant_attn import TurboQuantMetadata
+
+            rocm_types.append(TurboQuantMetadata)
+
             self.allowed_attn_types = tuple(rocm_types)
 
         # Parse the speculative token tree.
