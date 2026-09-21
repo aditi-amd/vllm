@@ -8,9 +8,16 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+# ROCm has no cuda-python / cuMemcpyBatchAsync. Route the batched block copy
+# through the compiled swap_blocks_batch op (HIP: batched hipMemcpyAsync),
+# which is the same primitive the native OffloadingConnector uses on AMD.
+_IS_ROCM = current_platform.is_rocm()
 
 
 def pin_tensor(tensor: torch.Tensor) -> None:
@@ -76,6 +83,7 @@ class BatchMemcpyParams(NamedTuple):
     # cuMemcpyBatchAsync() with fail_idx for backward compatibility
     fail_idx: ctypes.c_size_t
     stream_handle: int  # raw cudaStream_t / CUstream
+    stream: Any  # torch.cuda.Stream — used by the ROCm swap_blocks_batch path
 
 
 def build_params(
@@ -84,7 +92,9 @@ def build_params(
     stream: torch.cuda.Stream,
 ) -> BatchMemcpyParams:
     global _batch_memcpy_fn
-    if _batch_memcpy_fn is None:
+    # On ROCm we use swap_blocks_batch (no cuda-python); skip resolving the
+    # NVIDIA cuMemcpyBatchAsync entry point.
+    if not _IS_ROCM and _batch_memcpy_fn is None:
         _batch_memcpy_fn = _resolve_batch_memcpy()
 
     assert list(src_caches.keys()) == list(dst_caches.keys())
@@ -111,6 +121,7 @@ def build_params(
         attrs_idx=ctypes.c_size_t(0),
         fail_idx=ctypes.c_size_t(0),
         stream_handle=stream.cuda_stream,
+        stream=stream,
     )
 
 
@@ -136,6 +147,17 @@ def copy_blocks(
     sz_all = np.repeat(params.bpb, n)
 
     total = n * params.num_layers
+
+    if _IS_ROCM:
+        # ROCm path: submit the batch via the compiled swap_blocks_batch op
+        # (HIP batched hipMemcpyAsync). Requires int64 CPU pointer/size tensors.
+        src_ptrs = torch.from_numpy(src_all.astype(np.int64))
+        dst_ptrs = torch.from_numpy(dst_all.astype(np.int64))
+        sizes = torch.from_numpy(sz_all.astype(np.int64))
+        with torch.cuda.stream(params.stream):
+            ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
+        return
+
     err = _batch_memcpy_fn(
         dst_all.ctypes.data,
         src_all.ctypes.data,

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
+import os
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -63,6 +65,14 @@ class SimpleCPUOffloadWorker:
         # Completed store events to report via build_connector_worker_meta
         self._completed_store_events: dict[int, int] = {}
 
+        # --- DIAGNOSTIC (env-gated) ---
+        self._dbg = bool(int(os.getenv("VLLM_SIMPLE_OFFLOAD_DEBUG", "0")))
+        self._dbg_store_launched = 0
+        self._dbg_load_launched = 0
+        self._dbg_store_evt_done = 0
+        self._dbg_load_reqs_done = 0
+        self._dbg_last_log = time.monotonic()
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -87,6 +97,20 @@ class SimpleCPUOffloadWorker:
         def _repr_tensor(v: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
             assert isinstance(v, torch.Tensor | list)
             return v if isinstance(v, torch.Tensor) else v[0]
+
+        if self._dbg:
+            for _name, _v in kv_caches.items():
+                if isinstance(_v, list):
+                    _ptrs = [t.untyped_storage().data_ptr() for t in _v]
+                    _shared = len(set(_ptrs)) == 1
+                    logger.info(
+                        "[OFFLOAD_DBG reg] mamba layer=%s ntensors=%d shared_storage=%s "
+                        "shapes=%s dtypes=%s ptrs=%s",
+                        _name, len(_v), _shared,
+                        [tuple(t.shape) for t in _v],
+                        [str(t.dtype) for t in _v],
+                        [hex(p) for p in _ptrs],
+                    )
 
         any_tensor = _repr_tensor(next(iter(kv_caches.values())))
         self.device = any_tensor.device
@@ -255,6 +279,26 @@ class SimpleCPUOffloadWorker:
             for j in [j for j in self._pending_store_event_indices if j <= store_wm]:
                 self._pending_store_event_indices.discard(j)
                 self._completed_store_events[j] = 1
+
+        if self._dbg:
+            if metadata is not None:
+                self._dbg_store_launched += len(metadata.store_gpu_blocks or [])
+                self._dbg_load_launched += len(metadata.load_cpu_blocks or [])
+            self._dbg_store_evt_done += len(self._completed_store_events)
+            self._dbg_load_reqs_done += len(finished_recving)
+            now = time.monotonic()
+            if now - self._dbg_last_log >= 5.0:
+                self._dbg_last_log = now
+                logger.info(
+                    "[OFFLOAD_DBG worker] store_blk_launched=%d load_blk_launched=%d "
+                    "store_evt_done=%d load_reqs_done=%d pend_store=%d pend_load=%d",
+                    self._dbg_store_launched,
+                    self._dbg_load_launched,
+                    self._dbg_store_evt_done,
+                    self._dbg_load_reqs_done,
+                    len(self._pending_store_event_indices),
+                    len(self._pending_load_event_indices),
+                )
 
         return None, finished_recving or None
 
