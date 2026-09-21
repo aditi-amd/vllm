@@ -41,7 +41,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl, vector
-from flydsl.expr.typing import T, Int32
+from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl._mlir import ir
@@ -177,6 +177,7 @@ def build_fp8_g32_decode_hd256_module(
     num_warps: int = 1,
     stride_q_seq: int | None = None,
     stride_q_head: int | None = None,
+    fuse_qrot: bool = True,
 ):
     """Build an fp8_g32 HEAD_SIZE=256 decode kernel module (base path only).
 
@@ -197,8 +198,16 @@ def build_fp8_g32_decode_hd256_module(
     by the production D=256 config. ``q_hoist`` only affects ``qk_scaled``
     (loop-invariant Q operands); ``use_wht_butterfly`` is ignored at 256.
     """
-    assert query_group_size in (8, 16), (
-        f"query_group_size must be 8 or 16; got {query_group_size}"
+    # QG=6 (Qwen3.6-27B full-attention layers) reuses this exact kernel, no
+    # sibling fork. It is QG-agnostic: STEP B loads exactly QG rows
+    # (QG_LOAD_ITERS = 6*32//64 = 3, integral at 256), _FUSE_QROT self-disables
+    # for QG%8!=0 (falls back to the external q_rot prologue), STEP C's read of
+    # rows QG..15 spills into the adjacent KV LDS region and is DISCARDED by the
+    # `mfma_row < QG` output store gate (STEP G) exactly like the validated QG=8
+    # shrink, so no tail-aliasing / zero-fill is needed. GQA-8/16 emission is
+    # byte-identical (QG=6 adds no new emitted code, only relaxes this gate).
+    assert query_group_size in (6, 8, 16), (
+        f"query_group_size must be 6, 8 or 16; got {query_group_size}"
     )
     # head_dim=256 hybrid models (Qwen3.6/3.8) force a larger mamba-aligned KV
     # block; the tiled inner loop (_TILES_PER_BLOCK = kv_block_size // TILE_SIZE)
@@ -213,7 +222,7 @@ def build_fp8_g32_decode_hd256_module(
     PARTITION_EXTENT_TOKENS = TGPP * KV_COMPUTE_BLOCK
     # Tile-group -> partition mapping.
     #
-    # Blocked (default): partition p owns the contiguous token range
+    # Blocked mode: partition p owns the contiguous token range
     #   [p*TGPP*KCB, (p+1)*TGPP*KCB). The host sizes TGPP off the WORST-CASE
     #   context (block_table.shape[1]*block_size) because CUDA-graph replay needs
     #   a fixed gridDim, so on a short sequence the work piles onto the first few
@@ -267,8 +276,7 @@ def build_fp8_g32_decode_hd256_module(
     )
 
     QG = int(query_group_size)
-    QG_LOAD_ITERS = (QG * Q_GROUPS_PER_ROW) // WARP_SIZE   # 8 for QG=16, 4 for QG=8
-    OOB_OFFSET = 0x7FFFFFF0
+    QG_LOAD_ITERS = (QG * Q_GROUPS_PER_ROW) // WARP_SIZE   # 8@QG16, 4@QG8, 3@QG6
 
     # --- Occupancy: optional multi-warp (HIOCC) --------------------------------
     # num_warps=1 is the canonical single-wavefront path (bit-identical to the
@@ -311,9 +319,12 @@ def build_fp8_g32_decode_hd256_module(
     # Walsh-Hadamard butterfly, deleting the separate ~7us prologue dispatch.
     # Requires the qk_scaled operand permutation (qperm), which is what the
     # closed-form bit permutation in STEP B' encodes, and QG a multiple of 8.
-    _FUSE_QROT = (os.environ.get("VLLM_FP8_G32_DECODE_V5_FUSE_QROT", "1") == "1"
-                  and int(query_group_size) % 8 == 0
-                  and HEAD_SIZE == 256 and bool(qk_scaled))
+    _FUSE_QROT = (
+        bool(fuse_qrot)
+        and int(query_group_size) % 8 == 0
+        and HEAD_SIZE == 256
+        and bool(qk_scaled)
+    )
 
     # --- Scheduling: LLVM instruction-group interleaving ----------------------
     # The tile loop is FULLY unrolled at trace time, so the whole K-tile
@@ -637,7 +648,6 @@ def build_fp8_g32_decode_hd256_module(
         c_qh = fx.Int32(_stride_q_head)
         c_qg = fx.Int32(QG)
         c_bt = fx.Int32(_stride_bt_seq)
-        c_block = fx.Int32(_stride_cache_block)
         c_stride_pos = fx.Int32(_stride_cache_pos)
         c_stride_head = fx.Int32(_stride_cache_head)
         c_kscale_off = fx.Int32(K_SCALES_OFFSET)       # 128

@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FlyDSL fp8_g32 decode v4 launcher (vLLM-side).
+"""FlyDSL fp8_g32 decode launcher for the optimized D=256 path.
 
-Drop-in alternative to ``fp8_g32_unified_attention`` (Triton v3) for the
-fp8_g32 decode profile: HEAD_SIZE=128, FP4 E2M1 codes + UE8M0 per-group-of-32
-scales, BLOCK_SIZE in {16, 32}, GQA group in {8, 16}.
+This module launches the v7 D=256 FlyDSL kernel used for ``fp8_kv_g32`` decode:
+FP4 E2M1 K/V codes, UE8M0 group-32 scales, scaled FP4xE4M3 QK MFMA,
+in-kernel Q rotation, and strided tile-group scheduling. It retains the D=128
+v4 launcher path only as a compatibility fallback.
 
 This launcher is a direct sibling of ``flydsl_turboquant_decode_v4.py`` and
 reuses its framework verbatim (FlyDSL bootstrap, single-bucket segm-pool,
@@ -20,8 +21,8 @@ the fp8_g32 algorithm change:
     (the precision haircut the QK ``dot_scaled`` applies in v3) before being
     fed as bf16 to the bf16 QK MFMA.
 
-Opt-in via ``VLLM_FP8_G32_DECODE_V4=1``. Falls back to the Triton path if
-FlyDSL is not importable (e.g. wrong arch, missing build tree).
+The backend controls dispatch and falls back to Triton when FlyDSL is not
+importable or the layer is ineligible.
 """
 from __future__ import annotations
 
@@ -74,13 +75,11 @@ def _ensure_flydsl_paths() -> None:
 
 
 _FLYDSL_AVAILABLE: bool | None = None
-_FP8_MOD = None      # kernels.fp8_g32_decode_v4 module (Qwen GQA-{8,16})
-_FP8_MOD_GQA6 = None  # kernels.fp8_g32_decode_v4_gqa6 module (MiniMax GQA-6); may stay None
+_FP8_MOD = None  # kernels.fp8_g32_decode_v4 module (Qwen GQA-{8,16})
+_FP8_MOD_GQA6 = None  # Optional MiniMax GQA-6 module.
 _GQA6_AVAILABLE: bool | None = None
-_FP8_MOD_HD256 = None  # flydsl_kernels.fp8_g32_decode_hd256 module (D=256, GQA-8/16); may stay None
+_FP8_MOD_HD256 = None  # Optional fused D=256 module.
 _HD256_AVAILABLE: bool | None = None
-_FP8_MOD_GQA6_HD256 = None  # flydsl_kernels.fp8_g32_decode_gqa6_hd256 (D=256, GQA-6); may stay None
-_GQA6_HD256_AVAILABLE: bool | None = None
 _FLYC = None    # flydsl.compiler
 _FX = None      # flydsl.expr
 _TYPING_T = None
@@ -153,23 +152,6 @@ def is_flydsl_available() -> bool:
                 "D=256 (GQA-8/16) will fall back to Triton fp8_g32 v3.",
                 ex_hd256,
             )
-        # Best-effort load of the GQA-6 HEAD_SIZE=256 sibling (Qwen3.6-27B).
-        global _FP8_MOD_GQA6_HD256, _GQA6_HD256_AVAILABLE
-        try:
-            from vllm.v1.attention.ops.flydsl_kernels import (
-                fp8_g32_decode_gqa6_hd256 as fp8_mod_gqa6_hd256,
-            )
-            _FP8_MOD_GQA6_HD256 = fp8_mod_gqa6_hd256
-            _GQA6_HD256_AVAILABLE = True
-            logger.info_once(
-                "FlyDSL fp8_g32 decode gqa6-hd256 sibling: available")
-        except Exception as ex_gqa6_hd256:  # noqa: BLE001
-            _GQA6_HD256_AVAILABLE = False
-            logger.warning_once(
-                "FlyDSL fp8_g32 decode gqa6-hd256 sibling: unavailable (%s). "
-                "D=256 (GQA-6) will fall back to Triton fp8_g32 v3.",
-                ex_gqa6_hd256,
-            )
     except Exception as ex:  # noqa: BLE001
         _FLYDSL_AVAILABLE = False
         logger.warning_once(
@@ -195,15 +177,14 @@ def is_flydsl_fp8_hd256_available(query_group_size: int = 16) -> bool:
     """True iff FlyDSL is available AND the relevant HEAD_SIZE=256 sibling
     loaded for the given GQA factor.
 
-    ``query_group_size==6`` requires the GQA-6 hd256 sibling; 8/16 require the
-    canonical hd256 sibling. Used by the backend eligibility gate to allow
-    D=256 only when the matching kernel module is importable; otherwise D=256
-    falls back to the Triton fp8_g32 v3 path.
+    GQA 6/8/16 all ride the canonical fused hd256 sibling. Used by the backend
+    eligibility gate to allow D=256 only when that kernel module is importable;
+    otherwise D=256 falls back to the Triton fp8_g32 v3 path.
     """
     if not is_flydsl_available():
         return False
-    if int(query_group_size) == 6:
-        return bool(_GQA6_HD256_AVAILABLE)
+    # QG 6/8/16 all ride the canonical fused hd256 module (the fused kernel is
+    # QG-agnostic; see the assert note in fp8_g32_decode_hd256_fused.py).
     return bool(_HD256_AVAILABLE)
 
 
@@ -281,6 +262,20 @@ def _qperm_index(device: torch.device, D: int = 128,
     return t
 
 
+def _mtp_expand_k(cfg) -> int:
+    """Decode-kernel batch expansion under spec-as-decode: B_kernel = n_reqs * K
+    with K = 1 + num_speculative_tokens (1 when MTP is off)."""
+    spec_cfg = getattr(cfg, "speculative_config", None)
+    n = (
+        getattr(spec_cfg, "num_speculative_tokens", None)
+        if spec_cfg is not None
+        else None
+    )
+    if n:
+        return 1 + int(n)
+    return 1
+
+
 def _detect_max_capture_B() -> int:
     env = _env("VLLM_FP8_G32_DECODE_V4_B_BUCKET")
     if env is not None:
@@ -291,9 +286,21 @@ def _detect_max_capture_B() -> int:
     try:
         from vllm.config import get_current_vllm_config
         cfg = get_current_vllm_config()
+        spec_k = _mtp_expand_k(cfg)
+        candidates: list[int] = []
         sizes = cfg.compilation_config.cudagraph_capture_sizes
         if sizes:
-            return int(max(sizes))
+            # Capture sizes count token rows, so speculative verify expansion is
+            # already reflected in them. Multiplying these by K again would
+            # over-allocate the pool.
+            candidates.append(int(max(sizes)))
+        sched = getattr(cfg, "scheduler_config", None)
+        if sched is not None and getattr(sched, "max_num_seqs", None):
+            # max_num_seqs counts requests; eager fallback can expand each
+            # request into K verify rows.
+            candidates.append(int(sched.max_num_seqs) * spec_k)
+        if candidates:
+            return max(candidates)
     except Exception:  # noqa: BLE001
         pass
     return 512
@@ -451,6 +458,7 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
            round(float(scale_c), 8), bool(qk_fp8), bool(qk_scaled),
            bool(v_cvt), bool(q_hoist), int(head_size), int(num_warps),
            _env("VLLM_FP8_G32_DECODE_V5_STRIDED_TG", "1"),
+           bool(_FUSE_QROT_INKERNEL),
            stride_q_seq, stride_q_head)
     cached = _KERN_CACHE.get(key)
     if cached is not None:
@@ -468,38 +476,30 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
         # Fast paths ported to 256: qk_fp8 (native fp8 QK MFMA), HW V-transpose,
         # native V CVT, and qk_scaled (GQA-6 sibling only; the GQA-8/16 sibling
         # still rejects it).
-        # GQA-6 (Qwen3.6-27B) uses the gqa6 sibling; GQA-8/16 the canonical.
-        if int(query_group_size) == 6:
-            assert _FP8_MOD_GQA6_HD256 is not None, (
-                "head_size=256 GQA-6 requires the fp8_g32_decode_gqa6_hd256 "
-                "sibling, which failed to import; check "
-                "is_flydsl_fp8_hd256_available(6)."
-            )
-            kmod = _FP8_MOD_GQA6_HD256
-            _hd256_build = kmod.build_fp8_g32_decode_gqa6_hd256_module
-            _hd256_extra = {}
-        else:
-            assert _FP8_MOD_HD256 is not None, (
-                "head_size=256 requires the fp8_g32_decode_hd256 sibling, "
-                "which failed to import; check is_flydsl_fp8_hd256_available()."
-            )
-            assert int(query_group_size) in (8, 16), (
-                f"fp8_g32 hd256 supports GQA 6, 8 or 16, got {query_group_size}"
-            )
-            kmod = _FP8_MOD_HD256
-            _hd256_build = kmod.build_fp8_g32_decode_hd256_module
-            # Only the canonical GQA-{8,16} hd256 build accepts the occupancy
-            # (num_warps) knob and the strided tile-group mapping; the gqa6
-            # sibling does not.
-            # strided_tg defaults ON: it beat the blocked mapping at every
-            # context (8k-262k) and batch (4-32) measured at the server's
-            # sizing, 1.2x-2.7x on the decode kernel, with no crossover.
-            # Set VLLM_FP8_G32_DECODE_V5_STRIDED_TG=0 to get the old mapping.
-            _hd256_extra = {
-                "num_warps": int(num_warps),
-                "strided_tg": _env(
-                    "VLLM_FP8_G32_DECODE_V5_STRIDED_TG", "1") == "1",
-            }
+        # GQA 6/8/16 all ride the canonical fused kernel: it is QG-agnostic
+        # (v7: STRIDED_TG + fused epilogue + qk_scaled; see its assert note).
+        assert _FP8_MOD_HD256 is not None, (
+            "head_size=256 requires the fp8_g32_decode_hd256 sibling, "
+            "which failed to import; check is_flydsl_fp8_hd256_available()."
+        )
+        assert int(query_group_size) in (6, 8, 16), (
+            f"fp8_g32 hd256 supports GQA 6, 8 or 16, got {query_group_size}"
+        )
+        kmod = _FP8_MOD_HD256
+        _hd256_build = kmod.build_fp8_g32_decode_hd256_module
+        # The canonical fused hd256 build accepts the occupancy (num_warps)
+        # knob and the strided tile-group mapping for ALL supported GQA
+        # factors (6/8/16 alike).
+        # strided_tg defaults ON: it beat the blocked mapping at every
+        # context (8k-262k) and batch (4-32) measured at the server's
+        # sizing, 1.2x-2.7x on the decode kernel, with no crossover.
+        # Set VLLM_FP8_G32_DECODE_V5_STRIDED_TG=0 to get the old mapping.
+        _hd256_extra = {
+            "num_warps": int(num_warps),
+            "strided_tg": _env(
+                "VLLM_FP8_G32_DECODE_V5_STRIDED_TG", "1") == "1",
+            "fuse_qrot": bool(_FUSE_QROT_INKERNEL),
+        }
         kfn = _hd256_build(
             num_seqs=int(num_seqs_hint),
             num_kv_heads=num_kv_heads,
@@ -573,9 +573,10 @@ def _get_kernel(num_kv_heads: int, num_partitions: int,
             q_hoist=bool(q_hoist),
         )
     al = kmod.allocator
-    # Canonical hd256 supports a per-build num_warps (occupancy knob); its block
-    # dim is num_warps*WARP_SIZE. All other modules use their module constant.
-    if int(head_size) == 256 and int(query_group_size) in (8, 16) \
+    # Canonical fused hd256 supports a per-build num_warps (occupancy knob); its
+    # block dim is num_warps*WARP_SIZE, for every GQA factor it serves (6/8/16).
+    # All other modules use their module constant.
+    if int(head_size) == 256 and int(query_group_size) in (6, 8, 16) \
             and int(num_warps) != 1:
         block_threads = int(num_warps) * 64
     else:
@@ -752,10 +753,12 @@ _FUSE_Q_ROT = True
 # butterfly and drop the prologue dispatch entirely. The prologue is ~7us at
 # B=4 and that is almost all fixed per-dispatch cost (sweeping its grid 4x moves
 # it 0%), so deleting the launch -- not optimizing it -- is the win.
-# Pinned ON: verified bit-exact (torch.equal) against the prologue path across
+# Default ON: verified bit-exact (torch.equal) against the prologue path across
 # B={1,2,3,4,8,16} x seq={4k,8k,16k,32k,50021,75k}, including non-power-of-2
 # batch and seq.
-_FUSE_QROT_INKERNEL = True
+_FUSE_QROT_INKERNEL = (
+    _env("VLLM_FP8_G32_DECODE_V5_FUSE_QROT", "1") == "1"
+)
 
 
 def _run_fused_q_rot(query, PiT_used, out, B, Hq, D, haircut):
@@ -787,12 +790,12 @@ def flydsl_fp8_g32_decode_attention_v5_fused(
     max_num_kv_splits: int = 32,
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Triton-v3-compatible launcher backed by the FlyDSL fp8_g32 decode kernel.
+    """Triton-v3-compatible launcher backed by FlyDSL fp8_g32 decode.
 
     Constraints:
-      * D == 128
-      * block_size in {16, 32}
-      * Hq // Hk in {8, 16}
+      * D in {128, 256}
+      * block_size in {16, 32} for D=128; {16, 32, 64, 128, 256} for D=256
+      * Hq // Hk in {6, 8, 16}
       * sinks is None (NYI on this path)
 
     The fp8_g32 cache slot layout (AoS) is read from ``kv_cache.shape[3]``
@@ -834,11 +837,9 @@ def flydsl_fp8_g32_decode_attention_v5_fused(
         f"fp8_g32 v4 supports GQA factor 6, 8 or 16, got {QG}"
     )
     if D == 256:
-        # D=256 (Qwen3.6-class): GQA-6 -> gqa6 hd256 sibling; GQA-8/16 ->
-        # canonical hd256 sibling. Require the matching module loaded.
+        # The canonical fused D=256 module serves GQA 6/8/16.
         assert is_flydsl_fp8_hd256_available(QG), (
-            "fp8_g32 v4 D=256 requires the fp8_g32_decode_"
-            f"{'gqa6_' if QG == 6 else ''}hd256 sibling, which is unavailable; "
+            "fp8_g32 D=256 requires the fused hd256 module, which is unavailable; "
             "caller should not have dispatched here "
             "(see is_flydsl_fp8_hd256_available())."
         )

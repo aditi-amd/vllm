@@ -258,6 +258,20 @@ def _qperm_index(device: torch.device, D: int = 128,
     return t
 
 
+def _mtp_expand_k(cfg) -> int:
+    """Decode-kernel batch expansion under spec-as-decode: B_kernel = n_reqs * K
+    with K = 1 + num_speculative_tokens (1 when MTP is off)."""
+    spec_cfg = getattr(cfg, "speculative_config", None)
+    n = (
+        getattr(spec_cfg, "num_speculative_tokens", None)
+        if spec_cfg is not None
+        else None
+    )
+    if n:
+        return 1 + int(n)
+    return 1
+
+
 def _detect_max_capture_B() -> int:
     env = os.environ.get("VLLM_FP8_G32_DECODE_V4_B_BUCKET")
     if env is not None:
@@ -268,9 +282,21 @@ def _detect_max_capture_B() -> int:
     try:
         from vllm.config import get_current_vllm_config
         cfg = get_current_vllm_config()
+        spec_k = _mtp_expand_k(cfg)
+        candidates: list[int] = []
         sizes = cfg.compilation_config.cudagraph_capture_sizes
         if sizes:
-            return int(max(sizes))
+            # Capture sizes count token rows, so speculative verify expansion is
+            # already reflected in them. Multiplying these by K again would
+            # over-allocate the pool.
+            candidates.append(int(max(sizes)))
+        sched = getattr(cfg, "scheduler_config", None)
+        if sched is not None and getattr(sched, "max_num_seqs", None):
+            # max_num_seqs counts requests; eager fallback can expand each
+            # request into K verify rows.
+            candidates.append(int(sched.max_num_seqs) * spec_k)
+        if candidates:
+            return max(candidates)
     except Exception:  # noqa: BLE001
         pass
     return 512
