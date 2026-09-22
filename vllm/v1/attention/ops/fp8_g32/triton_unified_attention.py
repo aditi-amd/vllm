@@ -860,6 +860,7 @@ def kernel_fp8_g32_unified_attention_2d(
     DOT_KIND: tl.constexpr = 0,  # 0=fp8mfma (default), 1=dot_scaled
     USE_SINKS: tl.constexpr = 0,
     SLIDING_WINDOW: tl.constexpr = 0,
+    IS_CAUSAL: tl.constexpr = True,
     ARCH_B_C: tl.constexpr = 0,  # 0 = Arch A, 1 = Arch B (c-baked codebook)
     SCALE_C: tl.constexpr = 1.0, # Arch B's c (folded into K/V scale at dequant)
     FUSE_Q_ROT: tl.constexpr = 0,  # 1 = load raw bf16 Q + fused rotate, 0 = pre-rotated fp8
@@ -947,13 +948,19 @@ def kernel_fp8_g32_unified_attention_2d(
     seq_len = tl.load(seq_lens_ptr + seq_idx)
     context_len = seq_len - cur_batch_query_len
 
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    if IS_CAUSAL:
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
+        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    else:
+        # Bidirectional block draft: every query attends to the whole
+        # sequence, including the other positions in its own block, so no
+        # query block can stop short of seq_len.
+        max_seq_prefix_len = seq_len
     num_tiles = tl.cdiv(max_seq_prefix_len, TILE_SIZE)
 
     tile_start = 0
@@ -1012,7 +1019,10 @@ def kernel_fp8_g32_unified_attention_2d(
             UNMASKED=True, DOT_KIND=DOT_KIND,
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
         )
-        seq_mask = seq_offset[None, :] <= query_abs_pos
+        if IS_CAUSAL:
+            seq_mask = seq_offset[None, :] <= query_abs_pos
+        else:
+            seq_mask = seq_offset[None, :] < seq_len
         if SLIDING_WINDOW > 0:
             seq_mask = seq_mask & (
                 (query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW
@@ -1085,7 +1095,10 @@ def kernel_fp8_g32_unified_attention_2d(
             UNMASKED=False, DOT_KIND=DOT_KIND,
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
         )
-        seq_mask = seq_offset[None, :] <= query_abs_pos
+        if IS_CAUSAL:
+            seq_mask = seq_offset[None, :] <= query_abs_pos
+        else:
+            seq_mask = seq_offset[None, :] < seq_len
         if SLIDING_WINDOW > 0:
             seq_mask = seq_mask & (
                 (query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW
@@ -1175,6 +1188,7 @@ def kernel_fp8_g32_unified_attention_3d(
     DOT_KIND: tl.constexpr = 0,  # 0=fp8mfma (default), 1=dot_scaled
     USE_SINKS: tl.constexpr = 0,
     SLIDING_WINDOW: tl.constexpr = 0,
+    IS_CAUSAL: tl.constexpr = True,
     ARCH_B_C: tl.constexpr = 0,  # 0 = Arch A, 1 = Arch B (c-baked codebook)
     SCALE_C: tl.constexpr = 1.0, # Arch B's c (folded into K/V scale at dequant)
     FUSE_Q_ROT: tl.constexpr = 0,  # 1 = load raw bf16 Q + fused rotate, 0 = pre-rotated fp8
@@ -1266,13 +1280,19 @@ def kernel_fp8_g32_unified_attention_3d(
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
 
     context_len = seq_len - cur_batch_query_len
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    if IS_CAUSAL:
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
+        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    else:
+        # Bidirectional block draft: every query attends to the whole
+        # sequence, including the other positions in its own block, so no
+        # query block can stop short of seq_len.
+        max_seq_prefix_len = seq_len
     num_tiles = tl.cdiv(max_seq_prefix_len, TILE_SIZE)
 
     tile_lo = segm_idx * tiles_per_segment
@@ -1335,7 +1355,10 @@ def kernel_fp8_g32_unified_attention_3d(
             UNMASKED=True, DOT_KIND=DOT_KIND,
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
         )
-        seq_mask = seq_offset[None, :] <= query_abs_pos
+        if IS_CAUSAL:
+            seq_mask = seq_offset[None, :] <= query_abs_pos
+        else:
+            seq_mask = seq_offset[None, :] < seq_len
         if SLIDING_WINDOW > 0:
             seq_mask = seq_mask & (
                 (query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW
@@ -1408,7 +1431,10 @@ def kernel_fp8_g32_unified_attention_3d(
             UNMASKED=False, DOT_KIND=DOT_KIND,
             ARCH_B_C=ARCH_B_C, SCALE_C=SCALE_C,
         )
-        seq_mask = seq_offset[None, :] <= query_abs_pos
+        if IS_CAUSAL:
+            seq_mask = seq_offset[None, :] <= query_abs_pos
+        else:
+            seq_mask = seq_offset[None, :] < seq_len
         if SLIDING_WINDOW > 0:
             seq_mask = seq_mask & (
                 (query_abs_pos - seq_offset[None, :]) < SLIDING_WINDOW
@@ -1510,9 +1536,12 @@ def fp8_g32_unified_attention(
     force_2d: bool = False,
     sinks: torch.Tensor | None = None,
     sliding_window: int | None = None,
+    causal: bool = True,
 ) -> torch.Tensor:
     """Launch unified FP8-g32 attention (V3 + scaled F8F6F4 MFMA)."""
     assert query.dim() == 3, f"query must be [N, Hq, D], got {query.shape}"
+    if not causal and sliding_window and sliding_window > 0:
+        raise ValueError("fp8_g32_unified: sliding window requires causal")
     num_tokens, Hq, D = query.shape
     Hk = kv_cache.shape[2]
     block_size = kv_cache.shape[1]
@@ -1779,6 +1808,7 @@ def fp8_g32_unified_attention(
             DOT_KIND=DOT_KIND,
             USE_SINKS=1 if use_sinks else 0,
             SLIDING_WINDOW=int(sliding_window) if sliding_window and sliding_window > 0 else 0,
+            IS_CAUSAL=bool(causal),
             ARCH_B_C=ARCH_B_C,
             SCALE_C=SCALE_C,
             FUSE_Q_ROT=1 if fuse_q_rot else 0,
@@ -1876,6 +1906,7 @@ def fp8_g32_unified_attention(
         DOT_KIND=DOT_KIND,
         USE_SINKS=1 if use_sinks else 0,
         SLIDING_WINDOW=int(sliding_window) if sliding_window and sliding_window > 0 else 0,
+        IS_CAUSAL=bool(causal),
         ARCH_B_C=ARCH_B_C,
         SCALE_C=SCALE_C,
         FUSE_Q_ROT=1 if fuse_q_rot else 0,
