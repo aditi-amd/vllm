@@ -728,6 +728,15 @@ class TurboQuantAttentionBackend(AttentionBackend):
         """
         return True
 
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        """Bidirectional attention, as DFlash's block draft needs.
+
+        Served by the fp8_g32 V3 unified Triton kernel; the single-query
+        decode kernel and the spec-as-decode expansion are causal-only.
+        """
+        return True
+
 
 @dataclass
 class TurboQuantMetadata(AttentionMetadata):
@@ -747,6 +756,9 @@ class TurboQuantMetadata(AttentionMetadata):
     # 1 for ordinary single-token decode; 1+num_speculative_tokens when the
     # decode region carries speculative verify queries (spec-as-decode).
     spec_query_len: int = 1
+    # False only for DFlash's bidirectional block draft. Sub-region metadata
+    # built internally is always a causal slice, so True is the right default.
+    causal: bool = True
 
 
 def _uniform_decode_query_len(
@@ -835,6 +847,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             spec_query_len=spec_query_len,
+            causal=cam.causal,
         )
 
 
@@ -1102,6 +1115,39 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         v = value[:N].view(N, self.num_kv_heads, self.head_size)
         self._store_kv(k, v, kv_cache, slot_mapping, layer)
 
+    def _non_causal_attention(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: "TurboQuantMetadata",
+        PiT: torch.Tensor,
+    ) -> torch.Tensor:
+        """Bidirectional attention over the whole batch (DFlash block draft).
+
+        The KV cache is already populated by do_kv_cache_update, so this only
+        reads it. Returns (N, Hq, D) like the other paths.
+        """
+        if not _USE_FP8_G32_V3:
+            raise NotImplementedError(
+                "non-causal TurboQuant attention needs the fp8_g32 V3 unified "
+                "kernel; set VLLM_FP8_G32_V3=1"
+            )
+        fp8_g32_unified_attention = _lazy_fp8_g32_v3_import()
+        return fp8_g32_unified_attention(
+            query=q,
+            kv_cache=kv_cache,
+            block_table=attn_metadata.block_table,
+            seq_lens=attn_metadata.seq_lens,
+            query_start_loc=attn_metadata.query_start_loc,
+            scale=self.scale,
+            PiT=PiT,
+            max_query_len=attn_metadata.max_query_len,
+            max_seq_len=attn_metadata.max_seq_len,
+            sinks=self.sinks,
+            sliding_window=self.sliding_window,
+            causal=False,
+        )
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -1179,7 +1225,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # decodes and reuses the single-query decode kernel (capture-safe).
         spec_decode = K > 1 and num_decodes > 0
 
-        if not attn_metadata.is_prefill:
+        if not attn_metadata.causal:
+            # DFlash block draft. Checked before every other branch because
+            # both the decode kernel and the spec-as-decode expansion bake in
+            # a causal mask, so neither can serve this batch whatever its
+            # query length looks like.
+            attn_out = self._non_causal_attention(q, kv_cache, attn_metadata, PiT)
+        elif not attn_metadata.is_prefill:
             # Pure decode batch — fast path
             attn_out = self._decode_attention(
                 q, kv_cache, attn_metadata, Pi, centroids, PiT, layer
