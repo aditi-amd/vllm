@@ -742,7 +742,17 @@ def build_fp8_g32_decode_hd256_module(
             _inv_sqrtD = arith.constant(1.0 / math.sqrt(HEAD_SIZE), type=T.f32)
             for _qit in range_constexpr((QG + 7) // 8):
                 _qrow = _wrow + fx.Int32(_qit * 8)
-                _qb = (seq * c_sq + (kv_h * c_qg + _qrow) * c_qh
+                # Rows >= QG are junk that STEP C discards, but their ADDRESS
+                # must still be in bounds: q_rsrc is built with max_size=True,
+                # so an out-of-range buffer_load faults rather than returning
+                # zero. Clamp to the last real row -- the value is dropped
+                # either way. Compile-time no-op when QG is a multiple of 8.
+                if const_expr(QG % 8 != 0):
+                    _qrow_ld = (_qrow < fx.Int32(QG)).select(
+                        _qrow, fx.Int32(QG - 1))
+                else:
+                    _qrow_ld = _qrow
+                _qb = (seq * c_sq + (kv_h * c_qg + _qrow_ld) * c_qh
                        + _wchk * fx.Int32(32))
                 # ---- load this lane's 32 raw-Q head-dims (4 x dwordx4) ----
                 _v = []
