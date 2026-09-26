@@ -324,6 +324,11 @@ class SpecDecodeBaseProposer:
 
             rocm_types.append(FlexAttentionMetadata)
 
+            # UltraQuant backend support
+            from vllm.v1.attention.backends.ultraquant_attn import UltraQuantMetadata
+
+            rocm_types.append(UltraQuantMetadata)
+
             self.allowed_attn_types = tuple(rocm_types)
 
     def _raise_if_padded_drafter_batch_disabled(self):

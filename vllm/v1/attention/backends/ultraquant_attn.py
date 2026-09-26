@@ -10,6 +10,7 @@ seams:
 
   * store         -> ultraquant_store (rotate K, pack FP4 + UE8M0 scales)
   * decode        -> FlyDSL D=256 scaled-MFMA kernel, Triton unified fallback
+  * spec verify   -> decoded as one single-query row per verify token
   * continuation  -> small chunk: Triton unified; large chunk: dequant + FA
 
 ``UltraQuantAttentionBackend`` is a standalone backend with its own identity
@@ -19,7 +20,7 @@ carry no UltraQuant knowledge.
 
 import contextlib
 import math
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
 from typing import Any, ClassVar
 
 import torch
@@ -36,6 +37,7 @@ from vllm.v1.attention.backends.turboquant_attn import (
     TurboQuantAttentionBackend,
     TurboQuantAttentionImpl,
     TurboQuantMetadata,
+    TurboQuantMetadataBuilder,
     _build_hadamard,
 )
 from vllm.v1.attention.ops.flydsl_ultraquant_decode import (
@@ -58,6 +60,56 @@ logger = init_logger(__name__)
 # CK FlashAttention on ROCm has no compiled kernel above head_dim 256 and no
 # sinks argument; those cases route through the Triton unified kernel instead.
 _CK_MAX_HEAD_DIM = 256
+
+
+@dataclass
+class UltraQuantMetadata(TurboQuantMetadata):
+    """UltraQuant's own metadata type, so speculative decoding can opt it in."""
+
+
+class UltraQuantMetadataBuilder(TurboQuantMetadataBuilder):
+    """Classifies speculative verify requests as decodes (spec-as-decode)."""
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        # Verify requests have query_len > 1 but stay on the decode path.
+        metadata.is_prefill = metadata.num_decodes < common_attn_metadata.num_reqs
+        return UltraQuantMetadata(
+            **{f.name: getattr(metadata, f.name) for f in fields(metadata)}
+        )
+
+
+def _split_multi_query_decode(
+    num_rows: int, attn_metadata: TurboQuantMetadata
+) -> TurboQuantMetadata:
+    """Rewrite multi-query decode requests as independent single-query rows.
+
+    The K/V of every verify token is already cached, so row ``j`` of a request
+    with ``q`` query tokens is a single-token decode over the first
+    ``seq_len - q + 1 + j`` tokens. Rows past the last request are padding.
+    """
+    query_start_loc = attn_metadata.query_start_loc
+    seq_lens = attn_metadata.seq_lens
+    query_ends = query_start_loc[1:]
+    rows = torch.arange(num_rows, device=seq_lens.device, dtype=query_ends.dtype)
+    req = torch.searchsorted(query_ends, rows, right=True).clamp_(
+        max=seq_lens.shape[0] - 1
+    )
+    rows_after = (query_ends[req] - 1 - rows).clamp_(min=0)
+    return replace(
+        attn_metadata,
+        # Clamp keeps CUDA-graph capture (seq_lens filled with 1) in range.
+        seq_lens=(seq_lens[req] - rows_after).clamp_(min=1),
+        block_table=attn_metadata.block_table[req],
+        query_start_loc=torch.arange(
+            num_rows + 1, device=seq_lens.device, dtype=query_start_loc.dtype
+        ),
+        max_query_len=1,
+    )
 
 
 class UltraQuantAttentionBackend(TurboQuantAttentionBackend):
@@ -90,6 +142,10 @@ class UltraQuantAttentionBackend(TurboQuantAttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["UltraQuantAttentionImpl"]:
         return UltraQuantAttentionImpl
+
+    @staticmethod
+    def get_builder_cls() -> type[UltraQuantMetadataBuilder]:
+        return UltraQuantMetadataBuilder
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
@@ -143,6 +199,10 @@ class UltraQuantAttentionImpl(TurboQuantAttentionImpl):
         self.sliding_window = sliding_window
         self.sinks = kwargs.get("sinks")
         self._max_model_len = vllm_config.model_config.max_model_len
+        self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        # CUDA-graph sizes are finalized in place after the layers are built.
+        self._compilation_config = vllm_config.compilation_config
+        self._spec_decode = vllm_config.speculative_config is not None
 
         self._use_ultraquant_flydsl = is_ultraquant_flydsl_available()
         # FlyDSL decode eligibility is static per layer config; compute once.
@@ -237,6 +297,38 @@ class UltraQuantAttentionImpl(TurboQuantAttentionImpl):
         PiT: torch.Tensor | None = None,
         layer: torch.nn.Module | None = None,
     ) -> torch.Tensor:
+        num_rows = query.shape[0]
+        if self._spec_decode and num_rows != attn_metadata.seq_lens.shape[0]:
+            attn_metadata = _split_multi_query_decode(num_rows, attn_metadata)
+            max_rows = max(
+                self._compilation_config.max_cudagraph_capture_size or 0,
+                self._max_num_seqs,
+            )
+            if num_rows > max_rows:
+                # Decode scratch is pre-warmed for this many rows; only eager
+                # batches beyond the CUDA-graph sizes exceed it.
+                out = torch.empty_like(query)
+                for start in range(0, num_rows, max_rows):
+                    end = min(start + max_rows, num_rows)
+                    chunk_metadata = replace(
+                        attn_metadata,
+                        seq_lens=attn_metadata.seq_lens[start:end],
+                        block_table=attn_metadata.block_table[start:end],
+                        query_start_loc=attn_metadata.query_start_loc[
+                            : end - start + 1
+                        ],
+                    )
+                    out[start:end] = self._decode_attention(
+                        query[start:end],
+                        kv_cache,
+                        chunk_metadata,
+                        Pi,
+                        centroids,
+                        PiT,
+                        layer,
+                    )
+                return out
+
         # Acquire shared decode scratch from the WorkspaceManager (UltraQuant
         # only needs the output buffer; the mid_o/lse slots keep the triple
         # allocation identical to the base decode for buffer reuse).
